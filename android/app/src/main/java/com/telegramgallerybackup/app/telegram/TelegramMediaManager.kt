@@ -52,8 +52,11 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         val inputFile = TdApi.InputFileLocal().apply {
             this.path = localFile.absolutePath
         }
-        val content = TdApi.InputMessagePhoto().apply {
+        val inputPhoto = TdApi.InputPhoto().apply {
             this.photo = inputFile
+        }
+        val content = TdApi.InputMessagePhoto().apply {
+            this.photo = inputPhoto
             this.caption = formattedText
         }
 
@@ -104,12 +107,15 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         val inputFile = TdApi.InputFileLocal().apply {
             this.path = localFile.absolutePath
         }
-        val content = TdApi.InputMessageVideo().apply {
+        val inputVideo = TdApi.InputVideo().apply {
             this.video = inputFile
             this.duration = durationSeconds
             this.width = width
             this.height = height
             this.supportsStreaming = true
+        }
+        val content = TdApi.InputMessageVideo().apply {
+            this.video = inputVideo
             this.caption = formattedText
         }
 
