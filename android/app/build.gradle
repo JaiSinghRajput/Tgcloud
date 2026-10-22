@@ -45,7 +45,15 @@ android {
         versionCode 1
         versionName "1.0"
         ndk {
-            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64", "x86"
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
     splits {
@@ -53,7 +61,7 @@ android {
             reset()
             enable true
             universalApk true
-            include "arm64-v8a", "armeabi-v7a", "x86_64", "x86"
+            include "arm64-v8a", "armeabi-v7a", "x86_64"
         }
     }
     signingConfigs {

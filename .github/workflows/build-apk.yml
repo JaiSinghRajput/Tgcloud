@@ -12,6 +12,9 @@ jobs:
     name: Build Android APK
     runs-on: ubuntu-latest
 
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs=\"-Xmx4608m -XX:MaxMetaspaceSize=1024m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError\" -Dorg.gradle.workers.max=2"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,7 +56,7 @@ jobs:
       - name: Build Release APK
         run: |
           cd android
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          ./gradlew assembleRelease --no-daemon --stacktrace --max-workers=2
 
       - name: Upload Release APK Artifacts
         uses: actions/upload-artifact@v4
@@ -65,7 +68,7 @@ jobs:
       - name: Build Debug APK
         run: |
           cd android
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace --max-workers=2
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
