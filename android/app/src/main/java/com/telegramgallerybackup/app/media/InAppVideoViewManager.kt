@@ -215,12 +215,9 @@ class InAppVideoViewManager : SimpleViewManager<InAppVideoContainerView>() {
     }
 
     override fun getExportedCustomDirectEventTypeConstants(): MutableMap<String, Any>? {
-        return MapBuilder.builder<String, Any>()
-            .put(
-                "onPlaybackStatus",
-                MapBuilder.of("registrationName", "onPlaybackStatus")
-            )
-            .build()
+        val events = mutableMapOf<String, Any>()
+        events["onPlaybackStatus"] = MapBuilder.of("registrationName", "onPlaybackStatus")
+        return events
     }
 
     override fun onDropViewInstance(view: InAppVideoContainerView) {
