@@ -16,6 +16,7 @@ class MainApplication : Application(), ReactApplication {
         PackageList(this).packages.apply {
           // Packages that cannot be autolinked yet can be added manually here:
           add(com.telegramgallerybackup.app.bridge.TelegramPackage())
+          add(com.telegramgallerybackup.app.media.MediaPackage())
         },
     )
   }
