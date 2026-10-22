@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -18,8 +18,15 @@ interface LoginScreenProps {
 }
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
-  const [phoneNumber, setPhoneNumber] = useState<string>('');
-  const [authCode, setAuthCode] = useState<string>('');
+  // Country Code Separation State
+  const [countryCode, setCountryCode] = useState<string>('+1');
+  const [nationalPhone, setNationalPhone] = useState<string>('');
+
+  // OTP 5-Box State
+  const [otpDigits, setOtpDigits] = useState<string[]>(['', '', '', '', '']);
+  const [focusedOtpIndex, setFocusedOtpIndex] = useState<number>(0);
+  const otpInputRefs = useRef<Array<any>>([]);
+
   const [password, setPassword] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -86,25 +93,38 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
   }, [onLoginSuccess]);
 
   const handleSendPhone = async () => {
-    const formatted = phoneNumber.trim().replace(/\s+/g, '');
-    if (!formatted || formatted.length < 5) {
-      setErrorMessage('Please enter a valid phone number with country code (e.g. +1 555 123 4567)');
+    let cleanCode = countryCode.trim();
+    if (!cleanCode.startsWith('+')) {
+      cleanCode = '+' + cleanCode;
+    }
+    const cleanNumber = nationalPhone.trim().replace(/\D/g, '');
+
+    if (cleanCode.length < 2) {
+      setErrorMessage('Please enter a valid country code (e.g. +1 or +91)');
       return;
     }
+
+    if (!cleanNumber || cleanNumber.length < 4) {
+      setErrorMessage('Please enter a valid phone number');
+      return;
+    }
+
+    const fullPhoneNumber = `${cleanCode}${cleanNumber}`;
+
     setLoading(true);
     setErrorMessage('');
     try {
-      await TelegramBridgeService.sendPhoneNumber(formatted);
+      await TelegramBridgeService.sendPhoneNumber(fullPhoneNumber);
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to submit phone number. Please try again.');
       setLoading(false);
     }
   };
 
-  const handleSendCode = async () => {
-    const cleanCode = authCode.trim();
-    if (!cleanCode) {
-      setErrorMessage('Please enter the verification code you received');
+  const submitOtpCode = async (code: string) => {
+    const cleanCode = code.trim();
+    if (!cleanCode || cleanCode.length < 5) {
+      setErrorMessage('Please enter all 5 digits of the verification code');
       return;
     }
     setLoading(true);
@@ -114,6 +134,51 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
     } catch (err: any) {
       setErrorMessage(err.message || 'Invalid verification code. Please check and try again.');
       setLoading(false);
+    }
+  };
+
+  const handleOtpDigitChange = (value: string, index: number) => {
+    // Check if user pasted a multi-digit code (e.g. 5 digits pasted)
+    const cleaned = value.replace(/\D/g, '');
+    if (cleaned.length > 1) {
+      const newDigits = [...otpDigits];
+      for (let i = 0; i < 5; i++) {
+        newDigits[i] = cleaned[i] || '';
+      }
+      setOtpDigits(newDigits);
+      const lastIndex = Math.min(cleaned.length - 1, 4);
+      otpInputRefs.current[lastIndex]?.focus();
+
+      if (cleaned.length >= 5) {
+        submitOtpCode(newDigits.slice(0, 5).join(''));
+      }
+      return;
+    }
+
+    const newDigits = [...otpDigits];
+    newDigits[index] = cleaned;
+    setOtpDigits(newDigits);
+
+    // Auto-advance to next box if a digit was entered
+    if (cleaned.length === 1 && index < 4) {
+      otpInputRefs.current[index + 1]?.focus();
+    }
+
+    // Auto-submit if all 5 digits are completed
+    const fullCode = newDigits.join('');
+    if (fullCode.length === 5) {
+      submitOtpCode(fullCode);
+    }
+  };
+
+  const handleOtpKeyPress = (e: any, index: number) => {
+    if (e.nativeEvent.key === 'Backspace') {
+      if (otpDigits[index] === '' && index > 0) {
+        const newDigits = [...otpDigits];
+        newDigits[index - 1] = '';
+        setOtpDigits(newDigits);
+        otpInputRefs.current[index - 1]?.focus();
+      }
     }
   };
 
@@ -135,7 +200,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
   const handleRestart = async () => {
     setLoading(true);
     setErrorMessage('');
-    setAuthCode('');
+    setOtpDigits(['', '', '', '', '']);
     setPassword('');
     try {
       await TelegramBridgeService.logOut();
@@ -152,6 +217,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
     authState.state === 'WAIT_PHONE_NUMBER' ||
     authState.state === 'UNINITIALIZED' ||
     authState.state === 'WAIT_PARAMETERS';
+
+  const fullPhoneDisplay = `${countryCode} ${nationalPhone}`.trim();
 
   return (
     <KeyboardAvoidingView
@@ -181,26 +248,53 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
             </View>
           ) : null}
 
-          {/* STEP 1: Phone Number Input */}
+          {/* STEP 1: Phone Number Input with Country Code Separation */}
           {isWaitPhone && (
             <View>
               <Text style={styles.stepTitle}>Log in to Telegram</Text>
               <Text style={styles.stepDesc}>
-                Enter your mobile number with country code. A verification code will be sent to your Telegram app or via SMS.
+                Enter your mobile number. A verification code will be sent to your Telegram app or via SMS.
               </Text>
 
-              <Text style={styles.inputLabel}>Phone Number</Text>
-              <TextInput
-                style={styles.input}
-                placeholder="+1 234 567 8900"
-                placeholderTextColor="#4b5563"
-                keyboardType="phone-pad"
-                autoCapitalize="none"
-                autoCorrect={false}
-                value={phoneNumber}
-                onChangeText={setPhoneNumber}
-                editable={!loading}
-              />
+              <Text style={styles.inputLabel}>Mobile Phone Number</Text>
+              <View style={styles.phoneInputRow}>
+                {/* Separated Country Code Box */}
+                <View style={styles.countryCodeBox}>
+                  <TextInput
+                    style={styles.countryCodeInput}
+                    value={countryCode}
+                    onChangeText={text => {
+                      let code = text.trim();
+                      if (code.length > 0 && !code.startsWith('+')) {
+                        code = '+' + code;
+                      }
+                      setCountryCode(code);
+                    }}
+                    placeholder="+1"
+                    placeholderTextColor="#6b7280"
+                    keyboardType="phone-pad"
+                    maxLength={5}
+                    editable={!loading}
+                    accessibilityLabel="Country Code"
+                  />
+                </View>
+
+                {/* Separated National Phone Number Box */}
+                <View style={styles.nationalPhoneBox}>
+                  <TextInput
+                    style={styles.nationalPhoneInput}
+                    placeholder="98765 43210"
+                    placeholderTextColor="#4b5563"
+                    keyboardType="phone-pad"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    value={nationalPhone}
+                    onChangeText={setNationalPhone}
+                    editable={!loading}
+                    accessibilityLabel="Phone Number"
+                  />
+                </View>
+              </View>
 
               <TouchableOpacity
                 style={[styles.primaryButton, loading && styles.buttonDisabled]}
@@ -216,31 +310,53 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
             </View>
           )}
 
-          {/* STEP 2: Verification Code Input */}
+          {/* STEP 2: Separated 5-Digit OTP Verification Boxes */}
           {isWaitCode && (
             <View>
               <Text style={styles.stepTitle}>Enter Verification Code</Text>
               <Text style={styles.stepDesc}>
-                We sent a login code to your Telegram app or SMS for{' '}
-                <Text style={styles.highlightText}>{phoneNumber}</Text>.
+                We sent a 5-digit login code to your Telegram app or SMS for{' '}
+                <Text style={styles.highlightText}>{fullPhoneDisplay}</Text>.
               </Text>
 
-              <Text style={styles.inputLabel}>Login Code</Text>
-              <TextInput
-                style={[styles.input, styles.codeInput]}
-                placeholder="12345"
-                placeholderTextColor="#4b5563"
-                keyboardType="number-pad"
-                autoFocus={true}
-                value={authCode}
-                onChangeText={setAuthCode}
-                editable={!loading}
-                maxLength={8}
-              />
+              <Text style={styles.inputLabel}>5-Digit OTP Code</Text>
+              <View style={styles.otpContainer}>
+                {otpDigits.map((digit, idx) => {
+                  const isFocused = focusedOtpIndex === idx;
+                  const isFilled = digit.length > 0;
+                  return (
+                    <View
+                      key={idx}
+                      style={[
+                        styles.otpBox,
+                        isFocused && styles.otpBoxFocused,
+                        isFilled && styles.otpBoxFilled,
+                      ]}
+                    >
+                      <TextInput
+                        ref={ref => {
+                          otpInputRefs.current[idx] = ref;
+                        }}
+                        style={styles.otpDigitInput}
+                        keyboardType="number-pad"
+                        maxLength={5} // Allows paste of full code
+                        value={digit}
+                        onFocus={() => setFocusedOtpIndex(idx)}
+                        onChangeText={val => handleOtpDigitChange(val, idx)}
+                        onKeyPress={e => handleOtpKeyPress(e, idx)}
+                        autoFocus={idx === 0}
+                        editable={!loading}
+                        selectTextOnFocus={true}
+                        textAlign="center"
+                      />
+                    </View>
+                  );
+                })}
+              </View>
 
               <TouchableOpacity
                 style={[styles.primaryButton, loading && styles.buttonDisabled]}
-                onPress={handleSendCode}
+                onPress={() => submitOtpCode(otpDigits.join(''))}
                 disabled={loading}
               >
                 {loading ? (
@@ -308,7 +424,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
         <View style={styles.privacyGuarantee}>
           <Text style={styles.privacyBadge}>🔒 Standalone Client-Side MTProto</Text>
           <Text style={styles.privacyNote}>
-            Direct end-to-end connection to Telegram data centers via TDLib. Your credentials and media are never routed through any third-party developer server.
+            Direct end-to-end connection to Telegram data centers via TDLib. Your credentials and media are never routed through any third-party server.
           </Text>
         </View>
       </ScrollView>
@@ -392,6 +508,71 @@ const styles = StyleSheet.create({
     letterSpacing: 0.5,
     marginBottom: 8,
   },
+  phoneInputRow: {
+    flexDirection: 'row',
+    marginBottom: 20,
+  },
+  countryCodeBox: {
+    width: 76,
+    marginRight: 10,
+    backgroundColor: '#0a0f0d',
+    borderColor: '#243029',
+    borderWidth: 1,
+    borderRadius: 10,
+    justifyContent: 'center',
+  },
+  countryCodeInput: {
+    color: '#f9fafb',
+    fontSize: 16,
+    fontWeight: '700',
+    textAlign: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+  },
+  nationalPhoneBox: {
+    flex: 1,
+    backgroundColor: '#0a0f0d',
+    borderColor: '#243029',
+    borderWidth: 1,
+    borderRadius: 10,
+    justifyContent: 'center',
+  },
+  nationalPhoneInput: {
+    color: '#f9fafb',
+    fontSize: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  otpContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 24,
+  },
+  otpBox: {
+    width: 52,
+    height: 60,
+    backgroundColor: '#0a0f0d',
+    borderColor: '#243029',
+    borderWidth: 1.5,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  otpBoxFocused: {
+    borderColor: '#34d399',
+    backgroundColor: '#162b20',
+  },
+  otpBoxFilled: {
+    borderColor: '#10b981',
+  },
+  otpDigitInput: {
+    width: '100%',
+    height: '100%',
+    color: '#f9fafb',
+    fontSize: 24,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
   input: {
     backgroundColor: '#0a0f0d',
     borderColor: '#243029',
@@ -402,12 +583,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#f9fafb',
     marginBottom: 20,
-  },
-  codeInput: {
-    fontSize: 22,
-    letterSpacing: 6,
-    textAlign: 'center',
-    fontWeight: '700',
   },
   primaryButton: {
     backgroundColor: '#34d399',

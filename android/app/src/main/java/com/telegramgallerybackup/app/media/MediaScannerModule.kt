@@ -3,7 +3,6 @@ package com.telegramgallerybackup.app.media
 import android.Manifest
 import android.content.ContentUris
 import android.content.pm.PackageManager
-import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -14,14 +13,20 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableArray
-import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * Native Android module to scan accessible photos and videos from MediaStore.
  * Groups media by folders and calculates eligible vs excluded byte counts.
+ * Uses Dispatchers.IO to guarantee zero UI thread blocking or ANRs.
  */
 class MediaScannerModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun getName(): String = "MediaScanner"
 
@@ -70,92 +75,99 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun scanMediaStore(excludedFoldersList: ReadableArray, promise: Promise) {
+        val excludedSet = mutableSetOf<String>()
         try {
-            val excludedSet = mutableSetOf<String>()
             for (i in 0 until excludedFoldersList.size()) {
                 val folder = excludedFoldersList.getString(i)
                 if (folder != null) {
                     excludedSet.add(folder)
                 }
             }
+        } catch (_: Exception) {
+            // Ignore
+        }
 
-            val foldersMap = mutableMapOf<String, FolderAccumulator>()
-            val mediaItemsArray = Arguments.createArray()
+        // Run heavy MediaStore cursor iteration on background I/O dispatcher to prevent ANR
+        scope.launch {
+            try {
+                val foldersMap = mutableMapOf<String, FolderAccumulator>()
+                val mediaItemsArray = Arguments.createArray()
 
-            var totalBytes: Long = 0
-            var totalCount: Int = 0
-            var eligibleBytes: Long = 0
-            var eligibleCount: Int = 0
-            var excludedBytes: Long = 0
-            var excludedCount: Int = 0
+                var totalBytes: Long = 0
+                var totalCount: Int = 0
+                var eligibleBytes: Long = 0
+                var eligibleCount: Int = 0
+                var excludedBytes: Long = 0
+                var excludedCount: Int = 0
 
-            // 1. Scan Photos
-            scanCollection(
-                collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                mediaType = "photo",
-                excludedSet = excludedSet,
-                foldersMap = foldersMap,
-                mediaItemsArray = mediaItemsArray,
-                onItem = { bytes, isExcluded ->
-                    totalCount++
-                    totalBytes += bytes
-                    if (isExcluded) {
-                        excludedCount++
-                        excludedBytes += bytes
-                    } else {
-                        eligibleCount++
-                        eligibleBytes += bytes
+                // 1. Scan Photos
+                scanCollection(
+                    collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    mediaType = "photo",
+                    excludedSet = excludedSet,
+                    foldersMap = foldersMap,
+                    mediaItemsArray = mediaItemsArray,
+                    onItem = { bytes, isExcluded ->
+                        totalCount++
+                        totalBytes += bytes
+                        if (isExcluded) {
+                            excludedCount++
+                            excludedBytes += bytes
+                        } else {
+                            eligibleCount++
+                            eligibleBytes += bytes
+                        }
                     }
-                }
-            )
+                )
 
-            // 2. Scan Videos
-            scanCollection(
-                collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                mediaType = "video",
-                excludedSet = excludedSet,
-                foldersMap = foldersMap,
-                mediaItemsArray = mediaItemsArray,
-                onItem = { bytes, isExcluded ->
-                    totalCount++
-                    totalBytes += bytes
-                    if (isExcluded) {
-                        excludedCount++
-                        excludedBytes += bytes
-                    } else {
-                        eligibleCount++
-                        eligibleBytes += bytes
+                // 2. Scan Videos
+                scanCollection(
+                    collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    mediaType = "video",
+                    excludedSet = excludedSet,
+                    foldersMap = foldersMap,
+                    mediaItemsArray = mediaItemsArray,
+                    onItem = { bytes, isExcluded ->
+                        totalCount++
+                        totalBytes += bytes
+                        if (isExcluded) {
+                            excludedCount++
+                            excludedBytes += bytes
+                        } else {
+                            eligibleCount++
+                            eligibleBytes += bytes
+                        }
                     }
+                )
+
+                // Build folder summaries array
+                val foldersArray = Arguments.createArray()
+                foldersMap.values.forEach { folder ->
+                    val fMap = Arguments.createMap().apply {
+                        putString("folderKey", folder.folderKey)
+                        putString("displayLabel", folder.displayLabel)
+                        putInt("itemCount", folder.itemCount)
+                        putDouble("byteSize", folder.byteSize.toDouble())
+                        putBoolean("isExcluded", folder.isExcluded)
+                    }
+                    foldersArray.pushMap(fMap)
                 }
-            )
 
-            // Build folder summaries array
-            val foldersArray = Arguments.createArray()
-            foldersMap.values.forEach { folder ->
-                val fMap = Arguments.createMap().apply {
-                    putString("folderKey", folder.folderKey)
-                    putString("displayLabel", folder.displayLabel)
-                    putInt("itemCount", folder.itemCount)
-                    putDouble("byteSize", folder.byteSize.toDouble())
-                    putBoolean("isExcluded", folder.isExcluded)
+                val result = Arguments.createMap().apply {
+                    putInt("totalCount", totalCount)
+                    putDouble("totalBytes", totalBytes.toDouble())
+                    putInt("eligibleCount", eligibleCount)
+                    putDouble("eligibleBytes", eligibleBytes.toDouble())
+                    putInt("excludedCount", excludedCount)
+                    putDouble("excludedBytes", excludedBytes.toDouble())
+                    putArray("folders", foldersArray)
+                    putArray("items", mediaItemsArray)
                 }
-                foldersArray.pushMap(fMap)
-            }
 
-            val result = Arguments.createMap().apply {
-                putInt("totalCount", totalCount)
-                putDouble("totalBytes", totalBytes.toDouble())
-                putInt("eligibleCount", eligibleCount)
-                putDouble("eligibleBytes", eligibleBytes.toDouble())
-                putInt("excludedCount", excludedCount)
-                putDouble("excludedBytes", excludedBytes.toDouble())
-                putArray("folders", foldersArray)
-                putArray("items", mediaItemsArray)
+                promise.resolve(result)
+            } catch (e: Exception) {
+                promise.reject("SCAN_ERROR", "Failed to scan MediaStore: ${e.message}", e)
             }
-
-            promise.resolve(result)
-        } catch (e: Exception) {
-            promise.reject("SCAN_ERROR", "Failed to scan MediaStore: ${e.message}", e)
         }
     }
 
@@ -178,73 +190,82 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
 
         val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
 
-        reactContext.contentResolver.query(collectionUri, projection, null, null, sortOrder)?.use { cursor ->
-            val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-            val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
-            val pathColumn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
-            } else {
-                cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
-            }
-            val mimeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
-            val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
-            val modColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
-
-            while (cursor.moveToNext()) {
-                val id = cursor.getLong(idColumn)
-                val name = cursor.getString(nameColumn) ?: "media_$id"
-                val rawPath = if (pathColumn != -1) cursor.getString(pathColumn) ?: "" else ""
-                val mimeType = cursor.getString(mimeColumn) ?: "application/octet-stream"
-                val sizeBytes = cursor.getLong(sizeColumn)
-                val modifiedAtSec = cursor.getLong(modColumn)
-                val contentUri = ContentUris.withAppendedId(collectionUri, id)
-
-                val normalizedFolderKey = extractFolderKey(rawPath)
-                val isExcluded = excludedSet.contains(normalizedFolderKey)
-
-                // Update folder aggregation
-                val folder = foldersMap.getOrPut(normalizedFolderKey) {
-                    FolderAccumulator(
-                        folderKey = normalizedFolderKey,
-                        displayLabel = deriveFolderLabel(normalizedFolderKey),
-                        itemCount = 0,
-                        byteSize = 0L,
-                        isExcluded = isExcluded
-                    )
+        try {
+            reactContext.contentResolver.query(collectionUri, projection, null, null, sortOrder)?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                val pathColumn = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+                } else {
+                    cursor.getColumnIndex(MediaStore.MediaColumns.DATA)
                 }
-                folder.itemCount++
-                folder.byteSize += sizeBytes
+                val mimeColumn = cursor.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
+                val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                val modColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
 
-                onItem(sizeBytes, isExcluded)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val name = cursor.getString(nameColumn) ?: "media_$id"
+                    val rawPath = if (pathColumn != -1) cursor.getString(pathColumn) ?: "" else ""
+                    val mimeType = if (mimeColumn != -1) cursor.getString(mimeColumn) ?: "application/octet-stream" else "application/octet-stream"
+                    val sizeBytes = cursor.getLong(sizeColumn)
+                    val modifiedAtSec = cursor.getLong(modColumn)
+                    val contentUri = ContentUris.withAppendedId(collectionUri, id)
 
-                // Add up to 100 preview items to keep payload fast and bounded
-                if (mediaItemsArray.size() < 100) {
-                    val itemMap = Arguments.createMap().apply {
-                        putString("id", "media-$id")
-                        putString("sourceKey", contentUri.toString())
-                        putString("mediaType", mediaType)
-                        putString("displayName", name)
-                        putString("relativePath", rawPath)
-                        putString("mimeType", mimeType)
-                        putDouble("sizeBytes", sizeBytes.toDouble())
-                        putDouble("modifiedAtMs", modifiedAtSec * 1000.0)
-                        putBoolean("isExcluded", isExcluded)
+                    val normalizedFolderKey = extractFolderKey(rawPath)
+                    val isExcluded = excludedSet.contains(normalizedFolderKey)
+
+                    // Update folder aggregation
+                    val folder = foldersMap.getOrPut(normalizedFolderKey) {
+                        FolderAccumulator(
+                            folderKey = normalizedFolderKey,
+                            displayLabel = deriveFolderLabel(normalizedFolderKey),
+                            itemCount = 0,
+                            byteSize = 0L,
+                            isExcluded = isExcluded
+                        )
                     }
-                    mediaItemsArray.pushMap(itemMap)
+                    folder.itemCount++
+                    folder.byteSize += sizeBytes
+
+                    onItem(sizeBytes, isExcluded)
+
+                    // Add up to 50 preview items to keep payload fast and responsive
+                    if (mediaItemsArray.size() < 50) {
+                        val itemMap = Arguments.createMap().apply {
+                            putString("id", "media-$id")
+                            putString("sourceKey", contentUri.toString())
+                            putString("mediaType", mediaType)
+                            putString("displayName", name)
+                            putString("relativePath", rawPath)
+                            putString("mimeType", mimeType)
+                            putDouble("sizeBytes", sizeBytes.toDouble())
+                            putDouble("modifiedAtMs", modifiedAtSec * 1000.0)
+                            putBoolean("isExcluded", isExcluded)
+                        }
+                        mediaItemsArray.pushMap(itemMap)
+                    }
                 }
             }
+        } catch (_: Exception) {
+            // Ignore individual query errors
         }
     }
 
-    private fun extractFolderKey(path: String): String {
-        val clean = path.trim().replace('\\', '/')
-        val dir = if (clean.endsWith("/")) clean.dropLast(1) else File(clean).parent ?: clean
-        return if (dir.startsWith("/")) dir.drop(1) else dir
+    private fun extractFolderKey(rawPath: String): String {
+        if (rawPath.isEmpty()) return "DCIM/Camera"
+        val clean = rawPath.replace('\\', '/')
+        val trimmed = if (clean.endsWith("/")) clean.dropLast(1) else clean
+        val lastSlash = trimmed.lastIndexOf('/')
+        return if (lastSlash > 0) trimmed.substring(0, lastSlash) else trimmed
     }
 
     private fun deriveFolderLabel(folderKey: String): String {
-        val parts = folderKey.split('/').filter { it.isNotEmpty() }
-        return parts.lastOrNull() ?: "Root"
+        if (folderKey.isEmpty() || folderKey == "Root") return "Root"
+        val clean = folderKey.replace('\\', '/')
+        val trimmed = if (clean.endsWith("/")) clean.dropLast(1) else clean
+        val lastSlash = trimmed.lastIndexOf('/')
+        return if (lastSlash != -1 && lastSlash < trimmed.length - 1) trimmed.substring(lastSlash + 1) else trimmed
     }
 
     private data class FolderAccumulator(

@@ -135,8 +135,12 @@ export const MainApp: React.FC = () => {
 
   const [cloudItems, setCloudItems] = useState<CloudMediaItem[]>([]);
 
+  const isScanningRef = React.useRef(false);
+
   const refreshScan = useCallback(
     async (excludedFolders: string[] = []) => {
+      if (isScanningRef.current) return;
+      isScanningRef.current = true;
       try {
         const review = await MediaScannerService.scanMediaStore(
           excludedFolders,
@@ -144,6 +148,8 @@ export const MainApp: React.FC = () => {
         setScanReview(review);
       } catch {
         // Handled safely
+      } finally {
+        isScanningRef.current = false;
       }
     },
     [],
@@ -162,8 +168,11 @@ export const MainApp: React.FC = () => {
 
   // Refresh permissions and scan when returning to foreground
   useEffect(() => {
+    let lastChecked = 0;
     const subscription = AppState.addEventListener('change', nextAppState => {
-      if (nextAppState === 'active' && isLoggedIn) {
+      const now = Date.now();
+      if (nextAppState === 'active' && isLoggedIn && now - lastChecked > 3000) {
+        lastChecked = now;
         checkPermissionState().then(status => {
           if (status === 'granted' || status === 'partial') {
             refreshScan();

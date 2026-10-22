@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   View,
   Text,
@@ -118,59 +118,67 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   };
 
   // Cloud folders derivation
-  const cloudFolders = Array.from(
-    new Set(
-      items.map(i => {
-        const parts = i.relativePath.split('/');
-        return parts.length > 1 ? parts.slice(0, -1).join('/') : 'Root';
-      }),
-    ),
-  );
+  const cloudFolders = useMemo(() => {
+    return Array.from(
+      new Set(
+        items.map(i => {
+          const parts = i.relativePath.split('/');
+          return parts.length > 1 ? parts.slice(0, -1).join('/') : 'Root';
+        }),
+      ),
+    );
+  }, [items]);
 
   // Device folders derivation
-  const deviceFolders = folders.map(f => f.folderKey);
+  const deviceFolders = useMemo(() => folders.map(f => f.folderKey), [folders]);
 
   const currentFolderList = activeView === 'cloud' ? cloudFolders : deviceFolders;
 
+  const backedUpIdSet = useMemo(() => new Set(items.map(ci => ci.id)), [items]);
+
   // Filtered cloud items
-  const filteredCloudItems = items.filter(item => {
-    if (filterType !== 'all' && item.mediaType !== filterType) return false;
-    if (selectedFolder !== 'all') {
-      const itemFolder = item.relativePath.includes('/')
-        ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
-        : 'Root';
-      if (itemFolder !== selectedFolder) return false;
-    }
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        item.originalName.toLowerCase().includes(q) ||
-        item.relativePath.toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+  const filteredCloudItems = useMemo(() => {
+    return items.filter(item => {
+      if (filterType !== 'all' && item.mediaType !== filterType) return false;
+      if (selectedFolder !== 'all') {
+        const itemFolder = item.relativePath.includes('/')
+          ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
+          : 'Root';
+        if (itemFolder !== selectedFolder) return false;
+      }
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        return (
+          item.originalName.toLowerCase().includes(q) ||
+          item.relativePath.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [items, filterType, selectedFolder, searchQuery]);
 
   // Filtered device items
-  const filteredDeviceItems = scannedItems.filter(item => {
-    if (filterType !== 'all' && item.mediaType !== filterType) return false;
-    if (selectedFolder !== 'all') {
-      const itemFolder = item.relativePath.includes('/')
-        ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
-        : 'Root';
-      if (!itemFolder.toLowerCase().includes(selectedFolder.toLowerCase())) {
-        return false;
+  const filteredDeviceItems = useMemo(() => {
+    return scannedItems.filter(item => {
+      if (filterType !== 'all' && item.mediaType !== filterType) return false;
+      if (selectedFolder !== 'all') {
+        const itemFolder = item.relativePath.includes('/')
+          ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
+          : 'Root';
+        if (!itemFolder.toLowerCase().includes(selectedFolder.toLowerCase())) {
+          return false;
+        }
       }
-    }
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        item.displayName.toLowerCase().includes(q) ||
-        item.relativePath.toLowerCase().includes(q)
-      );
-    }
-    return true;
-  });
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase();
+        return (
+          item.displayName.toLowerCase().includes(q) ||
+          item.relativePath.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [scannedItems, filterType, selectedFolder, searchQuery]);
 
   const handleExecuteRestore = async () => {
     if (!restoreModalItem) return;
@@ -615,8 +623,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                 )}
               </View>
             ) : (
-              filteredDeviceItems.map(item => {
-                const isBackedUp = items.some(ci => ci.id === item.id);
+              filteredDeviceItems.slice(0, 50).map(item => {
+                const isBackedUp = backedUpIdSet.has(item.id);
                 return (
                   <View key={item.id} style={styles.mediaItemCard}>
                     <View style={styles.mediaItemIcon}>
