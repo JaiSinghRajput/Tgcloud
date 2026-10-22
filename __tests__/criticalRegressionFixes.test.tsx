@@ -1,10 +1,8 @@
 import React from 'react';
 import renderer, { act } from 'react-test-renderer';
 import { FlatList } from 'react-native';
-import { Buffer } from 'buffer';
 import {
   CloudGalleryScreen,
-  CloudMediaItem,
   DiscoveredMediaItem,
 } from '../src/screens/CloudGalleryScreen';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
@@ -243,5 +241,68 @@ describe('Critical Regression Fix: Channel Setup, Black Video Screen, and Immers
       });
       expect(allText.some(t => t.includes('Backup to Telegram'))).toBe(false);
     });
+
+    test('supports swiping and arrow navigation between photos and videos in gallery view', async () => {
+      let root: renderer.ReactTestRenderer;
+      await act(async () => {
+        root = renderer.create(
+          <CloudGalleryScreen
+            items={[]}
+            scannedItems={[mockLocalPhoto, mockLocalVideo]}
+            onRestoreItem={async () => true}
+          />,
+        );
+      });
+
+      // Open first item (photo)
+      const flatList = root!.root.findByType(FlatList);
+      const renderedItem = flatList.props.renderItem({ item: mockLocalPhoto, index: 0 });
+      await act(async () => {
+        renderedItem.props.onPress();
+      });
+
+      // Verify horizontal viewer list is present
+      const horizontalList = root!.root.findByProps({ testID: 'viewer-horizontal-list' });
+      expect(horizontalList).toBeDefined();
+      expect(horizontalList.props.horizontal).toBe(true);
+      expect(horizontalList.props.pagingEnabled).toBe(true);
+
+      // Verify item counter displays '1 / 2'
+      const allText = root!.root.findAllByType('Text' as any).map(t => {
+        const c = t.props.children;
+        return Array.isArray(c) ? c.join('') : String(c);
+      });
+      expect(allText.some(t => t.includes('1 / 2'))).toBe(true);
+
+      // Navigate to next item (video) via next button
+      const nextBtn = root!.root.findByProps({ testID: 'viewer-next-btn' });
+      expect(nextBtn).toBeDefined();
+
+      await act(async () => {
+        nextBtn.props.onPress();
+      });
+
+      // Verify item counter updates to '2 / 2'
+      const updatedText = root!.root.findAllByType('Text' as any).map(t => {
+        const c = t.props.children;
+        return Array.isArray(c) ? c.join('') : String(c);
+      });
+      expect(updatedText.some(t => t.includes('2 / 2'))).toBe(true);
+
+      // Navigate back to previous item (photo) via prev button
+      const prevBtn = root!.root.findByProps({ testID: 'viewer-prev-btn' });
+      expect(prevBtn).toBeDefined();
+
+      await act(async () => {
+        prevBtn.props.onPress();
+      });
+
+      const finalTexts = root!.root.findAllByType('Text' as any).map(t => {
+        const c = t.props.children;
+        return Array.isArray(c) ? c.join('') : String(c);
+      });
+      expect(finalTexts.some(t => t.includes('1 / 2'))).toBe(true);
+    });
   });
 });
+

@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   TextInput,
   Dimensions,
   ActivityIndicator,
+  useWindowDimensions,
 } from 'react-native';
 import { Buffer } from 'buffer';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -142,14 +143,17 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
   // In-App Full-Screen Viewer State & Safe-Area Aware Playback Lifecycle
   const insets = useSafeInsetsFallback();
+  const { width: windowWidth } = useWindowDimensions();
   const [previewItem, setPreviewItem] = useState<
     DiscoveredMediaItem | CloudMediaItem | null
   >(null);
+  const [previewIndex, setPreviewIndex] = useState<number>(0);
+  const viewerFlatListRef = useRef<FlatList<any>>(null);
   const [showViewerControls, setShowViewerControls] = useState<boolean>(true);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadingMsg, setVideoLoadingMsg] = useState<string>('');
   const [playableVideoUri, setPlayableVideoUri] = useState<string>('');
-  const [activeTempVideoPath, setActiveTempVideoPath] = useState<string | null>(null);
+  const activeTempVideoPathRef = useRef<string | null>(null);
 
   // Destination Recreation Modal State
   const [showRecreateModal, setShowRecreateModal] = useState<boolean>(false);
@@ -159,17 +163,23 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
   const handleCloseViewer = async () => {
     setPreviewItem(null);
+    setPreviewIndex(0);
     setPlayableVideoUri('');
     setVideoError(null);
     setVideoLoadingMsg('');
-    if (activeTempVideoPath) {
-      const p = activeTempVideoPath;
-      setActiveTempVideoPath(null);
+    if (activeTempVideoPathRef.current) {
+      const p = activeTempVideoPathRef.current;
+      activeTempVideoPathRef.current = null;
       await TelegramBridgeService.cleanupTempMedia(p);
     }
   };
 
   const prepareVideoSource = useCallback(async (item: DiscoveredMediaItem | CloudMediaItem) => {
+    if (activeTempVideoPathRef.current) {
+      const oldPath = activeTempVideoPathRef.current;
+      activeTempVideoPathRef.current = null;
+      await TelegramBridgeService.cleanupTempMedia(oldPath);
+    }
     setVideoLoadingMsg('Preparing in-app video...');
     setVideoError(null);
     setPlayableVideoUri('');
@@ -211,7 +221,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
         setPlayableVideoUri(prepared.localUri);
         if (prepared.isTemporary && prepared.tempFilePath) {
-          setActiveTempVideoPath(prepared.tempFilePath);
+          activeTempVideoPathRef.current = prepared.tempFilePath;
         }
       } else {
         throw new Error('Video source reference is unavailable.');
@@ -228,6 +238,11 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setPlayableVideoUri('');
       setVideoError(null);
       setVideoLoadingMsg('');
+      if (activeTempVideoPathRef.current) {
+        const p = activeTempVideoPathRef.current;
+        activeTempVideoPathRef.current = null;
+        TelegramBridgeService.cleanupTempMedia(p);
+      }
     }
   }, [previewItem, prepareVideoSource]);
 
@@ -317,6 +332,29 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     });
   }, [items, filterType]);
 
+  // Current list for swipe viewer
+  const currentViewerItems = useMemo(() => {
+    return activeView === 'device' ? filteredDeviceItems : filteredCloudItems;
+  }, [activeView, filteredDeviceItems, filteredCloudItems]);
+
+  const handleSwipePrev = () => {
+    if (previewIndex > 0) {
+      const prevIdx = previewIndex - 1;
+      setPreviewIndex(prevIdx);
+      setPreviewItem(currentViewerItems[prevIdx]);
+      viewerFlatListRef.current?.scrollToIndex({ index: prevIdx, animated: true });
+    }
+  };
+
+  const handleSwipeNext = () => {
+    if (previewIndex < currentViewerItems.length - 1) {
+      const nextIdx = previewIndex + 1;
+      setPreviewIndex(nextIdx);
+      setPreviewItem(currentViewerItems[nextIdx]);
+      viewerFlatListRef.current?.scrollToIndex({ index: nextIdx, animated: true });
+    }
+  };
+
   // Selection calculations
   const totalSelectedBytes = useMemo(() => {
     return scannedItems
@@ -337,6 +375,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       }
       setSelectedItemIds(next);
     } else {
+      const idx = filteredDeviceItems.findIndex(i => i.id === item.id);
+      setPreviewIndex(idx >= 0 ? idx : 0);
       setPreviewItem(item);
       setVideoError(null);
     }
@@ -350,6 +390,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setUnlockSuccess(null);
       setShowUnlockModal(true);
     } else {
+      const idx = filteredCloudItems.findIndex(i => i.id === item.id);
+      setPreviewIndex(idx >= 0 ? idx : 0);
       setPreviewItem(item);
       setVideoError(null);
     }
@@ -1054,7 +1096,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         </View>
       )}
 
-      {/* 7. Redesigned Immersive Gallery Viewer Modal */}
+      {/* 7. Redesigned Immersive Gallery Viewer Modal with Horizontal Swipe */}
       {previewItem && (
         <Modal
           visible={true}
@@ -1082,87 +1124,207 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               </TouchableOpacity>
             )}
 
-            {/* Immersive Viewer Content Area */}
-            <View style={styles.viewerImageArea}>
-              {previewItem.mediaType === 'video' ? (
-                playableVideoUri ? (
-                  <InAppVideoPlayer
-                    sourceUri={playableVideoUri}
-                    isEncrypted={!!('isEncrypted' in previewItem && previewItem.isEncrypted)}
-                    onClose={handleCloseViewer}
-                    onError={err => setVideoError(err)}
-                    testID="in-app-video-player"
-                  />
-                ) : (
-                  <View style={styles.videoPreparingContainer}>
-                    <ActivityIndicator size="large" color="#34d399" />
-                    <Text style={styles.videoPreparingText}>
-                      {videoLoadingMsg || 'Preparing video...'}
-                    </Text>
-                    {videoError && (
-                      <View style={styles.videoPlayerErrorBox}>
-                        <Text style={styles.videoPlayerErrorText}>
-                          ⚠ {videoError}
-                        </Text>
-                        <TouchableOpacity
-                          style={styles.retryPrepBtn}
-                          onPress={handleRetryVideoPreparation}
-                        >
-                          <Text style={styles.retryPrepBtnText}>
-                            ↻ Retry
-                          </Text>
-                        </TouchableOpacity>
-                      </View>
-                    )}
-                  </View>
-                )
-              ) : (
+            {/* Floating Index Counter Pill */}
+            {showViewerControls && currentViewerItems.length > 0 && (
+              <View
+                style={[
+                  styles.viewerCounterBadge,
+                  {
+                    top: Math.max(insets.top, 16),
+                  },
+                ]}
+              >
+                <Text style={styles.viewerCounterText}>
+                  {previewIndex + 1} / {currentViewerItems.length}
+                </Text>
+                <Text style={styles.viewerFileNameText} numberOfLines={1}>
+                  {'displayName' in previewItem
+                    ? previewItem.displayName
+                    : previewItem.originalName}
+                </Text>
+              </View>
+            )}
+
+            {/* Left and Right Navigation Arrows */}
+            {showViewerControls && previewIndex > 0 && (
+              <TouchableOpacity
+                style={[
+                  styles.viewerNavArrow,
+                  styles.viewerNavArrowLeft,
+                  { left: Math.max(insets.left, 12) },
+                ]}
+                onPress={handleSwipePrev}
+                accessibilityLabel="Previous media item"
+                testID="viewer-prev-btn"
+              >
+                <Text style={styles.viewerNavArrowText}>‹</Text>
+              </TouchableOpacity>
+            )}
+
+            {showViewerControls &&
+              previewIndex < currentViewerItems.length - 1 && (
                 <TouchableOpacity
-                  activeOpacity={1}
-                  style={styles.photoSurface}
-                  onPress={() => setShowViewerControls(prev => !prev)}
+                  style={[
+                    styles.viewerNavArrow,
+                    styles.viewerNavArrowRight,
+                    { right: Math.max(insets.right, 12) },
+                  ]}
+                  onPress={handleSwipeNext}
+                  accessibilityLabel="Next media item"
+                  testID="viewer-next-btn"
                 >
-                  {'sourceKey' in previewItem && previewItem.sourceKey ? (
-                    <Image
-                      source={{ uri: previewItem.sourceKey }}
-                      style={styles.fullImage}
-                      resizeMode="contain"
-                      accessibilityLabel="Full screen image preview"
-                      testID="full-viewer-image"
-                    />
-                  ) : (
-                    <View style={styles.viewerPlaceholder}>
-                      <Text style={styles.viewerPlaceholderIcon}>
-                        {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked
-                          ? '🔒'
-                          : '🖼'}
-                      </Text>
-                      <Text style={styles.viewerPlaceholderText}>
-                        {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked
-                          ? 'Encrypted Photo (Locked)'
-                          : 'displayName' in previewItem
-                          ? previewItem.displayName
-                          : previewItem.originalName}
-                      </Text>
-                      {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked && (
-                        <TouchableOpacity
-                          style={styles.unlockInViewerBtn}
-                          onPress={() => {
-                            setPassphraseInput('');
-                            setUnlockError(null);
-                            setShowUnlockModal(true);
-                          }}
-                        >
-                          <Text style={styles.unlockInViewerBtnText}>
-                            🔓 Unlock Media
-                          </Text>
-                        </TouchableOpacity>
-                      )}
-                    </View>
-                  )}
+                  <Text style={styles.viewerNavArrowText}>›</Text>
                 </TouchableOpacity>
               )}
-            </View>
+
+            {/* Horizontal Swipeable Media List */}
+            <FlatList
+              ref={viewerFlatListRef}
+              data={currentViewerItems}
+              keyExtractor={item => item.id}
+              horizontal={true}
+              pagingEnabled={true}
+              showsHorizontalScrollIndicator={false}
+              initialScrollIndex={
+                previewIndex >= 0 && previewIndex < currentViewerItems.length
+                  ? previewIndex
+                  : 0
+              }
+              getItemLayout={(_, index) => ({
+                length: windowWidth,
+                offset: windowWidth * index,
+                index,
+              })}
+              onMomentumScrollEnd={ev => {
+                const offsetX = ev.nativeEvent.contentOffset.x;
+                const newIdx = Math.round(offsetX / windowWidth);
+                if (
+                  newIdx >= 0 &&
+                  newIdx < currentViewerItems.length &&
+                  newIdx !== previewIndex
+                ) {
+                  setPreviewIndex(newIdx);
+                  setPreviewItem(currentViewerItems[newIdx]);
+                }
+              }}
+              onScrollToIndexFailed={info => {
+                setTimeout(() => {
+                  viewerFlatListRef.current?.scrollToIndex({
+                    index: info.index,
+                    animated: false,
+                  });
+                }, 50);
+              }}
+              renderItem={({ item, index }) => {
+                const isCurrent = index === previewIndex;
+                const isVideo = item.mediaType === 'video';
+                const isLocked =
+                  'isEncrypted' in item && item.isEncrypted && !isUnlocked;
+
+                return (
+                  <View
+                    style={[styles.viewerPageSlide, { width: windowWidth }]}
+                    key={item.id}
+                    testID={`viewer-slide-${item.id}`}
+                  >
+                    {isVideo ? (
+                      isCurrent ? (
+                        playableVideoUri ? (
+                          <InAppVideoPlayer
+                            sourceUri={playableVideoUri}
+                            isEncrypted={
+                              !!('isEncrypted' in item && item.isEncrypted)
+                            }
+                            onClose={handleCloseViewer}
+                            onError={err => setVideoError(err)}
+                            testID="in-app-video-player"
+                          />
+                        ) : (
+                          <View style={styles.videoPreparingContainer}>
+                            <ActivityIndicator size="large" color="#34d399" />
+                            <Text style={styles.videoPreparingText}>
+                              {videoLoadingMsg || 'Preparing video...'}
+                            </Text>
+                            {videoError && (
+                              <View style={styles.videoPlayerErrorBox}>
+                                <Text style={styles.videoPlayerErrorText}>
+                                  ⚠ {videoError}
+                                </Text>
+                                <TouchableOpacity
+                                  style={styles.retryPrepBtn}
+                                  onPress={handleRetryVideoPreparation}
+                                >
+                                  <Text style={styles.retryPrepBtnText}>
+                                    ↻ Retry
+                                  </Text>
+                                </TouchableOpacity>
+                              </View>
+                            )}
+                          </View>
+                        )
+                      ) : (
+                        <View style={styles.viewerPlaceholder}>
+                          <Text style={styles.viewerPlaceholderIcon}>🎬</Text>
+                          <Text style={styles.viewerPlaceholderText}>
+                            {'displayName' in item
+                              ? item.displayName
+                              : item.originalName}
+                          </Text>
+                        </View>
+                      )
+                    ) : (
+                      <TouchableOpacity
+                        activeOpacity={1}
+                        style={styles.photoSurface}
+                        onPress={() => setShowViewerControls(prev => !prev)}
+                      >
+                        {'sourceKey' in item && item.sourceKey ? (
+                          <Image
+                            source={{ uri: item.sourceKey }}
+                            style={styles.fullImage}
+                            resizeMode="contain"
+                            accessibilityLabel="Full screen image preview"
+                            testID={isCurrent ? 'full-viewer-image' : undefined}
+                          />
+                        ) : (
+                          <View style={styles.viewerPlaceholder}>
+                            <Text style={styles.viewerPlaceholderIcon}>
+                              {isLocked ? '🔒' : '🖼'}
+                            </Text>
+                            <Text style={styles.viewerPlaceholderText}>
+                              {isLocked
+                                ? 'Encrypted Photo (Locked)'
+                                : 'displayName' in item
+                                ? item.displayName
+                                : item.originalName}
+                            </Text>
+                            {isLocked && (
+                              <TouchableOpacity
+                                style={styles.unlockInViewerBtn}
+                                onPress={() => {
+                                  setPassphraseInput('');
+                                  setUnlockError(null);
+                                  setShowUnlockModal(true);
+                                }}
+                              >
+                                <Text style={styles.unlockInViewerBtnText}>
+                                  🔓 Unlock Media
+                                </Text>
+                              </TouchableOpacity>
+                            )}
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                );
+              }}
+              removeClippedSubviews={false}
+              windowSize={3}
+              maxToRenderPerBatch={3}
+              initialNumToRender={3}
+              testID="viewer-horizontal-list"
+            />
           </View>
         </Modal>
       )}
@@ -1846,6 +2008,61 @@ const styles = StyleSheet.create({
   viewerContainer: {
     flex: 1,
     backgroundColor: '#000000',
+  },
+  viewerPageSlide: {
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#000000',
+  },
+  viewerCounterBadge: {
+    position: 'absolute',
+    alignSelf: 'center',
+    zIndex: 50,
+    backgroundColor: 'rgba(20, 20, 20, 0.75)',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 16,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+    maxWidth: '55%',
+  },
+  viewerCounterText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  viewerFileNameText: {
+    color: '#9ca3af',
+    fontSize: 11,
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  viewerNavArrow: {
+    position: 'absolute',
+    top: '48%',
+    zIndex: 50,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(20, 20, 20, 0.65)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerNavArrowLeft: {
+    left: 12,
+  },
+  viewerNavArrowRight: {
+    right: 12,
+  },
+  viewerNavArrowText: {
+    color: '#ffffff',
+    fontSize: 28,
+    fontWeight: '300',
+    marginTop: -2,
   },
   viewerFloatingCloseBtn: {
     position: 'absolute',
