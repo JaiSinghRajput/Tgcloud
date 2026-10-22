@@ -42,7 +42,10 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
         try {
             val excludedSet = mutableSetOf<String>()
             for (i in 0 until excludedFoldersList.size()) {
-                excludedSet.add(excludedFoldersList.getString(i))
+                val folder = excludedFoldersList.getString(i)
+                if (folder != null) {
+                    excludedSet.add(folder)
+                }
             }
 
             val foldersMap = mutableMapOf<String, FolderAccumulator>()

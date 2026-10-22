@@ -52,9 +52,13 @@ class TelegramChannelManager(private val tdLibService: TdLibService) {
      */
     private suspend fun findChannelByTitle(targetTitle: String): TdApi.Chat? {
         return try {
-            val searchResult = tdLibService.send(TdApi.SearchChatsOnServer(targetTitle, 20))
+            val req = TdApi.SearchChatsOnServer().apply {
+                this.query = targetTitle
+                this.limit = 20
+            }
+            val searchResult: TdApi.Chats = tdLibService.send(req)
             for (chatId in searchResult.chatIds) {
-                val chat = tdLibService.send(TdApi.GetChat(chatId))
+                val chat: TdApi.Chat = tdLibService.send(TdApi.GetChat(chatId))
                 if (chat.title.equals(targetTitle, ignoreCase = true)) {
                     val chatType = chat.type
                     if (chatType is TdApi.ChatTypeSupergroup && chatType.isChannel) {
@@ -73,16 +77,13 @@ class TelegramChannelManager(private val tdLibService: TdLibService) {
      * Creates a new private broadcast channel (isChannel = true, not public).
      */
     suspend fun createPrivateChannel(title: String, description: String): TdApi.Chat {
-        return tdLibService.send(
-            TdApi.CreateNewSupergroupChat(
-                title,
-                true, // isChannel = true
-                description,
-                null, // location
-                false, // forImport
-                false  // isForum
-            )
-        )
+        val req = TdApi.CreateNewSupergroupChat().apply {
+            this.title = title
+            this.isChannel = true
+            this.description = description
+            this.isForum = false
+        }
+        return tdLibService.send(req)
     }
 
     /**
@@ -90,18 +91,9 @@ class TelegramChannelManager(private val tdLibService: TdLibService) {
      */
     suspend fun verifyChannelAccess(chatId: Long): Boolean {
         return try {
-            val chat = tdLibService.send(TdApi.GetChat(chatId))
-            // Check canSendBasicContent or admin permissions
-            val permissions = chat.permissions
-            val canSend = permissions.canSendBasicContent
-            val canPost = when (val type = chat.type) {
-                is TdApi.ChatTypeSupergroup -> {
-                    // In a supergroup channel, creator/admin can post
-                    true
-                }
-                else -> canSend
-            }
-            canPost
+            val chat: TdApi.Chat = tdLibService.send(TdApi.GetChat(chatId))
+            // In a private supergroup channel created by the app, creator can post
+            chat.type is TdApi.ChatTypeSupergroup || chat.permissions != null
         } catch (e: Exception) {
             Log.e(tag, "Failed to verify channel access for $chatId: ${e.message}")
             false

@@ -45,29 +45,23 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         }
 
         val caption = TelegramMetadataEnvelope.serializeToCaption(metadata)
-        val formattedText = TdApi.FormattedText(caption, emptyArray())
-        val inputFile = TdApi.InputFileLocal(localFile.absolutePath)
-        val content = TdApi.InputMessagePhoto(
-            inputFile,
-            null, // thumbnail
-            IntArray(0), // addedStickerFileIds
-            0, // width
-            0, // height
-            formattedText,
-            false, // hasSpoiler
-            0 // selfDestructType
-        )
+        val formattedText = TdApi.FormattedText().apply {
+            this.text = caption
+            this.entities = emptyArray()
+        }
+        val inputFile = TdApi.InputFileLocal().apply {
+            this.path = localFile.absolutePath
+        }
+        val content = TdApi.InputMessagePhoto().apply {
+            this.photo = inputFile
+            this.caption = formattedText
+        }
 
-        val message = tdLibService.send(
-            TdApi.SendMessage(
-                chatId,
-                0, // messageThreadId
-                0, // replyTo
-                null, // options
-                null, // replyMarkup
-                content
-            )
-        )
+        val sendMessageReq = TdApi.SendMessage().apply {
+            this.chatId = chatId
+            this.inputMessageContent = content
+        }
+        val message: TdApi.Message = tdLibService.send(sendMessageReq)
 
         // Wait for file upload to complete
         val remoteFile = extractFileFromMessage(message)
@@ -103,31 +97,27 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         }
 
         val caption = TelegramMetadataEnvelope.serializeToCaption(metadata)
-        val formattedText = TdApi.FormattedText(caption, emptyArray())
-        val inputFile = TdApi.InputFileLocal(localFile.absolutePath)
-        val content = TdApi.InputMessageVideo(
-            inputFile,
-            null, // thumbnail
-            IntArray(0), // addedStickerFileIds
-            durationSeconds,
-            width,
-            height,
-            true, // supportsStreaming
-            formattedText,
-            false, // hasSpoiler
-            0 // selfDestructType
-        )
+        val formattedText = TdApi.FormattedText().apply {
+            this.text = caption
+            this.entities = emptyArray()
+        }
+        val inputFile = TdApi.InputFileLocal().apply {
+            this.path = localFile.absolutePath
+        }
+        val content = TdApi.InputMessageVideo().apply {
+            this.video = inputFile
+            this.duration = durationSeconds
+            this.width = width
+            this.height = height
+            this.supportsStreaming = true
+            this.caption = formattedText
+        }
 
-        val message = tdLibService.send(
-            TdApi.SendMessage(
-                chatId,
-                0,
-                0,
-                null,
-                null,
-                content
-            )
-        )
+        val sendMessageReq = TdApi.SendMessage().apply {
+            this.chatId = chatId
+            this.inputMessageContent = content
+        }
+        val message: TdApi.Message = tdLibService.send(sendMessageReq)
 
         val remoteFile = extractFileFromMessage(message)
         val fileId = remoteFile?.id ?: 0
@@ -162,15 +152,14 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         fromMessageId: Long = 0,
         limit: Int = 50
     ): List<TelegramMediaResult> {
-        val messages = tdLibService.send(
-            TdApi.GetChatHistory(
-                chatId,
-                fromMessageId,
-                0, // offset
-                limit,
-                false // onlyLocal
-            )
-        )
+        val req = TdApi.GetChatHistory().apply {
+            this.chatId = chatId
+            this.fromMessageId = fromMessageId
+            this.offset = 0
+            this.limit = limit
+            this.onlyLocal = false
+        }
+        val messages: TdApi.Messages = tdLibService.send(req)
 
         val results = mutableListOf<TelegramMediaResult>()
         for (message in messages.messages) {
@@ -198,7 +187,14 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
      */
     suspend fun downloadMediaFile(fileId: Int, timeoutMs: Long = 60_000): File? {
         // Request download
-        tdLibService.send(TdApi.DownloadFile(fileId, 32, 0, 0, false))
+        val downloadReq = TdApi.DownloadFile().apply {
+            this.fileId = fileId
+            this.priority = 32
+            this.offset = 0
+            this.limit = 0
+            this.synchronous = false
+        }
+        tdLibService.send(downloadReq)
 
         // Wait for UpdateFile event where isDownloadingCompleted is true
         val completedFile = withTimeoutOrNull(timeoutMs) {

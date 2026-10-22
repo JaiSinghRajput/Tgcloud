@@ -112,7 +112,7 @@ class TdLibService(private val context: Context) {
                     }
                     is TdApi.AuthorizationStateWaitCode -> {
                         _authState.value = TelegramAuthState.WaitCode(
-                            isRegistered = state.isRegistered,
+                            isRegistered = true,
                             timeout = state.codeInfo.timeout
                         )
                     }
