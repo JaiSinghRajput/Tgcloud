@@ -53,8 +53,11 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
             this.path = localFile.absolutePath
         }
         val content = if (metadata.encryptionEnvelope != null) {
-            TdApi.InputMessageDocument().apply {
+            val inputDoc = TdApi.InputDocument().apply {
                 this.document = inputFile
+            }
+            TdApi.InputMessageDocument().apply {
+                this.document = inputDoc
                 this.caption = formattedText
             }
         } else {
@@ -115,8 +118,11 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
             this.path = localFile.absolutePath
         }
         val content = if (metadata.encryptionEnvelope != null) {
-            TdApi.InputMessageDocument().apply {
+            val inputDoc = TdApi.InputDocument().apply {
                 this.document = inputFile
+            }
+            TdApi.InputMessageDocument().apply {
+                this.document = inputDoc
                 this.caption = formattedText
             }
         } else {
