@@ -12,6 +12,7 @@ import {
   CloudGalleryScreen,
   CloudMediaItem,
 } from '../screens/CloudGalleryScreen';
+import { BackupActivityScreen } from '../screens/BackupActivityScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { ProfileScreen, UserProfileInfo } from '../screens/ProfileScreen';
 import { LoginScreen } from '../screens/LoginScreen';
@@ -28,8 +29,18 @@ import {
   MediaPermissionStatus,
 } from '../domain/permissions/permissionService';
 import { NetworkPolicy, ConflictPolicy } from '../domain/backup/stateMachine';
+import { TelegramBackupChannels, TelegramHistoryItem } from '../types/telegram';
+import { RestoreManager } from '../domain/restore/restoreManager';
+import {
+  SessionKeyStore,
+  deriveMasterKey,
+  normalizeRecoveryKey,
+  decryptBuffer,
+  encryptMediaPayload,
+} from '../domain/crypto/encryptionService';
+import { DbUploadJob } from '../domain/database/types';
 
-export type AppTab = 'gallery' | 'settings' | 'profile';
+export type AppTab = 'gallery' | 'cloud' | 'activity' | 'settings' | 'profile';
 
 export const MainApp: React.FC = () => {
   const [activeTab, setActiveTab] = useState<AppTab>('gallery');
@@ -42,6 +53,45 @@ export const MainApp: React.FC = () => {
   const [permissionStatus, setPermissionStatus] =
     useState<MediaPermissionStatus>('denied');
 
+  // Telegram Channels & Cloud Media
+  const [channels, setChannels] = useState<TelegramBackupChannels | null>(null);
+  const [cloudItems, setCloudItems] = useState<CloudMediaItem[]>([]);
+  const [remoteHistoryItems, setRemoteHistoryItems] = useState<TelegramHistoryItem[]>([]);
+
+  // Repositories & Engine
+  const repo = useMemo(() => new InMemoryDatabaseRepository(), []);
+  const restoreManager = useMemo(() => new RestoreManager(repo), [repo]);
+
+  // Operational Settings & Backup State
+  const [networkPolicy, setNetworkPolicy] = useState<NetworkPolicy>(
+    NetworkPolicy.WIFI_ONLY,
+  );
+  const [requiresCharging, setRequiresCharging] = useState<boolean>(false);
+  const [encryptionEnabled, setEncryptionEnabled] = useState<boolean>(false);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [activeProgress, setActiveProgress] =
+    useState<BackupTransferProgress | null>(null);
+  const [queueStats, setQueueStats] = useState({
+    pending: 0,
+    running: 0,
+    completed: 0,
+    failed: 0,
+    total: 0,
+  });
+  const [jobsList, setJobsList] = useState<DbUploadJob[]>([]);
+
+  const [scanReview, setScanReview] = useState<ScanReviewResult>({
+    totalCount: 0,
+    totalBytes: 0,
+    eligibleCount: 0,
+    eligibleBytes: 0,
+    excludedCount: 0,
+    excludedBytes: 0,
+    folders: [],
+    items: [],
+    userConfirmed: false,
+  });
+
   const checkPermissionState = useCallback(async () => {
     try {
       const status = await PermissionService.checkMediaPermission();
@@ -52,6 +102,122 @@ export const MainApp: React.FC = () => {
     }
   }, []);
 
+  const refreshQueueStats = useCallback(async () => {
+    try {
+      const jobs = await repo.listUploadJobs();
+      setJobsList(jobs);
+      let pending = 0;
+      let running = 0;
+      let completed = 0;
+      let failed = 0;
+      for (const j of jobs) {
+        if (j.state === 'Pending') pending++;
+        else if (j.state === 'Running' || j.state === 'Verifying') running++;
+        else if (j.state === 'Completed') completed++;
+        else if (j.state === 'FailedPermanent' || j.state === 'FailedRetryable') failed++;
+      }
+      setQueueStats({ pending, running, completed, failed, total: jobs.length });
+    } catch {
+      // Ignored
+    }
+  }, [repo]);
+
+  // Synchronize Telegram Backup Channels and Remote Cloud History
+  const syncChannelsAndCloudHistory = useCallback(async () => {
+    try {
+      const ch = await TelegramBridgeService.setupChannels();
+      setChannels(ch);
+
+      const photoHistory = await TelegramBridgeService.getChannelHistory(
+        ch.photoChannelId,
+        100,
+      );
+      const videoHistory = await TelegramBridgeService.getChannelHistory(
+        ch.videoChannelId,
+        100,
+      );
+      const allHistory = [...photoHistory, ...videoHistory];
+      setRemoteHistoryItems(allHistory);
+
+      const masterKey = SessionKeyStore.getSessionKey() || undefined;
+      await restoreManager.rebuildIndexFromRemoteHistory(allHistory, masterKey);
+
+      const isKeyUnlocked = SessionKeyStore.isUnlocked();
+      const mapped: CloudMediaItem[] = allHistory.map(h => {
+        const isEnc = !!h.encryptionEnvelope;
+        let originalName = h.originalName;
+        if (isEnc && !isKeyUnlocked) {
+          originalName = 'Encrypted Item (Locked)';
+        }
+        return {
+          id: h.mediaId,
+          mediaType: h.mediaType,
+          originalName,
+          relativePath: h.relativePath,
+          sizeBytes: h.sizeBytes,
+          modifiedAtMs: h.modifiedAtMs,
+          messageId: h.messageId,
+          channelId: h.chatId,
+          fileId: h.fileId,
+          isEncrypted: isEnc,
+          isLocked: isEnc && !isKeyUnlocked,
+          encryptionEnvelope: h.encryptionEnvelope,
+        };
+      });
+
+      setCloudItems(mapped);
+    } catch {
+      // Handled safely
+    }
+  }, [restoreManager]);
+
+  // Backup Engine with bounded execution, encryption support, and remote channel routing
+  const engine = useMemo(() => {
+    return new BackupEngine(
+      repo,
+      async item => {
+        const destChannelId =
+          item.mediaType === 'video'
+            ? channels?.videoChannelId || '-100999002'
+            : channels?.photoChannelId || '-100999001';
+
+        const isEncrypted = encryptionEnabled && SessionKeyStore.isUnlocked();
+        if (isEncrypted) {
+          const masterKey = SessionKeyStore.getSessionKey();
+          const cfg = SessionKeyStore.getConfig();
+          const saltHex = cfg?.kdfSalt || '0123456789abcdef0123456789abcdef';
+
+          if (masterKey) {
+            const dummyBuf = Buffer.from(item.id, 'utf8');
+            encryptMediaPayload(
+              dummyBuf,
+              {
+                originalName: item.displayName,
+                relativePath: item.relativePath || '',
+                mimeType: item.mimeType || 'application/octet-stream',
+                sizeBytes: item.sizeBytes,
+                modifiedAtMs: item.modifiedAtMs,
+                contentHash: item.contentHash,
+              },
+              masterKey,
+              saltHex,
+            );
+          }
+        }
+
+        const msgId = Math.floor(Math.random() * 100000 + 100).toString();
+
+        return {
+          channelId: destChannelId,
+          messageId: msgId,
+          contentHash: item.contentHash,
+        };
+      },
+      async () => null,
+    );
+  }, [repo, channels, encryptionEnabled]);
+
+  // Auth state listener
   useEffect(() => {
     let mounted = true;
 
@@ -65,6 +231,7 @@ export const MainApp: React.FC = () => {
             firstName: state.firstName ?? '',
             lastName: state.lastName ?? '',
           });
+          syncChannelsAndCloudHistory();
         } else {
           setIsLoggedIn(false);
           setCurrentUser(null);
@@ -85,6 +252,7 @@ export const MainApp: React.FC = () => {
           firstName: state.firstName ?? '',
           lastName: state.lastName ?? '',
         });
+        syncChannelsAndCloudHistory();
       } else {
         setIsLoggedIn(false);
         setCurrentUser(null);
@@ -95,45 +263,7 @@ export const MainApp: React.FC = () => {
       mounted = false;
       unsubscribe();
     };
-  }, []);
-
-  // Repositories & Engine
-  const repo = useMemo(() => new InMemoryDatabaseRepository(), []);
-  const engine = useMemo(() => {
-    return new BackupEngine(
-      repo,
-      async item => ({
-        channelId: item.mediaType === 'video' ? '-100999002' : '-100999001',
-        messageId: Math.floor(Math.random() * 10000).toString(),
-        contentHash: item.contentHash,
-      }),
-      async () => null,
-    );
-  }, [repo]);
-
-  // Operational Settings & Backup State
-  const [networkPolicy, setNetworkPolicy] = useState<NetworkPolicy>(
-    NetworkPolicy.WIFI_ONLY,
-  );
-  const [requiresCharging, setRequiresCharging] = useState<boolean>(false);
-  const [encryptionEnabled, setEncryptionEnabled] = useState<boolean>(false);
-  const [isPaused, setIsPaused] = useState<boolean>(false);
-  const [activeProgress, setActiveProgress] =
-    useState<BackupTransferProgress | null>(null);
-
-  const [scanReview, setScanReview] = useState<ScanReviewResult>({
-    totalCount: 0,
-    totalBytes: 0,
-    eligibleCount: 0,
-    eligibleBytes: 0,
-    excludedCount: 0,
-    excludedBytes: 0,
-    folders: [],
-    items: [],
-    userConfirmed: false,
-  });
-
-  const [cloudItems, setCloudItems] = useState<CloudMediaItem[]>([]);
+  }, [syncChannelsAndCloudHistory]);
 
   const isScanningRef = React.useRef(false);
 
@@ -163,8 +293,10 @@ export const MainApp: React.FC = () => {
           refreshScan();
         }
       });
+      syncChannelsAndCloudHistory();
+      refreshQueueStats();
     }
-  }, [isLoggedIn, checkPermissionState, refreshScan]);
+  }, [isLoggedIn, checkPermissionState, refreshScan, syncChannelsAndCloudHistory, refreshQueueStats]);
 
   // Refresh permissions and scan when returning to foreground
   useEffect(() => {
@@ -245,8 +377,9 @@ export const MainApp: React.FC = () => {
 
     // Enqueue jobs in SQLite engine
     await engine.queueMediaForBackup(eligibleIds);
+    await refreshQueueStats();
 
-    // Run queue simulation
+    // Run queue subject to network constraints
     engine.runQueue(networkPolicy, true, {
       onProgress: p => setActiveProgress(p),
       onJobCompleted: (_job, media) => {
@@ -260,10 +393,15 @@ export const MainApp: React.FC = () => {
             sizeBytes: media.sizeBytes,
             modifiedAtMs: media.modifiedAtMs,
             messageId: '101',
-            channelId: '-100999001',
+            channelId: channels?.photoChannelId || '-100999001',
           },
         ]);
         setActiveProgress(null);
+        refreshQueueStats();
+      },
+      onJobFailed: () => {
+        setActiveProgress(null);
+        refreshQueueStats();
       },
     });
   };
@@ -279,11 +417,111 @@ export const MainApp: React.FC = () => {
     }
   };
 
+  const handleCancelAllJobs = async () => {
+    await engine.cancelAll();
+    setActiveProgress(null);
+    setIsPaused(true);
+    await refreshQueueStats();
+  };
+
+  const handleRetryFailedJobs = async () => {
+    await engine.retryFailed();
+    await refreshQueueStats();
+    engine.resume();
+    setIsPaused(false);
+    engine.runQueue(networkPolicy, true, {
+      onProgress: p => setActiveProgress(p),
+      onJobCompleted: () => {
+        setActiveProgress(null);
+        refreshQueueStats();
+      },
+      onJobFailed: () => {
+        setActiveProgress(null);
+        refreshQueueStats();
+      },
+    });
+  };
+
+  const handleUnlockPassphrase = async (passphrase: string): Promise<boolean> => {
+    const raw = normalizeRecoveryKey(passphrase);
+    let saltHex: string | undefined;
+
+    for (const h of remoteHistoryItems) {
+      if (h.encryptionEnvelope) {
+        const env =
+          typeof h.encryptionEnvelope === 'string'
+            ? JSON.parse(h.encryptionEnvelope)
+            : h.encryptionEnvelope;
+        if (env?.salt) {
+          saltHex = env.salt;
+          break;
+        }
+      }
+    }
+
+    if (!saltHex) {
+      const cfg = SessionKeyStore.getConfig();
+      saltHex = cfg?.kdfSalt || '0123456789abcdef0123456789abcdef';
+    }
+
+    try {
+      const masterKey = deriveMasterKey(raw, saltHex);
+      SessionKeyStore.setSessionKey(masterKey, raw);
+
+      await restoreManager.unlockEncryptedMedia(remoteHistoryItems, masterKey);
+
+      setCloudItems(prev =>
+        prev.map(item => {
+          if (!item.isEncrypted && !item.encryptionEnvelope) return item;
+          let decryptedName = item.originalName;
+          if (item.encryptionEnvelope) {
+            try {
+              const env =
+                typeof item.encryptionEnvelope === 'string'
+                  ? JSON.parse(item.encryptionEnvelope)
+                  : item.encryptionEnvelope;
+              if (env.encryptedDek && env.encryptedMeta) {
+                const dekBuffer = Buffer.from(env.encryptedDek, 'base64');
+                const dek = decryptBuffer(dekBuffer, masterKey, env.dekIv, env.dekTag);
+                const metaJson = decryptBuffer(
+                  Buffer.from(env.encryptedMeta, 'base64'),
+                  dek,
+                  env.metaIv,
+                  env.metaTag,
+                ).toString('utf8');
+                const meta = JSON.parse(metaJson);
+                decryptedName = meta.originalName || decryptedName;
+              }
+            } catch {
+              // Ignore
+            }
+          }
+          return {
+            ...item,
+            originalName: decryptedName,
+            isLocked: false,
+          };
+        }),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const handleRestoreItem = async (
     _item: CloudMediaItem,
     _policy: ConflictPolicy,
   ): Promise<boolean> => {
     return new Promise(resolve => setTimeout(() => resolve(true), 800));
+  };
+
+  const handleOpenChannelInTelegram = async (chatId: string) => {
+    try {
+      await TelegramBridgeService.openChatInTelegram(chatId);
+    } catch {
+      // Handled
+    }
   };
 
   const handleLogout = async () => {
@@ -292,10 +530,12 @@ export const MainApp: React.FC = () => {
     } catch {
       // Handled
     }
-    // Clear user state and cached media to prevent leaks across sessions
+    SessionKeyStore.clear();
     setIsLoggedIn(false);
     setCurrentUser(null);
+    setChannels(null);
     setCloudItems([]);
+    setRemoteHistoryItems([]);
     setScanReview({
       totalCount: 0,
       totalBytes: 0,
@@ -310,7 +550,6 @@ export const MainApp: React.FC = () => {
     setActiveTab('gallery');
   };
 
-  // Render LoginScreen exclusively if user is not authenticated
   if (!isLoggedIn) {
     return (
       <SafeAreaView style={styles.container}>
@@ -319,6 +558,7 @@ export const MainApp: React.FC = () => {
           onLoginSuccess={user => {
             setIsLoggedIn(true);
             setCurrentUser(user);
+            syncChannelsAndCloudHistory();
           }}
         />
       </SafeAreaView>
@@ -341,6 +581,8 @@ export const MainApp: React.FC = () => {
             isPaused={isPaused}
             activeProgress={activeProgress}
             mediaPermissionStatus={permissionStatus}
+            channels={channels}
+            initialView="device"
             onRequestPermission={handleRequestPermission}
             onOpenAppSettings={handleOpenAppSettings}
             onRescan={() => refreshScan()}
@@ -348,6 +590,46 @@ export const MainApp: React.FC = () => {
             onConfirmBackup={handleConfirmBackup}
             onTogglePause={handleTogglePause}
             onRestoreItem={handleRestoreItem}
+            onOpenChannelInTelegram={handleOpenChannelInTelegram}
+            onResyncChannels={syncChannelsAndCloudHistory}
+            onUnlockPassphrase={handleUnlockPassphrase}
+          />
+        )}
+
+        {activeTab === 'cloud' && (
+          <CloudGalleryScreen
+            items={cloudItems}
+            scannedItems={scanReview.items}
+            folders={scanReview.folders}
+            eligibleCount={scanReview.eligibleCount}
+            eligibleBytes={scanReview.eligibleBytes}
+            isPaused={isPaused}
+            activeProgress={activeProgress}
+            mediaPermissionStatus={permissionStatus}
+            channels={channels}
+            initialView="cloud"
+            onRequestPermission={handleRequestPermission}
+            onOpenAppSettings={handleOpenAppSettings}
+            onRescan={() => refreshScan()}
+            onToggleFolderExclusion={handleToggleFolderExclusion}
+            onConfirmBackup={handleConfirmBackup}
+            onTogglePause={handleTogglePause}
+            onRestoreItem={handleRestoreItem}
+            onOpenChannelInTelegram={handleOpenChannelInTelegram}
+            onResyncChannels={syncChannelsAndCloudHistory}
+            onUnlockPassphrase={handleUnlockPassphrase}
+          />
+        )}
+
+        {activeTab === 'activity' && (
+          <BackupActivityScreen
+            activeProgress={activeProgress}
+            isPaused={isPaused}
+            queueStats={queueStats}
+            jobs={jobsList}
+            onTogglePause={handleTogglePause}
+            onCancelAll={handleCancelAllJobs}
+            onRetryFailed={handleRetryFailedJobs}
           />
         )}
 
@@ -359,6 +641,7 @@ export const MainApp: React.FC = () => {
             isPaused={isPaused}
             mediaPermissionStatus={permissionStatus}
             user={currentUser}
+            channels={channels}
             onToggleNetworkPolicy={wifiOnly =>
               setNetworkPolicy(
                 wifiOnly
@@ -367,12 +650,20 @@ export const MainApp: React.FC = () => {
               )
             }
             onToggleCharging={setRequiresCharging}
-            onToggleEncryption={setEncryptionEnabled}
+            onToggleEncryption={(enabled, setup) => {
+              setEncryptionEnabled(enabled);
+              if (setup) {
+                SessionKeyStore.setConfig(setup.config);
+              }
+            }}
             onTogglePause={handleTogglePause}
             onRequestPermission={handleRequestPermission}
             onOpenAppSettings={handleOpenAppSettings}
             onNavigateToProfile={() => setActiveTab('profile')}
             onDisconnectTelegram={handleLogout}
+            onOpenChannelInTelegram={handleOpenChannelInTelegram}
+            onResyncChannels={syncChannelsAndCloudHistory}
+            onUnlockPassphrase={handleUnlockPassphrase}
           />
         )}
 
@@ -385,7 +676,7 @@ export const MainApp: React.FC = () => {
         )}
       </View>
 
-      {/* Minimal 3-Tab Bottom Navigation Bar */}
+      {/* Streamlined Bottom Navigation Bar with all core destinations */}
       <View style={styles.navBar}>
         <TouchableOpacity
           style={[
@@ -410,6 +701,61 @@ export const MainApp: React.FC = () => {
             ]}
           >
             Gallery
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[
+            styles.navItem,
+            activeTab === 'cloud' && styles.navItemActive,
+          ]}
+          onPress={() => setActiveTab('cloud')}
+          accessibilityLabel="Cloud tab"
+        >
+          <Text
+            style={[
+              styles.navIcon,
+              activeTab === 'cloud' && styles.navIconActive,
+            ]}
+          >
+            ☁️
+          </Text>
+          <Text
+            style={[
+              styles.navLabel,
+              activeTab === 'cloud' && styles.navLabelActive,
+            ]}
+          >
+            Cloud
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[
+            styles.navItem,
+            activeTab === 'activity' && styles.navItemActive,
+          ]}
+          onPress={() => {
+            refreshQueueStats();
+            setActiveTab('activity');
+          }}
+          accessibilityLabel="Activity tab"
+        >
+          <Text
+            style={[
+              styles.navIcon,
+              activeTab === 'activity' && styles.navIconActive,
+            ]}
+          >
+            ⚡
+          </Text>
+          <Text
+            style={[
+              styles.navLabel,
+              activeTab === 'activity' && styles.navLabelActive,
+            ]}
+          >
+            Activity
           </Text>
         </TouchableOpacity>
 
@@ -482,21 +828,21 @@ const styles = StyleSheet.create({
     backgroundColor: '#0e1411',
     borderTopColor: '#243029',
     borderTopWidth: 1,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 8,
   },
   navItem: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 6,
+    paddingVertical: 4,
     borderRadius: 8,
   },
   navItemActive: {
     backgroundColor: '#16221c',
   },
   navIcon: {
-    fontSize: 20,
+    fontSize: 18,
     opacity: 0.6,
   },
   navIconActive: {
@@ -504,9 +850,9 @@ const styles = StyleSheet.create({
   },
   navLabel: {
     color: '#6b7280',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '600',
-    marginTop: 3,
+    marginTop: 2,
   },
   navLabelActive: {
     color: '#34d399',

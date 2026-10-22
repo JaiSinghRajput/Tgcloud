@@ -34,6 +34,9 @@ export interface DatabaseRepository {
     errorSummary?: string,
     nextAttemptAtMs?: number | null,
   ): Promise<void>;
+  cancelPendingUploadJobs(): Promise<number>;
+  retryFailedUploadJobs(): Promise<number>;
+  listUploadJobs(): Promise<DbUploadJob[]>;
 
   // Remote references
   recordTelegramObject(obj: DbTelegramObject): Promise<void>;
@@ -202,6 +205,59 @@ export class InMemoryDatabaseRepository implements DatabaseRepository {
         nextAttemptAtMs !== undefined ? nextAttemptAtMs : job.nextAttemptAtMs,
       updatedAtMs: Date.now(),
     });
+  }
+
+  async cancelPendingUploadJobs(): Promise<number> {
+    let count = 0;
+    for (const job of this.uploadJobs.values()) {
+      if (
+        job.state === UploadJobState.PENDING ||
+        job.state === UploadJobState.RUNNING ||
+        job.state === UploadJobState.FAILED_RETRYABLE
+      ) {
+        job.state = UploadJobState.CANCELLED;
+        job.updatedAtMs = Date.now();
+        count++;
+        const media = this.mediaItems.get(job.mediaItemId);
+        if (
+          media &&
+          (media.state === MediaState.QUEUED ||
+            media.state === MediaState.UPLOADING)
+        ) {
+          media.state = MediaState.DISCOVERED;
+          media.updatedAtMsLocal = Date.now();
+        }
+      }
+    }
+    return count;
+  }
+
+  async retryFailedUploadJobs(): Promise<number> {
+    let count = 0;
+    for (const job of this.uploadJobs.values()) {
+      if (
+        job.state === UploadJobState.FAILED_RETRYABLE ||
+        job.state === UploadJobState.FAILED_PERMANENT
+      ) {
+        job.state = UploadJobState.PENDING;
+        job.attemptCount = 0;
+        job.nextAttemptAtMs = null;
+        job.lastErrorCode = null;
+        job.lastErrorSummary = null;
+        job.updatedAtMs = Date.now();
+        count++;
+        const media = this.mediaItems.get(job.mediaItemId);
+        if (media) {
+          media.state = MediaState.QUEUED;
+          media.updatedAtMsLocal = Date.now();
+        }
+      }
+    }
+    return count;
+  }
+
+  async listUploadJobs(): Promise<DbUploadJob[]> {
+    return Array.from(this.uploadJobs.values());
   }
 
   async recordTelegramObject(obj: DbTelegramObject): Promise<void> {

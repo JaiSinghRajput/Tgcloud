@@ -202,6 +202,9 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                         putDouble("modifiedAtMs", item.metadata.modifiedAtMs.toDouble())
                         putString("contentHash", item.metadata.contentHash)
                         putInt("date", item.date)
+                        if (item.metadata.encryptionEnvelope != null) {
+                            putString("encryptionEnvelope", item.metadata.encryptionEnvelope)
+                        }
                     }
                     array.pushMap(itemMap)
                 }
@@ -209,6 +212,31 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
             } catch (e: Exception) {
                 promise.reject("HISTORY_ERROR", e.message, e)
             }
+        }
+    }
+
+    @ReactMethod
+    fun openChatInTelegram(chatId: String, promise: Promise) {
+        try {
+            val rawId = chatId.replace("-100", "").replace("-", "")
+            val tgUri = android.net.Uri.parse("tg://openmessage?chat_id=$chatId")
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, tgUri).apply {
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val pm = reactApplicationContext.packageManager
+            if (intent.resolveActivity(pm) != null) {
+                reactApplicationContext.startActivity(intent)
+                promise.resolve(true)
+            } else {
+                val webUri = android.net.Uri.parse("https://t.me/c/$rawId")
+                val webIntent = android.content.Intent(android.content.Intent.ACTION_VIEW, webUri).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                reactApplicationContext.startActivity(webIntent)
+                promise.resolve(true)
+            }
+        } catch (e: Exception) {
+            promise.reject("OPEN_ERROR", e.message, e)
         }
     }
 

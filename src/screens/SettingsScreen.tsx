@@ -7,15 +7,20 @@ import {
   Switch,
   TouchableOpacity,
   Modal,
+  TextInput,
+  ActivityIndicator,
 } from 'react-native';
 import { NetworkPolicy } from '../domain/backup/stateMachine';
 import {
-  generateRecoveryKey,
-  normalizeRecoveryKey,
+  initializeEncryptionSetup,
+  SessionKeyStore,
+  verifyRecoveryKey,
 } from '../domain/crypto/encryptionService';
 import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
 import { MediaPermissionStatus } from '../domain/permissions/permissionService';
+import { TelegramBackupChannels } from '../types/telegram';
+import { RecoveryKeySetup } from '../types/encryption';
 
 interface SettingsScreenProps {
   networkPolicy: NetworkPolicy;
@@ -24,61 +29,77 @@ interface SettingsScreenProps {
   isPaused?: boolean;
   mediaPermissionStatus?: MediaPermissionStatus;
   user?: UserProfileInfo | null;
+  channels?: TelegramBackupChannels | null;
   onToggleNetworkPolicy: (wifiOnly: boolean) => void;
   onToggleCharging: (chargingOnly: boolean) => void;
-  onToggleEncryption: (enabled: boolean) => void;
+  onToggleEncryption: (enabled: boolean, setup?: RecoveryKeySetup) => void;
   onTogglePause?: () => void;
   onRequestPermission?: () => void;
   onOpenAppSettings?: () => void;
   onNavigateToProfile?: () => void;
   onDisconnectTelegram: () => void;
+  onOpenChannelInTelegram?: (channelId: string) => void;
+  onResyncChannels?: () => void;
+  onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
 }
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   networkPolicy,
   requiresCharging,
   encryptionEnabled,
-  isPaused = false,
+  isPaused: _isPaused = false,
   mediaPermissionStatus = 'granted',
   user,
+  channels,
   onToggleNetworkPolicy,
   onToggleCharging,
   onToggleEncryption,
-  onTogglePause,
+  onTogglePause: _onTogglePause,
   onRequestPermission,
   onOpenAppSettings,
-  onNavigateToProfile,
+  onNavigateToProfile: _onNavigateToProfile,
   onDisconnectTelegram,
+  onOpenChannelInTelegram,
+  onResyncChannels,
+  onUnlockPassphrase,
 }) => {
   const isWifiOnly = networkPolicy === NetworkPolicy.WIFI_ONLY;
 
   // Encryption setup modal state
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [generatedKey, setGeneratedKey] = useState('');
-  const [confirmationInput, setConfirmationInput] = useState('');
+  const [activeSetup, setActiveSetup] = useState<RecoveryKeySetup | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
   const [copySuccess, setCopySuccess] = useState<string>('');
   const [savePhotoSuccess, setSavePhotoSuccess] = useState<string>('');
   const [hasConfirmedSaved, setHasConfirmedSaved] = useState<boolean>(false);
 
+  // Unlock Modal State in Settings
+  const [showUnlockModal, setShowUnlockModal] = useState(false);
+  const [unlockPassphraseInput, setUnlockPassphraseInput] = useState('');
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+
+  const isUnlocked = SessionKeyStore.isUnlocked();
+
   const handleToggleEncryption = (newValue: boolean) => {
     if (newValue && !encryptionEnabled) {
-      const newKey = generateRecoveryKey();
-      setGeneratedKey(newKey);
-      setConfirmationInput('');
+      const setup = initializeEncryptionSetup();
+      setActiveSetup(setup);
+      setGeneratedKey(setup.recoveryKey);
       setSetupError(null);
       setCopySuccess('');
       setSavePhotoSuccess('');
       setHasConfirmedSaved(false);
       setShowSetupModal(true);
     } else {
+      SessionKeyStore.clear();
       onToggleEncryption(false);
     }
   };
 
   const handleCopyWords = async () => {
     await MediaScannerService.copyToClipboard(generatedKey);
-    setConfirmationInput(generatedKey);
     setCopySuccess('✓ Passphrase copied to clipboard!');
     setHasConfirmedSaved(true);
     setTimeout(() => setCopySuccess(''), 3000);
@@ -97,27 +118,61 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   };
 
   const handleConfirmVerification = () => {
-    // If user clicked Copy or Save to Photo or checked the acknowledgment, allow enabling directly
-    if (hasConfirmedSaved || confirmationInput.trim() === generatedKey.trim()) {
-      setSetupError(null);
-      setShowSetupModal(false);
-      onToggleEncryption(true);
+    if (!hasConfirmedSaved) {
+      setSetupError('Please check the acknowledgment that you have saved your 12 recovery words.');
       return;
     }
 
-    const normalizedInput = normalizeRecoveryKey(confirmationInput);
-    const normalizedGen = normalizeRecoveryKey(generatedKey);
-
-    if (normalizedInput !== normalizedGen) {
-      setSetupError(
-        'Recovery passphrase does not match. Tap Copy Words or Save as Photo above to verify.',
-      );
-      return;
+    if (activeSetup) {
+      const masterKey = Buffer.from(activeSetup.masterKeyHex, 'hex');
+      SessionKeyStore.setSessionKey(masterKey, activeSetup.recoveryKey, activeSetup.config);
+      onToggleEncryption(true, activeSetup);
+    } else {
+      onToggleEncryption(true);
     }
 
     setSetupError(null);
     setShowSetupModal(false);
-    onToggleEncryption(true);
+  };
+
+  const handleUnlockInSettings = async () => {
+    const raw = unlockPassphraseInput.trim();
+    if (!raw) {
+      setUnlockError('Please enter your 12-word recovery passphrase.');
+      return;
+    }
+
+    setIsVerifying(true);
+    setUnlockError(null);
+
+    try {
+      let valid = false;
+      const cfg = SessionKeyStore.getConfig();
+      if (cfg) {
+        const res = verifyRecoveryKey(raw, cfg);
+        if (res.valid && res.masterKeyHex) {
+          valid = true;
+          const masterKey = Buffer.from(res.masterKeyHex, 'hex');
+          SessionKeyStore.setSessionKey(masterKey, raw, cfg);
+        }
+      }
+
+      if (onUnlockPassphrase) {
+        const success = await onUnlockPassphrase(raw);
+        if (success) valid = true;
+      }
+
+      if (valid) {
+        setShowUnlockModal(false);
+        setUnlockPassphraseInput('');
+      } else {
+        setUnlockError('Incorrect recovery passphrase. Please verify your 12 words.');
+      }
+    } catch (e: any) {
+      setUnlockError(`Verification error: ${e?.message || 'Authentication failed'}`);
+    } finally {
+      setIsVerifying(false);
+    }
   };
 
   const displayName = [user?.firstName, user?.lastName]
@@ -141,87 +196,45 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      {/* Header */}
-      <View style={styles.header}>
-        <Text style={styles.headerTitle}>Settings</Text>
-        <Text style={styles.headerSubtitle}>
-          Preferences, backup rules, and account management
-        </Text>
-      </View>
-
-      {/* 1. ACCOUNT SECTION */}
+      {/* 1. ACCOUNT */}
       <View style={styles.section}>
         <Text style={styles.sectionHeader}>Account</Text>
         <View style={styles.card}>
-          <View style={styles.accountRow}>
-            <View style={styles.accountAvatar}>
-              <Text style={styles.accountAvatarText}>
-                {user?.firstName?.[0] || 'TG'}
+          <View style={styles.accountHeader}>
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>
+                {displayName.slice(0, 2).toUpperCase()}
               </Text>
             </View>
-            <View style={styles.accountInfo}>
+            <View style={styles.accountDetails}>
               <Text style={styles.accountName}>{displayName}</Text>
               <Text style={styles.accountSub}>
-                {user?.userId ? `User ID: ${user.userId}` : 'Logged In via TDLib'}
+                Telegram ID: {user?.userId || 'N/A'}
               </Text>
             </View>
-            {onNavigateToProfile && (
-              <TouchableOpacity
-                style={styles.profileBadgeBtn}
-                onPress={onNavigateToProfile}
-              >
-                <Text style={styles.profileBadgeText}>Profile →</Text>
-              </TouchableOpacity>
-            )}
           </View>
 
           <View style={styles.divider} />
 
           <TouchableOpacity
-            style={styles.actionRow}
+            style={styles.dangerButton}
             onPress={onDisconnectTelegram}
           >
-            <Text style={styles.dangerActionText}>Log Out of Telegram</Text>
-            <Text style={styles.chevronText}>›</Text>
+            <Text style={styles.dangerButtonText}>Log Out of Telegram</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      {/* 2. BACKUP PREFERENCES */}
+      {/* 2. BACKUP & DESTINATIONS */}
       <View style={styles.section}>
         <Text style={styles.sectionHeader}>Backup</Text>
         <View style={styles.card}>
-          {/* Pause / Resume */}
-          {onTogglePause && (
-            <>
-              <View style={styles.settingRow}>
-                <View style={styles.settingTextCol}>
-                  <Text style={styles.settingTitle}>Pause Automatic Backup</Text>
-                  <Text style={styles.settingSubtitle}>
-                    {isPaused
-                      ? 'Backups are currently paused'
-                      : 'Backups run automatically when conditions are met'}
-                  </Text>
-                </View>
-                <Switch
-                  value={isPaused}
-                  onValueChange={onTogglePause}
-                  trackColor={{ false: '#243029', true: '#ef4444' }}
-                  thumbColor={isPaused ? '#f87171' : '#9ca3af'}
-                />
-              </View>
-              <View style={styles.divider} />
-            </>
-          )}
-
-          {/* Wi-Fi Only */}
+          {/* Wi-Fi only toggle */}
           <View style={styles.settingRow}>
             <View style={styles.settingTextCol}>
-              <Text style={styles.settingTitle}>Wi-Fi Only</Text>
+              <Text style={styles.settingTitle}>Upload Only on Wi-Fi</Text>
               <Text style={styles.settingSubtitle}>
-                {isWifiOnly
-                  ? 'Uploads only run over Wi-Fi networks to save mobile data'
-                  : 'Uploads are allowed over both Wi-Fi and mobile data'}
+                Pause uploads automatically on cellular data to prevent unexpected data usage.
               </Text>
             </View>
             <Switch
@@ -234,12 +247,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
           <View style={styles.divider} />
 
-          {/* Charging Only */}
+          {/* Charging only toggle */}
           <View style={styles.settingRow}>
             <View style={styles.settingTextCol}>
-              <Text style={styles.settingTitle}>Only While Charging</Text>
+              <Text style={styles.settingTitle}>Require Device Charging</Text>
               <Text style={styles.settingSubtitle}>
-                Pause background uploads while running on battery power
+                Upload only when connected to a charger to conserve battery life.
               </Text>
             </View>
             <Switch
@@ -249,6 +262,61 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               thumbColor={requiresCharging ? '#34d399' : '#9ca3af'}
             />
           </View>
+
+          {/* Telegram Destination Channels Info */}
+          {channels && (
+            <>
+              <View style={styles.divider} />
+              <View style={styles.channelsContainer}>
+                <Text style={styles.channelsHeader}>Cloud Storage Destinations</Text>
+
+                <View style={styles.channelRow}>
+                  <View style={styles.channelTextCol}>
+                    <Text style={styles.channelName}>
+                      📷 {channels.photoChannelTitle || 'Backup - Photos'}
+                    </Text>
+                    <Text style={styles.channelStatus}>
+                      Channel ID: {channels.photoChannelId} · {channels.verified ? '✓ Verified' : 'Connecting'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.channelTgBtn}
+                    onPress={() => onOpenChannelInTelegram?.(channels.photoChannelId)}
+                  >
+                    <Text style={styles.channelTgBtnText}>Open ↗</Text>
+                  </TouchableOpacity>
+                </View>
+
+                <View style={styles.channelRow}>
+                  <View style={styles.channelTextCol}>
+                    <Text style={styles.channelName}>
+                      🎬 {channels.videoChannelTitle || 'Backup - Videos'}
+                    </Text>
+                    <Text style={styles.channelStatus}>
+                      Channel ID: {channels.videoChannelId} · {channels.verified ? '✓ Verified' : 'Connecting'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.channelTgBtn}
+                    onPress={() => onOpenChannelInTelegram?.(channels.videoChannelId)}
+                  >
+                    <Text style={styles.channelTgBtnText}>Open ↗</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {onResyncChannels && (
+                  <TouchableOpacity
+                    style={styles.resyncChannelsBtn}
+                    onPress={onResyncChannels}
+                  >
+                    <Text style={styles.resyncChannelsBtnText}>
+                      ↻ Reconnect / Rediscover Destinations
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </>
+          )}
 
           <View style={styles.divider} />
 
@@ -311,8 +379,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               <Text style={styles.settingTitle}>Client-Side Encryption</Text>
               <Text style={styles.settingSubtitle}>
                 {encryptionEnabled
-                  ? 'Active: Media and filenames are encrypted with AES-256-GCM before upload'
-                  : 'Off: Media is stored directly in your private Telegram backup channels'}
+                  ? isUnlocked
+                    ? 'Active (Unlocked): Media is encrypted with AES-256-GCM before upload'
+                    : 'Active (Locked): Recovery passphrase required to preview or restore'
+                  : 'Off: Media is stored directly in your private Telegram channels'}
               </Text>
             </View>
             <Switch
@@ -321,6 +391,46 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               trackColor={{ false: '#243029', true: '#047857' }}
               thumbColor={encryptionEnabled ? '#34d399' : '#9ca3af'}
             />
+          </View>
+
+          {encryptionEnabled && (
+            <View style={styles.encryptionActionBox}>
+              {!isUnlocked ? (
+                <TouchableOpacity
+                  style={styles.unlockKeyBtn}
+                  onPress={() => {
+                    setUnlockPassphraseInput('');
+                    setUnlockError(null);
+                    setShowUnlockModal(true);
+                  }}
+                >
+                  <Text style={styles.unlockKeyBtnText}>
+                    🔓 Enter Recovery Passphrase to Unlock
+                  </Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={styles.lockKeyBtn}
+                  onPress={() => SessionKeyStore.clear()}
+                >
+                  <Text style={styles.lockKeyBtnText}>
+                    🔒 Lock Cloud Media (Clear Key from Memory)
+                  </Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+
+          <View style={styles.divider} />
+
+          <View style={styles.cryptoExplainerBox}>
+            <Text style={styles.cryptoExplainerTitle}>About Client-Side Encryption</Text>
+            <Text style={styles.cryptoExplainerText}>
+              • Files are encrypted using AES-256-GCM authenticated encryption before leaving your device.
+              {'\n'}• Files appear as unreadable binary (.bin) documents in Telegram; Telegram cannot preview them.
+              {'\n'}• Media can be decrypted and restored in TG Cloud after entering your 12-word recovery passphrase.
+              {'\n'}• If you lose your passphrase, encrypted backups are permanently unrecoverable.
+            </Text>
           </View>
         </View>
       </View>
@@ -360,9 +470,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <View style={styles.warningBox}>
               <Text style={styles.warningTitle}>IMPORTANT WARNING</Text>
               <Text style={styles.warningText}>
-                With client-side encryption, only you possess the master key. If
-                you lose your recovery passphrase, your backups will be
-                PERMANENTLY UNRECOVERABLE. Telegram cannot recover them.
+                With client-side encryption, only you possess the master key. Encrypted files appear as unreadable binary (.bin) on Telegram. If you lose your recovery passphrase, your backups will be PERMANENTLY UNRECOVERABLE. Telegram cannot recover them.
               </Text>
             </View>
 
@@ -399,29 +507,85 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               style={styles.checkboxRow}
               onPress={() => setHasConfirmedSaved(!hasConfirmedSaved)}
             >
-              <View style={[styles.checkboxBox, hasConfirmedSaved && styles.checkboxBoxActive]}>
-                {hasConfirmedSaved ? <Text style={styles.checkboxCheckMark}>✓</Text> : null}
+              <View style={[styles.checkbox, hasConfirmedSaved && styles.checkboxActive]}>
+                {hasConfirmedSaved && <Text style={styles.checkmark}>✓</Text>}
               </View>
               <Text style={styles.checkboxLabel}>
-                I have securely copied or saved my 12 recovery words
+                I have securely copied or saved my 12 recovery words.
               </Text>
             </TouchableOpacity>
 
-            {setupError && <Text style={styles.errorText}>{setupError}</Text>}
+            {setupError ? <Text style={styles.errorText}>{setupError}</Text> : null}
 
-            <View style={styles.modalActions}>
+            <View style={styles.modalButtons}>
               <TouchableOpacity
-                style={styles.cancelButton}
+                style={styles.cancelBtn}
                 onPress={() => setShowSetupModal(false)}
               >
-                <Text style={styles.cancelButtonText}>Cancel</Text>
+                <Text style={styles.cancelBtnText}>Cancel</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={styles.confirmButton}
+                style={[
+                  styles.confirmBtn,
+                  !hasConfirmedSaved && styles.confirmBtnDisabled,
+                ]}
+                disabled={!hasConfirmedSaved}
                 onPress={handleConfirmVerification}
               >
-                <Text style={styles.confirmButtonText}>Enable Encryption</Text>
+                <Text style={styles.confirmBtnText}>Enable Encryption</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Unlock Passphrase Modal in Settings */}
+      <Modal
+        visible={showUnlockModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowUnlockModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Unlock Cloud Media</Text>
+            <Text style={styles.modalDesc}>
+              Enter your saved 12-word recovery passphrase to decrypt your cloud backups.
+            </Text>
+
+            <TextInput
+              style={styles.unlockInput}
+              placeholder="e.g. eagle harbor quartz river beacon..."
+              placeholderTextColor="#6b7280"
+              value={unlockPassphraseInput}
+              onChangeText={setUnlockPassphraseInput}
+              multiline
+              numberOfLines={3}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+
+            {unlockError && <Text style={styles.errorText}>{unlockError}</Text>}
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => setShowUnlockModal(false)}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmBtn}
+                disabled={isVerifying}
+                onPress={handleUnlockInSettings}
+              >
+                {isVerifying ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.confirmBtnText}>Unlock</Text>
+                )}
               </TouchableOpacity>
             </View>
           </View>
@@ -440,198 +604,266 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 40,
   },
-  header: {
-    marginBottom: 20,
-    marginTop: 8,
-  },
-  headerTitle: {
-    color: '#f9fafb',
-    fontSize: 26,
-    fontWeight: '800',
-    letterSpacing: -0.5,
-  },
-  headerSubtitle: {
-    color: '#9ca3af',
-    fontSize: 13,
-    marginTop: 4,
-  },
   section: {
     marginBottom: 20,
   },
   sectionHeader: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#9ca3af',
+    color: '#34d399',
     textTransform: 'uppercase',
     letterSpacing: 0.8,
     marginBottom: 8,
     marginLeft: 4,
   },
   card: {
-    backgroundColor: '#121a15',
-    borderRadius: 14,
+    backgroundColor: '#16221c',
+    borderRadius: 12,
+    padding: 16,
     borderWidth: 1,
     borderColor: '#243029',
-    overflow: 'hidden',
   },
-  accountRow: {
+  accountHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 16,
+    marginBottom: 12,
   },
-  accountAvatar: {
+  avatar: {
     width: 44,
     height: 44,
     borderRadius: 22,
-    backgroundColor: '#1b3327',
-    borderWidth: 1,
-    borderColor: '#34d399',
+    backgroundColor: '#047857',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
   },
-  accountAvatarText: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#34d399',
+  avatarText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '800',
   },
-  accountInfo: {
+  accountDetails: {
     flex: 1,
   },
   accountName: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#f9fafb',
+    color: '#ffffff',
   },
   accountSub: {
     fontSize: 12,
     color: '#9ca3af',
     marginTop: 2,
   },
-  profileBadgeBtn: {
-    backgroundColor: '#16221c',
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#243029',
-  },
-  profileBadgeText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#34d399',
-  },
-  actionRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+  dangerButton: {
+    paddingVertical: 10,
     alignItems: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
   },
-  dangerActionText: {
-    fontSize: 14,
-    fontWeight: '600',
+  dangerButtonText: {
     color: '#f87171',
-  },
-  chevronText: {
-    fontSize: 18,
-    color: '#6b7280',
-    fontWeight: '600',
+    fontWeight: '700',
+    fontSize: 13,
   },
   settingRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    padding: 16,
+    paddingVertical: 8,
   },
   settingTextCol: {
     flex: 1,
-    paddingRight: 16,
+    marginRight: 12,
   },
   settingTitle: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '600',
-    color: '#f3f4f6',
-    marginBottom: 4,
+    color: '#ffffff',
   },
   settingSubtitle: {
     fontSize: 12,
     color: '#9ca3af',
+    marginTop: 2,
     lineHeight: 16,
   },
   divider: {
     height: 1,
-    backgroundColor: '#1c2820',
+    backgroundColor: '#243029',
+    marginVertical: 12,
   },
   infoNoteBox: {
-    backgroundColor: '#0e1511',
-    padding: 14,
+    backgroundColor: 'rgba(16, 185, 129, 0.08)',
+    borderLeftWidth: 3,
+    borderLeftColor: '#10b981',
+    padding: 10,
+    borderRadius: 6,
   },
   infoNoteTitle: {
-    fontSize: 12,
-    fontWeight: '700',
     color: '#34d399',
-    marginBottom: 4,
+    fontWeight: '700',
+    fontSize: 12,
+    marginBottom: 3,
   },
   infoNoteText: {
+    color: '#d1d5db',
     fontSize: 11,
-    color: '#9ca3af',
-    lineHeight: 16,
+    lineHeight: 15,
   },
   permissionStatusRow: {
-    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   permBadge: {
-    alignSelf: 'flex-start',
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 4,
-    borderRadius: 12,
-    marginTop: 8,
+    borderRadius: 6,
   },
   permBadgeText: {
     fontSize: 11,
     fontWeight: '700',
   },
   permActionContainer: {
-    paddingHorizontal: 16,
-    paddingBottom: 16,
+    marginTop: 12,
   },
   permButton: {
-    backgroundColor: '#16221c',
-    borderColor: '#34d399',
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingVertical: 10,
+    backgroundColor: '#10b981',
+    paddingVertical: 8,
+    borderRadius: 6,
     alignItems: 'center',
   },
   permButtonText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  channelsContainer: {
+    paddingVertical: 4,
+  },
+  channelsHeader: {
     fontSize: 13,
     fontWeight: '700',
+    color: '#e5e7eb',
+    marginBottom: 8,
+  },
+  channelRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#111814',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 6,
+    borderWidth: 1,
+    borderColor: '#1e2923',
+  },
+  channelTextCol: {
+    flex: 1,
+    marginRight: 8,
+  },
+  channelName: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  channelStatus: {
+    color: '#9ca3af',
+    fontSize: 10,
+    marginTop: 2,
+  },
+  channelTgBtn: {
+    backgroundColor: '#16221c',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#2d3d34',
+  },
+  channelTgBtnText: {
     color: '#34d399',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  resyncChannelsBtn: {
+    marginTop: 6,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  resyncChannelsBtnText: {
+    color: '#34d399',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  encryptionActionBox: {
+    marginTop: 8,
+  },
+  unlockKeyBtn: {
+    backgroundColor: '#d97706',
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  unlockKeyBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  lockKeyBtn: {
+    backgroundColor: '#261c1c',
+    borderWidth: 1,
+    borderColor: '#543333',
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  lockKeyBtnText: {
+    color: '#f87171',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  cryptoExplainerBox: {
+    backgroundColor: '#111814',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1e2923',
+  },
+  cryptoExplainerTitle: {
+    color: '#34d399',
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  cryptoExplainerText: {
+    color: '#9ca3af',
+    fontSize: 11,
+    lineHeight: 16,
   },
   aboutRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    padding: 14,
+    paddingVertical: 6,
   },
   aboutLabel: {
-    fontSize: 13,
     color: '#9ca3af',
+    fontSize: 13,
   },
   aboutValue: {
+    color: '#ffffff',
     fontSize: 13,
     fontWeight: '600',
-    color: '#e5e7eb',
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
     justifyContent: 'center',
+    alignItems: 'center',
     padding: 20,
   },
   modalContent: {
-    backgroundColor: '#121a15',
-    borderRadius: 16,
+    width: '100%',
+    maxWidth: 440,
+    backgroundColor: '#16221c',
+    borderRadius: 14,
     padding: 20,
     borderWidth: 1,
     borderColor: '#243029',
@@ -639,99 +871,38 @@ const styles = StyleSheet.create({
   modalTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: '#f9fafb',
-    marginBottom: 12,
+    color: '#ffffff',
+    marginBottom: 10,
+  },
+  modalDesc: {
+    fontSize: 13,
+    color: '#9ca3af',
+    marginBottom: 14,
   },
   warningBox: {
-    backgroundColor: '#2d1515',
-    borderColor: '#7f1d1d',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    borderLeftWidth: 3,
+    borderLeftColor: '#ef4444',
+    padding: 10,
+    borderRadius: 6,
     marginBottom: 14,
   },
   warningTitle: {
     color: '#f87171',
-    fontWeight: '800',
+    fontWeight: '700',
     fontSize: 11,
-    letterSpacing: 0.5,
-    marginBottom: 4,
+    marginBottom: 2,
   },
   warningText: {
     color: '#fca5a5',
     fontSize: 11,
-    lineHeight: 16,
+    lineHeight: 15,
   },
   keyLabel: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#d1d5db',
-    marginBottom: 6,
-  },
-  keyBox: {
-    backgroundColor: '#0a0f0d',
-    borderColor: '#243029',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 12,
-  },
-  keyText: {
-    fontFamily: 'monospace',
     color: '#34d399',
-    fontSize: 13,
-    lineHeight: 20,
-  },
-  instructionText: {
     fontSize: 12,
-    color: '#9ca3af',
-    marginBottom: 8,
-    lineHeight: 16,
-  },
-  modalInput: {
-    backgroundColor: '#0a0f0d',
-    borderColor: '#243029',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 10,
-    color: '#f9fafb',
-    fontSize: 13,
-    minHeight: 60,
-    marginBottom: 12,
-    textAlignVertical: 'top',
-  },
-  errorText: {
-    color: '#f87171',
-    fontSize: 12,
-    marginBottom: 12,
-  },
-  modalActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 12,
-  },
-  cancelButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#374151',
-  },
-  cancelButtonText: {
-    color: '#9ca3af',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  confirmButton: {
-    backgroundColor: '#34d399',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-  },
-  confirmButtonText: {
-    color: '#0a0f0d',
-    fontSize: 13,
     fontWeight: '700',
+    marginBottom: 8,
   },
   wordChipsGrid: {
     flexDirection: 'row',
@@ -741,51 +912,46 @@ const styles = StyleSheet.create({
   },
   wordChip: {
     flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#0a0f0d',
+    backgroundColor: '#111814',
     borderWidth: 1,
     borderColor: '#243029',
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 4,
-    minWidth: '30%',
+    alignItems: 'center',
   },
   wordChipIndex: {
-    color: '#34d399',
+    color: '#6b7280',
     fontSize: 10,
-    fontWeight: '700',
     marginRight: 4,
+    fontWeight: '700',
   },
   wordChipText: {
-    color: '#f9fafb',
+    color: '#ffffff',
     fontSize: 12,
     fontWeight: '600',
   },
   passphraseActionsRow: {
     flexDirection: 'row',
     gap: 8,
-    marginBottom: 12,
+    marginBottom: 10,
   },
   actionBtnCopy: {
     flex: 1,
-    backgroundColor: '#16221c',
-    borderWidth: 1,
-    borderColor: '#34d399',
-    borderRadius: 8,
-    paddingVertical: 8,
+    backgroundColor: '#10b981',
+    paddingVertical: 9,
+    borderRadius: 6,
     alignItems: 'center',
   },
   actionBtnPhoto: {
     flex: 1,
-    backgroundColor: '#16221c',
-    borderWidth: 1,
-    borderColor: '#243029',
-    borderRadius: 8,
-    paddingVertical: 8,
+    backgroundColor: '#2563eb',
+    paddingVertical: 9,
+    borderRadius: 6,
     alignItems: 'center',
   },
   actionBtnText: {
-    color: '#34d399',
+    color: '#ffffff',
     fontSize: 12,
     fontWeight: '700',
   },
@@ -794,35 +960,83 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     textAlign: 'center',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   checkboxRow: {
     flexDirection: 'row',
     alignItems: 'center',
     marginVertical: 10,
   },
-  checkboxBox: {
+  checkbox: {
     width: 20,
     height: 20,
     borderRadius: 4,
-    borderWidth: 1.5,
-    borderColor: '#4b5563',
-    marginRight: 10,
+    borderWidth: 2,
+    borderColor: '#9ca3af',
     alignItems: 'center',
     justifyContent: 'center',
+    marginRight: 10,
   },
-  checkboxBoxActive: {
+  checkboxActive: {
     backgroundColor: '#10b981',
     borderColor: '#10b981',
   },
-  checkboxCheckMark: {
+  checkmark: {
     color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '800',
+    fontSize: 12,
+    fontWeight: '900',
   },
   checkboxLabel: {
     color: '#d1d5db',
     fontSize: 12,
     flex: 1,
+  },
+  errorText: {
+    color: '#ef4444',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 8,
+  },
+  cancelBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+  },
+  cancelBtnText: {
+    color: '#9ca3af',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  confirmBtn: {
+    backgroundColor: '#10b981',
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmBtnDisabled: {
+    opacity: 0.5,
+  },
+  confirmBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  unlockInput: {
+    backgroundColor: '#0a0f0d',
+    borderWidth: 1,
+    borderColor: '#243029',
+    borderRadius: 8,
+    color: '#ffffff',
+    padding: 12,
+    fontSize: 14,
+    textAlignVertical: 'top',
+    marginBottom: 12,
   },
 });

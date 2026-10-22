@@ -21,6 +21,8 @@ export interface EncryptedItemEnvelope {
   encryptedMeta?: string; // Base64
   metaIv?: string; // Base64
   metaTag?: string; // Base64
+  salt?: string; // Hex salt for PBKDF2 key derivation
+  verificationToken?: string;
 }
 
 export interface SensitiveMediaMetadata {

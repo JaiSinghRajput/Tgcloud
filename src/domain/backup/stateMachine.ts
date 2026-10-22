@@ -29,6 +29,7 @@ export enum UploadJobState {
   COMPLETED = 'Completed',
   FAILED_RETRYABLE = 'FailedRetryable',
   FAILED_PERMANENT = 'FailedPermanent',
+  CANCELLED = 'Cancelled',
 }
 
 export enum RestoreJobState {

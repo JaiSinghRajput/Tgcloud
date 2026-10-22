@@ -253,6 +253,8 @@ export function encryptMediaPayload(
   plaintextMedia: Buffer,
   sensitiveMeta: SensitiveMediaMetadata,
   masterKey: Buffer,
+  saltHex?: string,
+  verificationToken?: string,
 ): { encryptedMedia: Buffer; envelope: EncryptedItemEnvelope } {
   // 1. Generate fresh random 256-bit DEK
   const dek = Buffer.from(getRandomBytes(KEY_LENGTH_BYTES));
@@ -278,6 +280,8 @@ export function encryptMediaPayload(
     encryptedMeta: metaEnc.ciphertext.toString('base64'),
     metaIv: metaEnc.iv,
     metaTag: metaEnc.tag,
+    ...(saltHex ? { salt: saltHex } : {}),
+    ...(verificationToken ? { verificationToken } : {}),
   };
 
   return {
@@ -366,4 +370,95 @@ export function createEncryptedCaptionEnvelope(
     contentHash: null,
     encryptionEnvelope: envelope,
   };
+}
+
+/**
+ * In-memory Session Key Store holding decrypted Master Key during active user session.
+ * Never persists raw secret to disk, logs, or analytics.
+ */
+class SessionKeyStoreManager {
+  private inMemoryMasterKey: Buffer | null = null;
+  private inMemoryRecoveryKey: string | null = null;
+  private encryptionConfig: EncryptionConfig | null = null;
+
+  setSessionKey(masterKey: Buffer, recoveryKey?: string, config?: EncryptionConfig) {
+    this.inMemoryMasterKey = masterKey;
+    if (recoveryKey) this.inMemoryRecoveryKey = recoveryKey;
+    if (config) this.encryptionConfig = config;
+  }
+
+  getSessionKey(): Buffer | null {
+    return this.inMemoryMasterKey;
+  }
+
+  getRecoveryKey(): string | null {
+    return this.inMemoryRecoveryKey;
+  }
+
+  getConfig(): EncryptionConfig | null {
+    return this.encryptionConfig;
+  }
+
+  setConfig(config: EncryptionConfig) {
+    this.encryptionConfig = config;
+  }
+
+  isUnlocked(): boolean {
+    return this.inMemoryMasterKey !== null;
+  }
+
+  clear() {
+    if (this.inMemoryMasterKey) {
+      this.inMemoryMasterKey.fill(0);
+      this.inMemoryMasterKey = null;
+    }
+    this.inMemoryRecoveryKey = null;
+  }
+}
+
+export const SessionKeyStore = new SessionKeyStoreManager();
+
+/**
+ * Attempts authenticated verification of a recovery passphrase against an encrypted object's DEK.
+ * Since AES-256-GCM is an authenticated cipher, successful decryption of encryptedDek guarantees the key is authentic!
+ */
+export function verifyPassphraseAgainstItem(
+  recoveryKey: string,
+  envelope: EncryptedItemEnvelope,
+  fallbackSaltHex?: string,
+): { valid: boolean; masterKey?: Buffer; masterKeyHex?: string; errorMessage?: string } {
+  try {
+    const saltHex = envelope.salt || fallbackSaltHex;
+    if (!saltHex) {
+      return {
+        valid: false,
+        errorMessage: 'Salt missing from encrypted envelope. Cannot derive key.',
+      };
+    }
+
+    const masterKey = deriveMasterKey(recoveryKey, saltHex, PBKDF2_ITERATIONS);
+    const dekBuffer = Buffer.from(envelope.encryptedDek, 'base64');
+    const dek = decryptBuffer(dekBuffer, masterKey, envelope.dekIv, envelope.dekTag);
+
+    if (dek && dek.length === KEY_LENGTH_BYTES) {
+      return {
+        valid: true,
+        masterKey,
+        masterKeyHex: masterKey.toString('hex'),
+      };
+    }
+
+    return {
+      valid: false,
+      errorMessage: 'Decrypted key size mismatch.',
+    };
+  } catch (err) {
+    return {
+      valid: false,
+      errorMessage:
+        err instanceof Error && err.message.includes('authenticate')
+          ? 'Incorrect recovery passphrase. Authentication tag mismatch.'
+          : 'Invalid recovery passphrase.',
+    };
+  }
 }

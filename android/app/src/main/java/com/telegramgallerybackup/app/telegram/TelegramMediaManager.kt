@@ -52,12 +52,19 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         val inputFile = TdApi.InputFileLocal().apply {
             this.path = localFile.absolutePath
         }
-        val inputPhoto = TdApi.InputPhoto().apply {
-            this.photo = inputFile
-        }
-        val content = TdApi.InputMessagePhoto().apply {
-            this.photo = inputPhoto
-            this.caption = formattedText
+        val content = if (metadata.encryptionEnvelope != null) {
+            TdApi.InputMessageDocument().apply {
+                this.document = inputFile
+                this.caption = formattedText
+            }
+        } else {
+            val inputPhoto = TdApi.InputPhoto().apply {
+                this.photo = inputFile
+            }
+            TdApi.InputMessagePhoto().apply {
+                this.photo = inputPhoto
+                this.caption = formattedText
+            }
         }
 
         val sendMessageReq = TdApi.SendMessage().apply {
@@ -107,16 +114,23 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         val inputFile = TdApi.InputFileLocal().apply {
             this.path = localFile.absolutePath
         }
-        val inputVideo = TdApi.InputVideo().apply {
-            this.video = inputFile
-            this.duration = durationSeconds
-            this.width = width
-            this.height = height
-            this.supportsStreaming = true
-        }
-        val content = TdApi.InputMessageVideo().apply {
-            this.video = inputVideo
-            this.caption = formattedText
+        val content = if (metadata.encryptionEnvelope != null) {
+            TdApi.InputMessageDocument().apply {
+                this.document = inputFile
+                this.caption = formattedText
+            }
+        } else {
+            val inputVideo = TdApi.InputVideo().apply {
+                this.video = inputFile
+                this.duration = durationSeconds
+                this.width = width
+                this.height = height
+                this.supportsStreaming = true
+            }
+            TdApi.InputMessageVideo().apply {
+                this.video = inputVideo
+                this.caption = formattedText
+            }
         }
 
         val sendMessageReq = TdApi.SendMessage().apply {

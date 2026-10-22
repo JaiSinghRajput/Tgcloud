@@ -262,4 +262,63 @@ export class BackupEngine {
 
     return { reconciledBackedUp, resetToQueued };
   }
+
+  /**
+   * Cancels all pending and in-flight upload jobs.
+   */
+  async cancelAll(): Promise<number> {
+    this.isPaused = true;
+    return await this.repo.cancelPendingUploadJobs();
+  }
+
+  /**
+   * Retries all failed upload jobs.
+   */
+  async retryFailed(): Promise<number> {
+    return await this.repo.retryFailedUploadJobs();
+  }
+
+  /**
+   * Returns current counts across queue states for activity dashboard.
+   */
+  async getQueueStats(): Promise<{
+    pending: number;
+    running: number;
+    completed: number;
+    failed: number;
+    total: number;
+  }> {
+    const jobs = await this.repo.listUploadJobs();
+    let pending = 0;
+    let running = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const j of jobs) {
+      switch (j.state) {
+        case UploadJobState.PENDING:
+          pending++;
+          break;
+        case UploadJobState.RUNNING:
+        case UploadJobState.VERIFYING:
+          running++;
+          break;
+        case UploadJobState.COMPLETED:
+          completed++;
+          break;
+        case UploadJobState.FAILED_PERMANENT:
+        case UploadJobState.FAILED_RETRYABLE:
+          failed++;
+          break;
+      }
+    }
+
+    return {
+      pending,
+      running,
+      completed,
+      failed,
+      total: jobs.length,
+    };
+  }
 }

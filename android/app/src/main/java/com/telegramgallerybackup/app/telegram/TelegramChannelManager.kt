@@ -48,10 +48,55 @@ class TelegramChannelManager(private val tdLibService: TdLibService) {
     }
 
     /**
-     * Searches server chats for a channel with matching title.
+     * Searches user's chats and server for a channel with matching title.
+     * Loads local chats first so private channels are discoverable across sessions and after app data clear.
      */
     private suspend fun findChannelByTitle(targetTitle: String): TdApi.Chat? {
         return try {
+            // 1. Ensure user's main chat list is loaded into TDLib memory
+            try {
+                tdLibService.send(TdApi.LoadChats(TdApi.ChatListMain(), 100))
+            } catch (e: Exception) {
+                // Ignore if chats are already fully loaded or 404 at end of list
+            }
+
+            // 2. Search user's existing dialogs and channels
+            try {
+                val localSearchReq = TdApi.SearchChats().apply {
+                    this.query = targetTitle
+                    this.limit = 20
+                }
+                val localResult: TdApi.Chats = tdLibService.send(localSearchReq)
+                for (chatId in localResult.chatIds) {
+                    val chat: TdApi.Chat = tdLibService.send(TdApi.GetChat(chatId))
+                    if (chat.title.equals(targetTitle, ignoreCase = true)) {
+                        val chatType = chat.type
+                        if (chatType is TdApi.ChatTypeSupergroup && chatType.isChannel) {
+                            return chat
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d(tag, "Local search notice: ${e.message}")
+            }
+
+            // 3. Scan user's chat list directly
+            try {
+                val chats: TdApi.Chats = tdLibService.send(TdApi.GetChats(TdApi.ChatListMain(), 100))
+                for (chatId in chats.chatIds) {
+                    val chat: TdApi.Chat = tdLibService.send(TdApi.GetChat(chatId))
+                    if (chat.title.equals(targetTitle, ignoreCase = true)) {
+                        val chatType = chat.type
+                        if (chatType is TdApi.ChatTypeSupergroup && chatType.isChannel) {
+                            return chat
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Ignore
+            }
+
+            // 4. Server search as fallback
             val req = TdApi.SearchChatsOnServer().apply {
                 this.query = targetTitle
                 this.limit = 20

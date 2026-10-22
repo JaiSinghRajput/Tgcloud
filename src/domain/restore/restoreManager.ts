@@ -131,6 +131,63 @@ export class RestoreManager {
   }
 
   /**
+   * Decrypts metadata for previously locked encrypted media items once masterKey is provided.
+   */
+  async unlockEncryptedMedia(
+    historyItems: TelegramHistoryItem[],
+    masterKey: Buffer,
+  ): Promise<number> {
+    let unlocked = 0;
+    for (const item of historyItems) {
+      if (!item.encryptionEnvelope) continue;
+      const encObj: EncryptedItemEnvelope | null =
+        typeof item.encryptionEnvelope === 'string'
+          ? (() => {
+              try {
+                return JSON.parse(item.encryptionEnvelope as string);
+              } catch {
+                return null;
+              }
+            })()
+          : item.encryptionEnvelope;
+
+      if (encObj?.encryptedDek && encObj?.encryptedMeta) {
+        try {
+          const dekBuffer = Buffer.from(encObj.encryptedDek, 'base64');
+          const dek = decryptBuffer(
+            dekBuffer,
+            masterKey,
+            encObj.dekIv,
+            encObj.dekTag,
+          );
+          const metaJson = decryptBuffer(
+            Buffer.from(encObj.encryptedMeta, 'base64'),
+            dek,
+            encObj.metaIv!,
+            encObj.metaTag!,
+          ).toString('utf8');
+          const meta = JSON.parse(metaJson);
+
+          const existing = await this.repo.getMediaItem(item.mediaId);
+          if (existing) {
+            await this.repo.upsertMediaItem({
+              ...existing,
+              displayName: meta.originalName || existing.displayName,
+              relativePath: meta.relativePath || existing.relativePath,
+              mimeType: meta.mimeType || existing.mimeType,
+              contentHash: meta.contentHash || existing.contentHash,
+            });
+            unlocked++;
+          }
+        } catch {
+          // Authentication tag failed or corrupted item
+        }
+      }
+    }
+    return unlocked;
+  }
+
+  /**
    * Resolves collision when target restore file already exists locally.
    */
   resolveConflict(

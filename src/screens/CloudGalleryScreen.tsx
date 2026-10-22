@@ -3,16 +3,27 @@ import {
   View,
   Text,
   StyleSheet,
-  ScrollView,
-  TextInput,
   TouchableOpacity,
   Modal,
-  Switch,
   Image,
+  FlatList,
+  TextInput,
+  Dimensions,
+  ActivityIndicator,
 } from 'react-native';
 import { ConflictPolicy } from '../domain/backup/stateMachine';
 import { BackupTransferProgress } from '../domain/backup/engine';
 import { MediaPermissionStatus } from '../domain/permissions/permissionService';
+import { TelegramBackupChannels } from '../types/telegram';
+import {
+  SessionKeyStore,
+  verifyPassphraseAgainstItem,
+  verifyRecoveryKey,
+  normalizeRecoveryKey,
+} from '../domain/crypto/encryptionService';
+import { EncryptedItemEnvelope } from '../types/encryption';
+
+const SCREEN_WIDTH = Dimensions.get('window').width;
 
 export interface CloudMediaItem {
   id: string;
@@ -24,6 +35,9 @@ export interface CloudMediaItem {
   messageId: string;
   channelId: string;
   fileId?: number;
+  isEncrypted?: boolean;
+  isLocked?: boolean;
+  encryptionEnvelope?: EncryptedItemEnvelope | string | null;
 }
 
 export interface DiscoveredMediaItem {
@@ -54,6 +68,8 @@ export interface CloudGalleryScreenProps {
   isPaused?: boolean;
   activeProgress?: BackupTransferProgress | null;
   mediaPermissionStatus?: MediaPermissionStatus;
+  channels?: TelegramBackupChannels | null;
+  initialView?: 'device' | 'cloud';
   onRequestPermission?: () => void;
   onOpenAppSettings?: () => void;
   onRescan?: () => void;
@@ -64,47 +80,58 @@ export interface CloudGalleryScreenProps {
     item: CloudMediaItem,
     policy: ConflictPolicy,
   ) => Promise<boolean>;
+  onOpenChannelInTelegram?: (channelId: string) => void;
+  onResyncChannels?: () => void;
+  onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
 }
 
 export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   items,
   scannedItems = [],
-  folders = [],
-  eligibleCount = 0,
-  eligibleBytes = 0,
-  isPaused = false,
-  activeProgress = null,
+  folders: _folders = [],
+  eligibleCount: _eligibleCount = 0,
+  eligibleBytes: _eligibleBytes = 0,
+  isPaused: _isPaused = false,
+  activeProgress: _activeProgress = null,
   mediaPermissionStatus = 'granted',
+  channels = null,
+  initialView = 'device',
   onRequestPermission,
   onOpenAppSettings,
   onRescan,
-  onToggleFolderExclusion,
+  onToggleFolderExclusion: _onToggleFolderExclusion,
   onConfirmBackup,
-  onTogglePause,
+  onTogglePause: _onTogglePause,
   onRestoreItem,
+  onOpenChannelInTelegram,
+  onResyncChannels,
+  onUnlockPassphrase,
 }) => {
-  const [activeView, setActiveView] = useState<'cloud' | 'device'>(
-    items.length > 0 ? 'cloud' : 'device',
-  );
-  const [filterType, setFilterType] = useState<'all' | 'photo' | 'video'>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [selectedFolder, setSelectedFolder] = useState<string>('all');
+  // Navigation View: 'device' (Local Gallery) or 'cloud' (Telegram Cloud Backups)
+  const [activeView, setActiveView] = useState<'device' | 'cloud'>(initialView);
 
-  // Multi-Selection Mode State (Activated on Long Press)
+  // Layout Toggle: exactly 1-column or 2-column thumbnail view
+  const [columnCount, setColumnCount] = useState<1 | 2>(2);
+
+  // Filter chips: 'all' | 'photo' | 'video'
+  const [filterType, setFilterType] = useState<'all' | 'photo' | 'video'>('all');
+
+  // Multi-Selection State for Backup
   const [isSelectionMode, setIsSelectionMode] = useState<boolean>(false);
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
 
-  // In-App Media Viewer / Preview Modal State
+  // In-App Full-Screen Viewer State
   const [previewItem, setPreviewItem] = useState<
     DiscoveredMediaItem | CloudMediaItem | null
   >(null);
+  const [isPlayingVideo, setIsPlayingVideo] = useState<boolean>(false);
 
-  // Thumbnail load error tracking
-  const [imageErrorMap, setImageErrorMap] = useState<Record<string, boolean>>({});
-
-  // Initial Backup confirmation modal
-  const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
-  const [showFoldersInModal, setShowFoldersInModal] = useState<boolean>(false);
+  // Unlock Recovery Modal State
+  const [showUnlockModal, setShowUnlockModal] = useState<boolean>(false);
+  const [passphraseInput, setPassphraseInput] = useState<string>('');
+  const [unlockError, setUnlockError] = useState<string | null>(null);
+  const [unlockSuccess, setUnlockSuccess] = useState<string | null>(null);
+  const [isVerifyingKey, setIsVerifyingKey] = useState<boolean>(false);
 
   // Restore Modal State
   const [restoreModalItem, setRestoreModalItem] = useState<CloudMediaItem | null>(null);
@@ -113,6 +140,9 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   );
   const [restoring, setRestoring] = useState<boolean>(false);
   const [restoreStatus, setRestoreStatus] = useState<string>('');
+
+  // Thumbnail load error tracking
+  const [imageErrorMap, setImageErrorMap] = useState<Record<string, boolean>>({});
 
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B';
@@ -123,6 +153,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   };
 
   const formatDate = (ms: number): string => {
+    if (!ms) return 'Unknown date';
     return new Date(ms).toLocaleDateString([], {
       year: 'numeric',
       month: 'short',
@@ -130,68 +161,33 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     });
   };
 
-  // Cloud folders derivation
-  const cloudFolders = useMemo(() => {
-    return Array.from(
-      new Set(
-        items.map(i => {
-          const parts = i.relativePath.split('/');
-          return parts.length > 1 ? parts.slice(0, -1).join('/') : 'Root';
-        }),
-      ),
-    );
-  }, [items]);
-
-  // Device folders derivation
-  const deviceFolders = useMemo(() => folders.map(f => f.folderKey), [folders]);
-
-  const currentFolderList = activeView === 'cloud' ? cloudFolders : deviceFolders;
-
+  // Backed-up ID set for fast status lookups
   const backedUpIdSet = useMemo(() => new Set(items.map(ci => ci.id)), [items]);
 
-  // Filtered cloud items
-  const filteredCloudItems = useMemo(() => {
-    return items.filter(item => {
-      if (filterType !== 'all' && item.mediaType !== filterType) return false;
-      if (selectedFolder !== 'all') {
-        const itemFolder = item.relativePath.includes('/')
-          ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
-          : 'Root';
-        if (itemFolder !== selectedFolder) return false;
-      }
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        return (
-          item.originalName.toLowerCase().includes(q) ||
-          item.relativePath.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [items, filterType, selectedFolder, searchQuery]);
+  // Locked encrypted items detection
+  const isUnlocked = SessionKeyStore.isUnlocked();
+  const lockedItemsCount = useMemo(() => {
+    return items.filter(i => {
+      const isEnc = i.isEncrypted || !!i.encryptionEnvelope;
+      return isEnc && (!isUnlocked || i.isLocked);
+    }).length;
+  }, [items, isUnlocked]);
 
-  // Filtered device items
+  // Filtered device media items
   const filteredDeviceItems = useMemo(() => {
     return scannedItems.filter(item => {
       if (filterType !== 'all' && item.mediaType !== filterType) return false;
-      if (selectedFolder !== 'all') {
-        const itemFolder = item.relativePath.includes('/')
-          ? item.relativePath.substring(0, item.relativePath.lastIndexOf('/'))
-          : 'Root';
-        if (!itemFolder.toLowerCase().includes(selectedFolder.toLowerCase())) {
-          return false;
-        }
-      }
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase();
-        return (
-          item.displayName.toLowerCase().includes(q) ||
-          item.relativePath.toLowerCase().includes(q)
-        );
-      }
       return true;
     });
-  }, [scannedItems, filterType, selectedFolder, searchQuery]);
+  }, [scannedItems, filterType]);
+
+  // Filtered cloud media items
+  const filteredCloudItems = useMemo(() => {
+    return items.filter(item => {
+      if (filterType !== 'all' && item.mediaType !== filterType) return false;
+      return true;
+    });
+  }, [items, filterType]);
 
   // Selection calculations
   const totalSelectedBytes = useMemo(() => {
@@ -214,6 +210,20 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setSelectedItemIds(next);
     } else {
       setPreviewItem(item);
+      setIsPlayingVideo(false);
+    }
+  };
+
+  const handleCloudItemPress = (item: CloudMediaItem) => {
+    const isItemLocked = (item.isEncrypted || !!item.encryptionEnvelope) && !isUnlocked;
+    if (isItemLocked) {
+      setPassphraseInput('');
+      setUnlockError(null);
+      setUnlockSuccess(null);
+      setShowUnlockModal(true);
+    } else {
+      setPreviewItem(item);
+      setIsPlayingVideo(false);
     }
   };
 
@@ -247,324 +257,316 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     try {
       const success = await onRestoreItem(restoreModalItem, selectedPolicy);
       if (success) {
-        setRestoreStatus(
-          `Restored '${restoreModalItem.originalName}' successfully!`,
-        );
+        setRestoreStatus('✓ Restored successfully to device!');
         setTimeout(() => {
+          setRestoring(false);
           setRestoreModalItem(null);
           setRestoreStatus('');
-        }, 1500);
+        }, 1200);
       } else {
-        setRestoreStatus('Restore failed or source missing.');
+        setRestoreStatus('Restoration encountered an issue.');
+        setRestoring(false);
       }
     } catch (e: any) {
-      setRestoreStatus(`Restore error: ${e.message}`);
-    } finally {
+      setRestoreStatus(`Restore failed: ${e?.message || 'Download error'}`);
       setRestoring(false);
     }
   };
 
+  const handleVerifyAndUnlock = async () => {
+    const raw = passphraseInput.trim();
+    if (!raw) {
+      setUnlockError('Please enter your 12-word recovery passphrase.');
+      return;
+    }
+
+    const words = normalizeRecoveryKey(raw).split(' ');
+    if (words.length < 12) {
+      setUnlockError('Recovery passphrase must contain all 12 words separated by spaces.');
+      return;
+    }
+
+    setIsVerifyingKey(true);
+    setUnlockError(null);
+
+    try {
+      // Attempt verification against the first locked encrypted item or config
+      const sampleLockedItem = items.find(
+        i => (i.isEncrypted || !!i.encryptionEnvelope) && i.encryptionEnvelope,
+      );
+
+      let isValid = false;
+
+      if (sampleLockedItem && sampleLockedItem.encryptionEnvelope) {
+        const encObj: EncryptedItemEnvelope =
+          typeof sampleLockedItem.encryptionEnvelope === 'string'
+            ? JSON.parse(sampleLockedItem.encryptionEnvelope)
+            : sampleLockedItem.encryptionEnvelope;
+
+        const verifyResult = verifyPassphraseAgainstItem(raw, encObj);
+        if (verifyResult.valid && verifyResult.masterKey) {
+          isValid = true;
+          SessionKeyStore.setSessionKey(verifyResult.masterKey, raw);
+        } else {
+          setUnlockError(
+            verifyResult.errorMessage ||
+              'Incorrect recovery passphrase. Please verify your 12 words.',
+          );
+          setIsVerifyingKey(false);
+          return;
+        }
+      } else {
+        // Fallback: check config if available
+        const cfg = SessionKeyStore.getConfig();
+        if (cfg) {
+          const verifyResult = verifyRecoveryKey(raw, cfg);
+          if (verifyResult.valid) {
+            isValid = true;
+            const masterKey = Buffer.from(verifyResult.masterKeyHex!, 'hex');
+            SessionKeyStore.setSessionKey(masterKey, raw, cfg);
+          } else {
+            setUnlockError(verifyResult.errorMessage || 'Incorrect recovery passphrase.');
+            setIsVerifyingKey(false);
+            return;
+          }
+        } else {
+          // No encrypted object or config exists yet
+          setUnlockError(
+            'Cannot verify passphrase: no encrypted cloud media exists yet to authenticate against.',
+          );
+          setIsVerifyingKey(false);
+          return;
+        }
+      }
+
+      if (isValid) {
+        setUnlockSuccess('✓ Passphrase verified! Decrypting cloud media...');
+        if (onUnlockPassphrase) {
+          await onUnlockPassphrase(raw);
+        }
+        setTimeout(() => {
+          setIsVerifyingKey(false);
+          setShowUnlockModal(false);
+          setUnlockSuccess(null);
+        }, 800);
+      }
+    } catch (e: any) {
+      setUnlockError(`Verification error: ${e?.message || 'Authentication failed'}`);
+      setIsVerifyingKey(false);
+    }
+  };
+
+  const handleLockAgain = () => {
+    SessionKeyStore.clear();
+  };
+
   const hasPermissionIssue =
     mediaPermissionStatus === 'denied' || mediaPermissionStatus === 'blocked';
-  const hasPartialPermission = mediaPermissionStatus === 'partial';
+
+  // Compute thumbnail dimensions for 1-column vs 2-column views
+  const itemSize =
+    columnCount === 1
+      ? SCREEN_WIDTH - 24
+      : (SCREEN_WIDTH - 30) / 2;
+
+  // Render Local Media Thumbnail Item (Thumbnails Only, No Cards)
+  const renderDeviceGridItem = ({ item }: { item: DiscoveredMediaItem }) => {
+    const isBackedUp = backedUpIdSet.has(item.id);
+    const isSelected = selectedItemIds.has(item.id);
+    const hasImageError = !!imageErrorMap[item.id];
+
+    return (
+      <TouchableOpacity
+        key={item.id}
+        style={[
+          styles.thumbnailContainer,
+          { width: itemSize, height: itemSize },
+          isSelected && styles.thumbnailSelected,
+        ]}
+        activeOpacity={0.8}
+        onPress={() => handleItemPress(item)}
+        onLongPress={() => handleItemLongPress(item)}
+      >
+        {item.sourceKey && !hasImageError ? (
+          <Image
+            source={{ uri: item.sourceKey }}
+            style={styles.thumbnailImage}
+            resizeMode="cover"
+            fadeDuration={0}
+            onError={() =>
+              setImageErrorMap(prev => ({ ...prev, [item.id]: true }))
+            }
+          />
+        ) : (
+          <View style={styles.thumbnailFallback}>
+            <Text style={styles.thumbnailFallbackIcon}>
+              {item.mediaType === 'video' ? '▶' : '🖼'}
+            </Text>
+          </View>
+        )}
+
+        {/* Video Indicator Badge */}
+        {item.mediaType === 'video' && (
+          <View style={styles.videoBadge}>
+            <Text style={styles.videoBadgeText}>▶ Video</Text>
+          </View>
+        )}
+
+        {/* Backed-up to Telegram Checkmark Badge */}
+        {isBackedUp && (
+          <View style={styles.backedUpBadge}>
+            <Text style={styles.backedUpBadgeText}>✓</Text>
+          </View>
+        )}
+
+        {/* Selection Checkbox */}
+        {isSelectionMode && (
+          <View
+            style={[
+              styles.selectionOverlayCheck,
+              isSelected && styles.selectionOverlayCheckActive,
+            ]}
+          >
+            {isSelected && <Text style={styles.selectionCheckmarkText}>✓</Text>}
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
+
+  // Render Cloud Media Thumbnail Item (Thumbnails Only, No Cards)
+  const renderCloudGridItem = ({ item }: { item: CloudMediaItem }) => {
+    const isItemLocked = (item.isEncrypted || !!item.encryptionEnvelope) && !isUnlocked;
+
+    return (
+      <TouchableOpacity
+        key={item.id}
+        style={[styles.thumbnailContainer, { width: itemSize, height: itemSize }]}
+        activeOpacity={0.8}
+        onPress={() => handleCloudItemPress(item)}
+      >
+        {isItemLocked ? (
+          <View style={styles.lockedThumbnailBox}>
+            <Text style={styles.lockedIcon}>🔒</Text>
+            <Text style={styles.lockedText}>Locked</Text>
+          </View>
+        ) : (
+          <View style={styles.cloudThumbnailBox}>
+            <Text style={styles.thumbnailFallbackIcon}>
+              {item.mediaType === 'video' ? '▶' : '🖼'}
+            </Text>
+          </View>
+        )}
+
+        {/* Video Indicator Badge */}
+        {item.mediaType === 'video' && (
+          <View style={styles.videoBadge}>
+            <Text style={styles.videoBadgeText}>▶ Video</Text>
+          </View>
+        )}
+
+        {/* Encrypted indicator */}
+        {(item.isEncrypted || !!item.encryptionEnvelope) && (
+          <View style={styles.encryptedBadge}>
+            <Text style={styles.encryptedBadgeText}>
+              {isItemLocked ? '🔒' : '🛡️'}
+            </Text>
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <View style={styles.container}>
-      {/* Sticky Selection Mode Bar */}
-      {isSelectionMode && (
-        <View style={styles.selectionBar}>
-          <View style={styles.selectionBarInfo}>
-            <Text style={styles.selectionBarTitle}>
-              {selectedItemIds.size} Selected
-            </Text>
-            <Text style={styles.selectionBarSub}>
-              {formatBytes(totalSelectedBytes)}
-            </Text>
-          </View>
-
-          <View style={styles.selectionBarActions}>
+      {/* 1. Header with Gallery Title and Layout Toggle */}
+      <View style={styles.topHeader}>
+        <View style={styles.titleRow}>
+          <Text style={styles.headerTitle}>Gallery</Text>
+          <View style={styles.layoutToggleRow}>
+            {/* 1-Column / 2-Column Layout Toggle Button */}
             <TouchableOpacity
-              style={styles.selectionBarBtnSecondary}
-              onPress={handleToggleSelectAll}
+              style={[
+                styles.layoutBtn,
+                columnCount === 1 && styles.layoutBtnActive,
+              ]}
+              onPress={() => setColumnCount(1)}
+              accessibilityLabel="One-column layout"
             >
-              <Text style={styles.selectionBarBtnSecondaryText}>
-                {selectedItemIds.size === filteredDeviceItems.length
-                  ? 'Deselect'
-                  : 'All'}
+              <Text
+                style={[
+                  styles.layoutBtnText,
+                  columnCount === 1 && styles.layoutBtnTextActive,
+                ]}
+              >
+                1 Col
               </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.selectionBarBtnSecondary}
-              onPress={() => {
-                setIsSelectionMode(false);
-                setSelectedItemIds(new Set());
-              }}
-            >
-              <Text style={styles.selectionBarBtnSecondaryText}>Cancel</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
               style={[
-                styles.selectionBarBtnPrimary,
-                selectedItemIds.size === 0 && styles.buttonDisabled,
+                styles.layoutBtn,
+                columnCount === 2 && styles.layoutBtnActive,
               ]}
-              onPress={handleBackupSelected}
-              disabled={selectedItemIds.size === 0}
+              onPress={() => setColumnCount(2)}
+              accessibilityLabel="Two-column layout"
             >
-              <Text style={styles.selectionBarBtnPrimaryText}>
-                Backup ({selectedItemIds.size})
+              <Text
+                style={[
+                  styles.layoutBtnText,
+                  columnCount === 2 && styles.layoutBtnTextActive,
+                ]}
+              >
+                2 Col
               </Text>
             </TouchableOpacity>
           </View>
         </View>
-      )}
 
-      <ScrollView contentContainerStyle={styles.content}>
-        {/* Screen Header */}
-        <View style={styles.header}>
-          <View style={styles.headerTopRow}>
-            <View>
-              <Text style={styles.headerEyebrow}>SECURE STORAGE</Text>
-              <Text style={styles.headerTitle}>Gallery</Text>
-            </View>
-            {onRescan && (
-              <TouchableOpacity
-                style={styles.rescanButton}
-                onPress={onRescan}
-                accessibilityLabel="Rescan device media"
-              >
-                <Text style={styles.rescanButtonText}>↻ Rescan</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-          <Text style={styles.headerDesc}>
-            Private photo and video backup encrypted directly into your Telegram cloud channels.
-          </Text>
-        </View>
-
-        {/* 1. Android Permission Alert Banner */}
-        {hasPermissionIssue && (
-          <View style={styles.permissionAlertCard}>
-            <View style={styles.permissionAlertHeader}>
-              <Text style={styles.permissionAlertTitle}>
-                Photo & Video Permission Needed
-              </Text>
-            </View>
-            <Text style={styles.permissionAlertDesc}>
-              TG Cloud needs access to your device storage to discover, preview, and back up your photos and videos.
-            </Text>
-            <TouchableOpacity
-              style={styles.permissionActionButton}
-              onPress={
-                mediaPermissionStatus === 'blocked' && onOpenAppSettings
-                  ? onOpenAppSettings
-                  : onRequestPermission
-              }
-            >
-              <Text style={styles.permissionActionButtonText}>
-                {mediaPermissionStatus === 'blocked'
-                  ? 'Open Android App Settings'
-                  : 'Allow Photo & Video Access'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        )}
-
-        {hasPartialPermission && (
-          <View style={styles.partialAlertCard}>
-            <View style={styles.partialAlertTextCol}>
-              <Text style={styles.partialAlertTitle}>Selected Photos Only</Text>
-              <Text style={styles.partialAlertDesc}>
-                Access is limited to photos you selected in Android 14+. Grant full access to back up all media.
-              </Text>
-            </View>
-            {onRequestPermission && (
-              <TouchableOpacity
-                style={styles.partialActionBtn}
-                onPress={onRequestPermission}
-              >
-                <Text style={styles.partialActionText}>Manage</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        )}
-
-        {/* 2. Concise Backup Status Bar */}
-        <View style={styles.statusBarCard}>
-          {activeProgress ? (
-            <View style={styles.progressSection}>
-              <View style={styles.statusRow}>
-                <View style={styles.statusBadgeRow}>
-                  <View style={styles.statusDotActive} />
-                  <Text style={styles.statusLabelActive}>UPLOADING</Text>
-                </View>
-                <Text style={styles.statusPercent}>
-                  {activeProgress.totalBytes > 0
-                    ? `${Math.round(
-                        (activeProgress.bytesUploaded /
-                          activeProgress.totalBytes) *
-                          100,
-                      )}%`
-                    : 'Starting...'}
-                </Text>
-              </View>
-
-              <Text style={styles.statusFileName} numberOfLines={1}>
-                {activeProgress.displayName}
-              </Text>
-
-              <View style={styles.progressBarBackground}>
-                <View
-                  style={[
-                    styles.progressBarFill,
-                    {
-                      width: `${
-                        activeProgress.totalBytes > 0
-                          ? Math.min(
-                              100,
-                              Math.round(
-                                (activeProgress.bytesUploaded /
-                                  activeProgress.totalBytes) *
-                                  100,
-                              ),
-                            )
-                          : 10
-                      }%`,
-                    },
-                  ]}
-                />
-              </View>
-
-              <View style={styles.statusBottomRow}>
-                <Text style={styles.statusMeta}>
-                  {formatBytes(activeProgress.bytesUploaded)} /{' '}
-                  {formatBytes(activeProgress.totalBytes)}
-                </Text>
-                {onTogglePause && (
-                  <TouchableOpacity
-                    style={styles.pauseSmallButton}
-                    onPress={onTogglePause}
-                  >
-                    <Text style={styles.pauseSmallButtonText}>Pause</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-          ) : isPaused ? (
-            <View style={styles.pausedSection}>
-              <View style={styles.statusRow}>
-                <View style={styles.statusBadgeRow}>
-                  <View style={styles.statusDotPaused} />
-                  <Text style={styles.statusLabelPaused}>BACKUP PAUSED</Text>
-                </View>
-                {onTogglePause && (
-                  <TouchableOpacity
-                    style={styles.resumeSmallButton}
-                    onPress={onTogglePause}
-                  >
-                    <Text style={styles.resumeSmallButtonText}>Resume Sync</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-              <Text style={styles.statusPausedDesc}>
-                Sync is paused. Tap Resume to continue uploading queued photos.
-              </Text>
-            </View>
-          ) : eligibleCount > 0 ? (
-            <View style={styles.readySection}>
-              <View style={styles.statusRow}>
-                <View style={styles.statusInfoCol}>
-                  <Text style={styles.readyTitle}>
-                    {eligibleCount} {eligibleCount === 1 ? 'item' : 'items'} ready to back up
-                  </Text>
-                  <Text style={styles.readySub}>
-                    Total size: {formatBytes(eligibleBytes)}
-                  </Text>
-                </View>
-                {onConfirmBackup && (
-                  <TouchableOpacity
-                    style={styles.backupActionButton}
-                    onPress={() => setShowConfirmModal(true)}
-                  >
-                    <Text style={styles.backupActionButtonText}>Start Backup</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-          ) : items.length > 0 ? (
-            <View style={styles.syncedSection}>
-              <Text style={styles.syncedText}>
-                ✓ All discovered media backed up ({items.length} in Telegram Cloud)
-              </Text>
-            </View>
-          ) : (
-            <View style={styles.syncedSection}>
-              <Text style={styles.syncedText}>
-                No pending items. Your gallery is up to date.
-              </Text>
-            </View>
-          )}
-        </View>
-
-        {/* 3. View Switcher Pills */}
-        <View style={styles.viewTabs}>
+        {/* Primary View Switcher Tabs: Local Device vs Cloud Backups */}
+        <View style={styles.tabSwitchContainer}>
           <TouchableOpacity
             style={[
-              styles.viewTab,
-              activeView === 'cloud' && styles.viewTabActive,
+              styles.tabSwitchBtn,
+              activeView === 'device' && styles.tabSwitchBtnActive,
             ]}
             onPress={() => {
-              setActiveView('cloud');
-              setSelectedFolder('all');
+              setActiveView('device');
               setIsSelectionMode(false);
             }}
           >
             <Text
               style={[
-                styles.viewTabText,
-                activeView === 'cloud' && styles.viewTabTextActive,
-              ]}
-            >
-              Cloud Backups ({items.length})
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[
-              styles.viewTab,
-              activeView === 'device' && styles.viewTabActive,
-            ]}
-            onPress={() => {
-              setActiveView('device');
-              setSelectedFolder('all');
-            }}
-          >
-            <Text
-              style={[
-                styles.viewTabText,
-                activeView === 'device' && styles.viewTabTextActive,
+                styles.tabSwitchText,
+                activeView === 'device' && styles.tabSwitchTextActive,
               ]}
             >
               Device Media ({scannedItems.length})
             </Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[
+              styles.tabSwitchBtn,
+              activeView === 'cloud' && styles.tabSwitchBtnActive,
+            ]}
+            onPress={() => {
+              setActiveView('cloud');
+              setIsSelectionMode(false);
+            }}
+          >
+            <Text
+              style={[
+                styles.tabSwitchText,
+                activeView === 'cloud' && styles.tabSwitchTextActive,
+              ]}
+            >
+              Telegram Cloud ({items.length})
+            </Text>
+          </TouchableOpacity>
         </View>
 
-        {/* 4. Search and Filter Controls */}
-        <TextInput
-          style={styles.searchInput}
-          placeholder={
-            activeView === 'cloud'
-              ? 'Search backed-up files...'
-              : 'Search device photos & videos...'
-          }
-          placeholderTextColor="#6b7280"
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-        />
-
-        {/* Filter Pills (All / Photos / Videos) */}
+        {/* Filter Pills Row */}
         <View style={styles.filterPillsRow}>
           <TouchableOpacity
             style={[
@@ -582,7 +584,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               All
             </Text>
           </TouchableOpacity>
-
           <TouchableOpacity
             style={[
               styles.filterPill,
@@ -599,7 +600,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               Photos
             </Text>
           </TouchableOpacity>
-
           <TouchableOpacity
             style={[
               styles.filterPill,
@@ -616,492 +616,431 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               Videos
             </Text>
           </TouchableOpacity>
-        </View>
 
-        {/* Folder Chips */}
-        {currentFolderList.length > 1 && (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={styles.folderScroll}
-          >
-            <TouchableOpacity
-              style={[
-                styles.folderChip,
-                selectedFolder === 'all' && styles.folderChipActive,
-              ]}
-              onPress={() => setSelectedFolder('all')}
-            >
-              <Text
-                style={[
-                  styles.folderChipText,
-                  selectedFolder === 'all' && styles.folderChipTextActive,
-                ]}
-              >
-                All Folders
-              </Text>
+          {activeView === 'device' && onRescan && (
+            <TouchableOpacity style={styles.rescanChip} onPress={onRescan}>
+              <Text style={styles.rescanChipText}>↻ Refresh</Text>
             </TouchableOpacity>
-            {currentFolderList.map(folder => (
-              <TouchableOpacity
-                key={folder}
-                style={[
-                  styles.folderChip,
-                  selectedFolder === folder && styles.folderChipActive,
-                ]}
-                onPress={() => setSelectedFolder(folder)}
-              >
-                <Text
-                  style={[
-                    styles.folderChipText,
-                    selectedFolder === folder && styles.folderChipTextActive,
-                  ]}
-                >
-                  {folder}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
-        )}
+          )}
 
-        {/* Selection mode tip */}
-        {activeView === 'device' && !isSelectionMode && scannedItems.length > 0 && (
-          <Text style={styles.selectionTipText}>
-            💡 Long press any item to select and back up specific photos
+          {activeView === 'cloud' && isUnlocked && (
+            <TouchableOpacity style={styles.lockNowChip} onPress={handleLockAgain}>
+              <Text style={styles.lockNowChipText}>🔒 Lock</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      {/* 2. Permission Banner (Rendered when Permission Needed) */}
+      {hasPermissionIssue && (
+        <View style={styles.permBanner}>
+          <Text style={styles.permTitle}>Photo & Video Permission Needed</Text>
+          <Text style={styles.permSubtitle}>
+            TG Cloud requires access to your device media to browse and securely back up your photos.
           </Text>
-        )}
+          <TouchableOpacity
+            style={styles.permBtn}
+            onPress={
+              mediaPermissionStatus === 'blocked'
+                ? onOpenAppSettings
+                : onRequestPermission
+            }
+          >
+            <Text style={styles.permBtnText}>Allow Photo & Video Access</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
-        {/* 5. Items Display List */}
-        {activeView === 'cloud' ? (
-          <View style={styles.itemsList}>
-            {filteredCloudItems.length === 0 ? (
-              <View style={styles.emptyCard}>
-                <Text style={styles.emptyTitle}>
-                  {items.length === 0
-                    ? 'No photos backed up yet'
-                    : 'No matches found'}
-                </Text>
-                <Text style={styles.emptySubtitle}>
-                  {items.length === 0
-                    ? 'Scan your device media and tap Start Backup to begin syncing photos to Telegram.'
-                    : 'Try adjusting your search query or folder filter.'}
-                </Text>
-              </View>
-            ) : (
-              filteredCloudItems.map(item => (
-                <TouchableOpacity
-                  key={item.id}
-                  style={styles.mediaItemCard}
-                  activeOpacity={0.7}
-                  onPress={() => setPreviewItem(item)}
-                >
-                  <View style={styles.mediaItemThumb}>
-                    <Text style={styles.mediaItemIconText}>
-                      {item.mediaType === 'video' ? '▶' : '🖼'}
-                    </Text>
-                  </View>
+      {/* 3. Cloud Destination & Channel Info Bar (In Cloud View) */}
+      {activeView === 'cloud' && channels && (
+        <View style={styles.destinationBar}>
+          <View style={styles.destinationInfo}>
+            <Text style={styles.destinationLabel}>BACKUP DESTINATION</Text>
+            <Text style={styles.destinationTitle}>
+              {channels.photoChannelTitle || 'Backup - Photos'} & Videos
+            </Text>
+          </View>
+          <TouchableOpacity
+            style={styles.openTgBtn}
+            onPress={() =>
+              onOpenChannelInTelegram?.(channels.photoChannelId)
+            }
+          >
+            <Text style={styles.openTgBtnText}>Open Telegram ↗</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
-                  <View style={styles.mediaItemDetails}>
-                    <Text style={styles.mediaItemName} numberOfLines={1}>
-                      {item.originalName}
-                    </Text>
-                    <Text style={styles.mediaItemPath} numberOfLines={1}>
-                      {item.relativePath}
-                    </Text>
-                    <Text style={styles.mediaItemMeta}>
-                      {formatBytes(item.sizeBytes)} · {formatDate(item.modifiedAtMs)}
-                    </Text>
-                  </View>
+      {/* 4. Locked Encrypted Media Recovery Banner */}
+      {activeView === 'cloud' && lockedItemsCount > 0 && !isUnlocked && (
+        <View style={styles.lockedBanner}>
+          <View style={styles.lockedBannerRow}>
+            <Text style={styles.lockedBannerIcon}>🔒</Text>
+            <View style={styles.lockedBannerTextContainer}>
+              <Text style={styles.lockedBannerTitle}>
+                {lockedItemsCount} Encrypted Backup{lockedItemsCount > 1 ? 's' : ''} Locked
+              </Text>
+              <Text style={styles.lockedBannerSubtitle}>
+                Enter your 12-word recovery passphrase to decrypt and preview.
+              </Text>
+            </View>
+          </View>
+          <TouchableOpacity
+            style={styles.enterKeyBtn}
+            onPress={() => {
+              setPassphraseInput('');
+              setUnlockError(null);
+              setUnlockSuccess(null);
+              setShowUnlockModal(true);
+            }}
+          >
+            <Text style={styles.enterKeyBtnText}>Enter Recovery Passphrase</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
-                  <TouchableOpacity
-                    style={styles.restoreItemButton}
-                    onPress={() => setRestoreModalItem(item)}
-                  >
-                    <Text style={styles.restoreItemButtonText}>Restore</Text>
-                  </TouchableOpacity>
-                </TouchableOpacity>
-              ))
-            )}
+      {/* 5. Pure Visual Media Grid (Thumbnails Only, No Cards!) */}
+      {activeView === 'device' ? (
+        filteredDeviceItems.length === 0 ? (
+          <View style={styles.emptyContainer}>
+            <Text style={styles.emptyIcon}>🖼️</Text>
+            <Text style={styles.emptyTitle}>No Device Photos Found</Text>
+            <Text style={styles.emptySubtitle}>
+              {hasPermissionIssue
+                ? 'Allow photo access above to scan device gallery.'
+                : 'Tap Refresh to discover local photos and videos.'}
+            </Text>
           </View>
         ) : (
-          <View style={styles.itemsList}>
-            {filteredDeviceItems.length === 0 ? (
-              <View style={styles.emptyCard}>
-                <Text style={styles.emptyTitle}>
-                  {scannedItems.length === 0
-                    ? 'No device media discovered'
-                    : 'No matches found'}
-                </Text>
-                <Text style={styles.emptySubtitle}>
-                  {hasPermissionIssue
-                    ? 'Grant photo & video access above to allow scanning.'
-                    : 'Tap Rescan to refresh media from your device storage.'}
-                </Text>
-                {onRescan && !hasPermissionIssue && (
-                  <TouchableOpacity
-                    style={styles.scanNowButton}
-                    onPress={onRescan}
-                  >
-                    <Text style={styles.scanNowButtonText}>Scan Device Media</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            ) : (
-              filteredDeviceItems.slice(0, 50).map(item => {
-                const isBackedUp = backedUpIdSet.has(item.id);
-                const isSelected = selectedItemIds.has(item.id);
-                const hasImageError = !!imageErrorMap[item.id];
+          <FlatList
+            key={`device-grid-${columnCount}`}
+            data={filteredDeviceItems}
+            keyExtractor={item => item.id}
+            numColumns={columnCount}
+            renderItem={renderDeviceGridItem}
+            contentContainerStyle={styles.gridContent}
+            initialNumToRender={20}
+            maxToRenderPerBatch={20}
+            windowSize={5}
+            removeClippedSubviews={true}
+          />
+        )
+      ) : filteredCloudItems.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyIcon}>☁️</Text>
+          <Text style={styles.emptyTitle}>No Cloud Backups Found</Text>
+          <Text style={styles.emptySubtitle}>
+            Select photos in Device Media and tap Backup Selected to begin backing up to Telegram.
+          </Text>
+          {onResyncChannels && (
+            <TouchableOpacity style={styles.resyncBtn} onPress={onResyncChannels}>
+              <Text style={styles.resyncBtnText}>↻ Resync Telegram Channels</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      ) : (
+        <FlatList
+          key={`cloud-grid-${columnCount}`}
+          data={filteredCloudItems}
+          keyExtractor={item => item.id}
+          numColumns={columnCount}
+          renderItem={renderCloudGridItem}
+          contentContainerStyle={styles.gridContent}
+          initialNumToRender={20}
+          maxToRenderPerBatch={20}
+          windowSize={5}
+          removeClippedSubviews={true}
+        />
+      )}
 
-                return (
-                  <TouchableOpacity
-                    key={item.id}
-                    style={[
-                      styles.mediaItemCard,
-                      isSelected && styles.mediaItemCardSelected,
-                    ]}
-                    activeOpacity={0.7}
-                    onPress={() => handleItemPress(item)}
-                    onLongPress={() => handleItemLongPress(item)}
-                  >
-                    {/* Checkbox when in Multi-Selection Mode */}
-                    {isSelectionMode && (
-                      <View
-                        style={[
-                          styles.checkboxCircle,
-                          isSelected && styles.checkboxCircleActive,
-                        ]}
-                      >
-                        {isSelected && (
-                          <Text style={styles.checkboxCheckText}>✓</Text>
-                        )}
-                      </View>
-                    )}
-
-                    {/* Rich Thumbnail with Real Photo Preview */}
-                    <View style={styles.mediaItemThumb}>
-                      {item.sourceKey && !hasImageError ? (
-                        <Image
-                          source={{ uri: item.sourceKey }}
-                          style={styles.thumbImage}
-                          resizeMode="cover"
-                          fadeDuration={0}
-                          onError={() =>
-                            setImageErrorMap(prev => ({
-                              ...prev,
-                              [item.id]: true,
-                            }))
-                          }
-                        />
-                      ) : (
-                        <Text style={styles.mediaItemIconText}>
-                          {item.mediaType === 'video' ? '▶' : '🖼'}
-                        </Text>
-                      )}
-                      {item.mediaType === 'video' && (
-                        <View style={styles.videoBadge}>
-                          <Text style={styles.videoBadgeText}>▶</Text>
-                        </View>
-                      )}
-                    </View>
-
-                    <View style={styles.mediaItemDetails}>
-                      <Text style={styles.mediaItemName} numberOfLines={1}>
-                        {item.displayName}
-                      </Text>
-                      <Text style={styles.mediaItemPath} numberOfLines={1}>
-                        {item.relativePath}
-                      </Text>
-                      <Text style={styles.mediaItemMeta}>
-                        {formatBytes(item.sizeBytes)} · {formatDate(item.modifiedAtMs)}
-                      </Text>
-                    </View>
-
-                    <View style={styles.deviceStatusCol}>
-                      {isBackedUp ? (
-                        <View style={styles.badgeBackedUp}>
-                          <Text style={styles.badgeBackedUpText}>✓ Backed Up</Text>
-                        </View>
-                      ) : item.isExcluded ? (
-                        <View style={styles.badgeExcluded}>
-                          <Text style={styles.badgeExcludedText}>Excluded</Text>
-                        </View>
-                      ) : (
-                        <View style={styles.badgePending}>
-                          <Text style={styles.badgePendingText}>Ready</Text>
-                        </View>
-                      )}
-                    </View>
-                  </TouchableOpacity>
-                );
-              })
-            )}
-            {filteredDeviceItems.length > 50 && (
-              <Text style={styles.limitNotice}>
-                Showing latest 50 items. Use search or folder filters to narrow down.
-              </Text>
-            )}
+      {/* 6. Multi-Selection Sticky Bottom Bar */}
+      {isSelectionMode && (
+        <View style={styles.selectionBar}>
+          <View style={styles.selectionBarInfo}>
+            <Text style={styles.selectionCountText}>
+              {selectedItemIds.size} Selected
+            </Text>
+            <Text style={styles.selectionBytesText}>
+              {formatBytes(totalSelectedBytes)}
+            </Text>
           </View>
-        )}
-      </ScrollView>
 
-      {/* 6. In-App Photo & Video Detail Viewer Modal */}
+          <View style={styles.selectionBarActions}>
+            <TouchableOpacity
+              style={styles.selectToggleBtn}
+              onPress={handleToggleSelectAll}
+            >
+              <Text style={styles.selectToggleBtnText}>
+                {selectedItemIds.size === filteredDeviceItems.length
+                  ? 'Deselect All'
+                  : 'Select All'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.cancelSelectBtn}
+              onPress={() => {
+                setIsSelectionMode(false);
+                setSelectedItemIds(new Set());
+              }}
+            >
+              <Text style={styles.cancelSelectBtnText}>Cancel</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.backupSelectedBtn,
+                selectedItemIds.size === 0 && styles.btnDisabled,
+              ]}
+              disabled={selectedItemIds.size === 0}
+              onPress={handleBackupSelected}
+            >
+              <Text style={styles.backupSelectedBtnText}>
+                Backup ({selectedItemIds.size})
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* 7. Full-Screen Photo / Video Viewer Modal */}
       {previewItem && (
-        <Modal transparent animationType="fade" visible={!!previewItem}>
-          <View style={styles.viewerOverlay}>
-            <View style={styles.viewerSheet}>
-              {/* Top Bar */}
-              <View style={styles.viewerTopBar}>
-                <Text style={styles.viewerTitle} numberOfLines={1}>
-                  {(previewItem as any).displayName ||
-                    (previewItem as any).originalName}
-                </Text>
+        <Modal
+          visible={true}
+          transparent={false}
+          animationType="fade"
+          onRequestClose={() => setPreviewItem(null)}
+        >
+          <View style={styles.viewerContainer}>
+            {/* Viewer Top Bar */}
+            <View style={styles.viewerTopBar}>
+              <TouchableOpacity
+                style={styles.viewerCloseBtn}
+                onPress={() => setPreviewItem(null)}
+              >
+                <Text style={styles.viewerCloseBtnText}>✕ Close</Text>
+              </TouchableOpacity>
+              <Text style={styles.viewerTitle} numberOfLines={1}>
+                {'displayName' in previewItem
+                  ? previewItem.displayName
+                  : previewItem.originalName}
+              </Text>
+              <View style={styles.viewerSpacer} />
+            </View>
+
+            {/* Viewer Content Area */}
+            <View style={styles.viewerImageArea}>
+              {'sourceKey' in previewItem && previewItem.sourceKey ? (
+                <Image
+                  source={{ uri: previewItem.sourceKey }}
+                  style={styles.fullImage}
+                  resizeMode="contain"
+                />
+              ) : (
+                <View style={styles.viewerPlaceholder}>
+                  <Text style={styles.viewerPlaceholderIcon}>
+                    {previewItem.mediaType === 'video' ? '▶' : '🖼'}
+                  </Text>
+                  <Text style={styles.viewerPlaceholderText}>
+                    {'displayName' in previewItem
+                      ? previewItem.displayName
+                      : previewItem.originalName}
+                  </Text>
+                </View>
+              )}
+
+              {/* Video Playback overlay */}
+              {previewItem.mediaType === 'video' && (
                 <TouchableOpacity
-                  style={styles.viewerCloseBtn}
-                  onPress={() => setPreviewItem(null)}
+                  style={styles.videoPlayOverlayBtn}
+                  onPress={() => setIsPlayingVideo(!isPlayingVideo)}
                 >
-                  <Text style={styles.viewerCloseText}>✕</Text>
+                  <Text style={styles.videoPlayOverlayText}>
+                    {isPlayingVideo ? '⏸ Pause' : '▶ Play Video'}
+                  </Text>
                 </TouchableOpacity>
+              )}
+            </View>
+
+            {/* Viewer Details & Bottom Actions */}
+            <View style={styles.viewerBottomBar}>
+              <View style={styles.viewerMetaRow}>
+                <Text style={styles.viewerMetaText}>
+                  {formatBytes(previewItem.sizeBytes)} ·{' '}
+                  {formatDate(previewItem.modifiedAtMs)}
+                </Text>
+                <Text style={styles.viewerStatusHighlight}>
+                  {backedUpIdSet.has(previewItem.id)
+                    ? '✓ Backed Up'
+                    : 'Local Device Media'}
+                </Text>
               </View>
 
-              {/* Large Media Preview */}
-              <View style={styles.viewerImageContainer}>
-                {(previewItem as any).sourceKey &&
-                previewItem.mediaType === 'photo' ? (
-                  <Image
-                    source={{ uri: (previewItem as any).sourceKey }}
-                    style={styles.viewerFullImage}
-                    resizeMode="contain"
-                    fadeDuration={0}
-                  />
-                ) : (
-                  <View style={styles.viewerPlaceholder}>
-                    <Text style={styles.viewerPlaceholderIcon}>
-                      {previewItem.mediaType === 'video' ? '▶' : '🖼'}
-                    </Text>
-                    <Text style={styles.viewerPlaceholderText}>
-                      {previewItem.mediaType === 'video'
-                        ? 'Video Preview'
-                        : 'Media File'}
-                    </Text>
-                  </View>
-                )}
-              </View>
-
-              {/* Item Details */}
-              <View style={styles.viewerDetails}>
-                <View style={styles.viewerDetailRow}>
-                  <Text style={styles.viewerDetailLabel}>File Size</Text>
-                  <Text style={styles.viewerDetailValue}>
-                    {formatBytes(previewItem.sizeBytes)}
-                  </Text>
-                </View>
-
-                <View style={styles.viewerDetailRow}>
-                  <Text style={styles.viewerDetailLabel}>Path</Text>
-                  <Text
-                    style={styles.viewerDetailValue}
-                    numberOfLines={1}
-                  >
-                    {previewItem.relativePath}
-                  </Text>
-                </View>
-
-                <View style={styles.viewerDetailRow}>
-                  <Text style={styles.viewerDetailLabel}>Modified</Text>
-                  <Text style={styles.viewerDetailValue}>
-                    {formatDate(previewItem.modifiedAtMs)}
-                  </Text>
-                </View>
-
-                <View style={styles.viewerDetailRow}>
-                  <Text style={styles.viewerDetailLabel}>Status</Text>
-                  <Text style={[styles.viewerDetailValue, styles.viewerStatusHighlight]}>
-                    {backedUpIdSet.has(previewItem.id)
-                      ? '✓ Backed Up to Telegram'
-                      : 'Local Device Media'}
-                  </Text>
-                </View>
-              </View>
-
-              {/* Modal Actions */}
-              <View style={styles.viewerActions}>
+              <View style={styles.viewerActionsRow}>
                 {!backedUpIdSet.has(previewItem.id) && onConfirmBackup && (
                   <TouchableOpacity
-                    style={styles.viewerActionPrimary}
+                    style={styles.viewerPrimaryBtn}
                     onPress={() => {
                       const id = previewItem.id;
                       setPreviewItem(null);
                       onConfirmBackup([id]);
                     }}
                   >
-                    <Text style={styles.viewerActionPrimaryText}>
-                      Back Up This Item Now
+                    <Text style={styles.viewerPrimaryBtnText}>
+                      Backup to Telegram
                     </Text>
                   </TouchableOpacity>
                 )}
 
-                <TouchableOpacity
-                  style={styles.viewerActionSecondary}
-                  onPress={() => setPreviewItem(null)}
-                >
-                  <Text style={styles.viewerActionSecondaryText}>Close</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        </Modal>
-      )}
-
-      {/* 7. Initial Backup Confirmation Modal */}
-      {showConfirmModal && (
-        <Modal transparent animationType="fade" visible={showConfirmModal}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalSheet}>
-              <Text style={styles.modalTitle}>Confirm Telegram Cloud Backup</Text>
-              <Text style={styles.modalSub}>
-                Ready to back up {eligibleCount} photos and videos ({formatBytes(eligibleBytes)}) to your private Telegram storage.
-              </Text>
-
-              {folders.length > 0 && (
-                <View style={styles.modalFolderSection}>
+                {'messageId' in previewItem && (
                   <TouchableOpacity
-                    style={styles.folderToggleHeader}
-                    onPress={() => setShowFoldersInModal(!showFoldersInModal)}
+                    style={styles.viewerRestoreBtn}
+                    onPress={() => {
+                      setRestoreModalItem(previewItem as CloudMediaItem);
+                      setPreviewItem(null);
+                    }}
                   >
-                    <Text style={styles.folderToggleHeaderText}>
-                      {showFoldersInModal ? '▼ Hide Folders' : '▶ Review Folders'} ({folders.length})
+                    <Text style={styles.viewerRestoreBtnText}>
+                      Restore to Photos
                     </Text>
                   </TouchableOpacity>
-
-                  {showFoldersInModal && (
-                    <ScrollView style={styles.modalFolderScroll}>
-                      {folders.map(folder => (
-                        <View key={folder.folderKey} style={styles.folderRow}>
-                          <View style={styles.folderInfoCol}>
-                            <Text style={styles.folderRowTitle}>
-                              {folder.displayLabel}
-                            </Text>
-                            <Text style={styles.folderRowMeta}>
-                              {folder.itemCount} items · {formatBytes(folder.byteSize)}
-                            </Text>
-                          </View>
-                          {onToggleFolderExclusion && (
-                            <Switch
-                              value={!folder.isExcluded}
-                              onValueChange={() =>
-                                onToggleFolderExclusion(folder.folderKey)
-                              }
-                              trackColor={{ false: '#374151', true: '#047857' }}
-                              thumbColor={!folder.isExcluded ? '#10b981' : '#9ca3af'}
-                            />
-                          )}
-                        </View>
-                      ))}
-                    </ScrollView>
-                  )}
-                </View>
-              )}
-
-              <View style={styles.modalActions}>
-                <TouchableOpacity
-                  style={styles.modalCancelButton}
-                  onPress={() => setShowConfirmModal(false)}
-                >
-                  <Text style={styles.modalCancelButtonText}>Cancel</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={styles.modalConfirmButton}
-                  onPress={() => {
-                    setShowConfirmModal(false);
-                    onConfirmBackup?.();
-                  }}
-                >
-                  <Text style={styles.modalConfirmButtonText}>Start Backup</Text>
-                </TouchableOpacity>
+                )}
               </View>
             </View>
           </View>
         </Modal>
       )}
 
-      {/* 8. Restore Modal Sheet with Conflict Policy */}
-      {restoreModalItem && (
-        <Modal transparent animationType="slide" visible={!!restoreModalItem}>
-          <View style={styles.modalOverlay}>
-            <View style={styles.modalSheet}>
-              <Text style={styles.modalTitle}>Restore Media Item</Text>
-              <Text style={styles.modalSub}>{restoreModalItem.originalName}</Text>
-              <Text style={styles.modalPath}>Target: {restoreModalItem.relativePath}</Text>
+      {/* 8. Unlock Passphrase Modal */}
+      <Modal
+        visible={showUnlockModal}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowUnlockModal(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.unlockModalCard}>
+            <View style={styles.unlockModalHeader}>
+              <Text style={styles.unlockModalIcon}>🔒</Text>
+              <Text style={styles.unlockModalTitle}>Unlock Encrypted Media</Text>
+            </View>
 
-              <Text style={styles.policyHeading}>COLLISION CONFLICT POLICY</Text>
-              <View style={styles.policyChoices}>
+            <Text style={styles.unlockModalDesc}>
+              Enter the 12-word recovery passphrase generated when client-side encryption was configured. Your key never leaves this device.
+            </Text>
+
+            <TextInput
+              style={styles.passphraseTextInput}
+              placeholder="e.g. eagle harbor quartz river beacon..."
+              placeholderTextColor="#6b7280"
+              value={passphraseInput}
+              onChangeText={setPassphraseInput}
+              multiline={true}
+              numberOfLines={3}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+
+            {unlockError && (
+              <Text style={styles.modalErrorText}>⚠ {unlockError}</Text>
+            )}
+
+            {unlockSuccess && (
+              <Text style={styles.modalSuccessText}>{unlockSuccess}</Text>
+            )}
+
+            <View style={styles.modalActionsRow}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                onPress={() => setShowUnlockModal(false)}
+              >
+                <Text style={styles.modalCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalConfirmBtn,
+                  isVerifyingKey && styles.btnDisabled,
+                ]}
+                disabled={isVerifyingKey}
+                onPress={handleVerifyAndUnlock}
+              >
+                {isVerifyingKey ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.modalConfirmBtnText}>Unlock Backups</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* 9. Restore Modal */}
+      {restoreModalItem && (
+        <Modal
+          visible={true}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setRestoreModalItem(null)}
+        >
+          <View style={styles.modalBackdrop}>
+            <View style={styles.unlockModalCard}>
+              <Text style={styles.unlockModalTitle}>Restore to Device</Text>
+              <Text style={styles.unlockModalDesc}>
+                Download and restore &quot;{restoreModalItem.originalName}&quot; to your device storage.
+              </Text>
+
+              <View style={styles.policyRow}>
                 <TouchableOpacity
                   style={[
-                    styles.policyChoice,
+                    styles.policyChip,
                     selectedPolicy === ConflictPolicy.KEEP_BOTH &&
-                      styles.policyChoiceSelected,
+                      styles.policyChipActive,
                   ]}
                   onPress={() => setSelectedPolicy(ConflictPolicy.KEEP_BOTH)}
                 >
-                  <Text style={styles.policyChoiceTitle}>Keep Both</Text>
-                  <Text style={styles.policyChoiceDesc}>
-                    Appends (1) if file already exists locally
-                  </Text>
+                  <Text style={styles.policyChipText}>Keep Both</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
                   style={[
-                    styles.policyChoice,
-                    selectedPolicy === ConflictPolicy.SKIP &&
-                      styles.policyChoiceSelected,
-                  ]}
-                  onPress={() => setSelectedPolicy(ConflictPolicy.SKIP)}
-                >
-                  <Text style={styles.policyChoiceTitle}>Skip Existing</Text>
-                  <Text style={styles.policyChoiceDesc}>
-                    Do not overwrite existing local file
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={[
-                    styles.policyChoice,
+                    styles.policyChip,
                     selectedPolicy === ConflictPolicy.REPLACE &&
-                      styles.policyChoiceSelected,
+                      styles.policyChipActive,
                   ]}
                   onPress={() => setSelectedPolicy(ConflictPolicy.REPLACE)}
                 >
-                  <Text style={styles.policyChoiceTitle}>Replace</Text>
-                  <Text style={styles.policyChoiceDesc}>
-                    Overwrite local file with cloud copy
-                  </Text>
+                  <Text style={styles.policyChipText}>Replace Existing</Text>
                 </TouchableOpacity>
               </View>
 
               {restoreStatus ? (
-                <Text style={styles.modalStatusText}>{restoreStatus}</Text>
+                <Text style={styles.modalSuccessText}>{restoreStatus}</Text>
               ) : null}
 
-              <View style={styles.modalActions}>
+              <View style={styles.modalActionsRow}>
                 <TouchableOpacity
-                  style={styles.modalCancelButton}
-                  onPress={() => setRestoreModalItem(null)}
+                  style={styles.modalCancelBtn}
                   disabled={restoring}
+                  onPress={() => setRestoreModalItem(null)}
                 >
-                  <Text style={styles.modalCancelButtonText}>Cancel</Text>
+                  <Text style={styles.modalCancelBtnText}>Cancel</Text>
                 </TouchableOpacity>
 
                 <TouchableOpacity
                   style={[
-                    styles.modalConfirmButton,
-                    restoring && styles.buttonDisabled,
+                    styles.modalConfirmBtn,
+                    restoring && styles.btnDisabled,
                   ]}
-                  onPress={handleExecuteRestore}
                   disabled={restoring}
+                  onPress={handleExecuteRestore}
                 >
-                  <Text style={styles.modalConfirmButtonText}>
-                    {restoring ? 'Restoring...' : 'Download & Restore'}
-                  </Text>
+                  {restoring ? (
+                    <ActivityIndicator size="small" color="#ffffff" />
+                  ) : (
+                    <Text style={styles.modalConfirmBtnText}>Restore Now</Text>
+                  )}
                 </TouchableOpacity>
               </View>
             </View>
@@ -1112,642 +1051,516 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   );
 };
 
-export const GalleryScreen = CloudGalleryScreen;
-
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#0a0f0d',
   },
-  content: {
-    padding: 16,
-    paddingBottom: 60,
+  topHeader: {
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#16221c',
   },
-  header: {
-    marginBottom: 16,
-  },
-  headerTopRow: {
+  titleRow: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-  },
-  headerEyebrow: {
-    color: '#10b981',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1.2,
-    marginBottom: 4,
+    alignItems: 'center',
+    marginBottom: 10,
   },
   headerTitle: {
-    color: '#f9fafb',
-    fontSize: 26,
+    fontSize: 24,
     fontWeight: '800',
-  },
-  rescanButton: {
-    backgroundColor: '#16221c',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#243029',
-  },
-  rescanButtonText: {
-    color: '#34d399',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  headerDesc: {
-    color: '#9ca3af',
-    fontSize: 13,
-    lineHeight: 18,
-    marginTop: 6,
-  },
-  selectionBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#162b20',
-    borderBottomWidth: 1,
-    borderBottomColor: '#34d399',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    zIndex: 99,
-  },
-  selectionBarInfo: {
-    flex: 1,
-  },
-  selectionBarTitle: {
-    color: '#34d399',
-    fontSize: 14,
-    fontWeight: '800',
-  },
-  selectionBarSub: {
-    color: '#9ca3af',
-    fontSize: 11,
-  },
-  selectionBarActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  selectionBarBtnSecondary: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 6,
-    backgroundColor: '#121a15',
-    borderWidth: 1,
-    borderColor: '#243029',
-  },
-  selectionBarBtnSecondaryText: {
-    color: '#d1d5db',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  selectionBarBtnPrimary: {
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 6,
-    backgroundColor: '#10b981',
-  },
-  selectionBarBtnPrimaryText: {
-    color: '#0a0f0d',
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  selectionTipText: {
-    color: '#6b7280',
-    fontSize: 12,
-    marginBottom: 10,
-    textAlign: 'center',
-  },
-  permissionAlertCard: {
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
-    borderRadius: 12,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.3)',
-    marginBottom: 16,
-  },
-  permissionAlertHeader: {
-    marginBottom: 6,
-  },
-  permissionAlertTitle: {
-    color: '#f87171',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  permissionAlertDesc: {
-    color: '#d1d5db',
-    fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 12,
-  },
-  permissionActionButton: {
-    backgroundColor: '#ef4444',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  permissionActionButtonText: {
     color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
   },
-  partialAlertCard: {
-    backgroundColor: 'rgba(245, 158, 11, 0.12)',
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(245, 158, 11, 0.3)',
-    marginBottom: 16,
+  layoutToggleRow: {
     flexDirection: 'row',
-    alignItems: 'center',
-  },
-  partialAlertTextCol: {
-    flex: 1,
-  },
-  partialAlertTitle: {
-    color: '#fbbf24',
-    fontSize: 14,
-    fontWeight: '700',
-    marginBottom: 2,
-  },
-  partialAlertDesc: {
-    color: '#d1d5db',
-    fontSize: 12,
-  },
-  partialActionBtn: {
-    backgroundColor: '#d97706',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 6,
-    marginLeft: 8,
-  },
-  partialActionText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  statusBarCard: {
-    backgroundColor: '#121a15',
-    borderRadius: 12,
-    padding: 14,
+    backgroundColor: '#111814',
+    borderRadius: 8,
+    padding: 2,
     borderWidth: 1,
     borderColor: '#243029',
-    marginBottom: 16,
   },
-  progressSection: {
-    width: '100%',
-  },
-  statusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 6,
-  },
-  statusBadgeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  statusDotActive: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#34d399',
-    marginRight: 6,
-  },
-  statusLabelActive: {
-    color: '#34d399',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 0.5,
-  },
-  statusPercent: {
-    color: '#f9fafb',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  statusFileName: {
-    color: '#e5e7eb',
-    fontSize: 13,
-    fontWeight: '500',
-    marginBottom: 8,
-  },
-  progressBarBackground: {
-    height: 6,
-    backgroundColor: '#1f2e24',
-    borderRadius: 3,
-    overflow: 'hidden',
-    marginBottom: 8,
-  },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: '#10b981',
-    borderRadius: 3,
-  },
-  statusBottomRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  statusMeta: {
-    color: '#9ca3af',
-    fontSize: 12,
-  },
-  pauseSmallButton: {
-    backgroundColor: '#1f2e24',
+  layoutBtn: {
     paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  pauseSmallButtonText: {
-    color: '#f87171',
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  pausedSection: {
-    width: '100%',
-  },
-  statusDotPaused: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#f59e0b',
-    marginRight: 6,
-  },
-  statusLabelPaused: {
-    color: '#f59e0b',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 0.5,
-  },
-  resumeSmallButton: {
-    backgroundColor: '#10b981',
-    paddingHorizontal: 12,
     paddingVertical: 5,
     borderRadius: 6,
   },
-  resumeSmallButtonText: {
-    color: '#ffffff',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  statusPausedDesc: {
-    color: '#9ca3af',
-    fontSize: 12,
-    marginTop: 4,
-  },
-  readySection: {
-    width: '100%',
-  },
-  statusInfoCol: {
-    flex: 1,
-  },
-  readyTitle: {
-    color: '#f9fafb',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  readySub: {
-    color: '#9ca3af',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  backupActionButton: {
+  layoutBtnActive: {
     backgroundColor: '#10b981',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 8,
   },
-  backupActionButtonText: {
-    color: '#ffffff',
-    fontSize: 13,
+  layoutBtnText: {
+    color: '#9ca3af',
+    fontSize: 11,
     fontWeight: '700',
   },
-  syncedSection: {
-    paddingVertical: 2,
+  layoutBtnTextActive: {
+    color: '#ffffff',
   },
-  syncedText: {
-    color: '#9ca3af',
-    fontSize: 13,
-  },
-  viewTabs: {
+  tabSwitchContainer: {
     flexDirection: 'row',
-    backgroundColor: '#121a15',
-    borderRadius: 10,
+    backgroundColor: '#111814',
+    borderRadius: 8,
     padding: 3,
-    marginBottom: 12,
+    marginBottom: 10,
     borderWidth: 1,
-    borderColor: '#243029',
+    borderColor: '#1e2923',
   },
-  viewTab: {
+  tabSwitchBtn: {
     flex: 1,
     paddingVertical: 8,
     alignItems: 'center',
-    borderRadius: 7,
+    borderRadius: 6,
   },
-  viewTabActive: {
-    backgroundColor: '#1b2a20',
+  tabSwitchBtnActive: {
+    backgroundColor: '#16221c',
+    borderWidth: 1,
+    borderColor: '#2d3d34',
   },
-  viewTabText: {
+  tabSwitchText: {
     color: '#9ca3af',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '600',
   },
-  viewTabTextActive: {
+  tabSwitchTextActive: {
     color: '#34d399',
     fontWeight: '700',
-  },
-  searchInput: {
-    backgroundColor: '#121a15',
-    borderColor: '#243029',
-    borderWidth: 1,
-    borderRadius: 10,
-    color: '#f9fafb',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    fontSize: 14,
-    marginBottom: 12,
   },
   filterPillsRow: {
     flexDirection: 'row',
-    marginBottom: 12,
+    alignItems: 'center',
+    gap: 8,
+    paddingBottom: 4,
   },
   filterPill: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingVertical: 6,
-    borderRadius: 16,
-    backgroundColor: '#121a15',
+    borderRadius: 14,
+    backgroundColor: '#111814',
     borderWidth: 1,
     borderColor: '#243029',
-    marginRight: 8,
   },
   filterPillActive: {
-    backgroundColor: '#1b3327',
-    borderColor: '#34d399',
+    backgroundColor: '#10b981',
+    borderColor: '#10b981',
   },
   filterPillText: {
+    fontSize: 11,
     color: '#9ca3af',
-    fontSize: 12,
     fontWeight: '600',
   },
   filterPillTextActive: {
-    color: '#34d399',
+    color: '#ffffff',
     fontWeight: '700',
   },
-  folderScroll: {
-    marginBottom: 14,
-  },
-  folderChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    borderRadius: 12,
-    backgroundColor: '#121a15',
-    borderWidth: 1,
-    borderColor: '#243029',
-    marginRight: 6,
-  },
-  folderChipActive: {
-    backgroundColor: '#243029',
-    borderColor: '#6b7280',
-  },
-  folderChipText: {
-    color: '#9ca3af',
-    fontSize: 12,
-  },
-  folderChipTextActive: {
-    color: '#f9fafb',
-    fontWeight: '600',
-  },
-  itemsList: {
-    marginTop: 4,
-  },
-  emptyCard: {
-    backgroundColor: '#121a15',
-    borderRadius: 12,
-    padding: 24,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#243029',
-    marginTop: 8,
-  },
-  emptyTitle: {
-    color: '#f9fafb',
-    fontSize: 15,
-    fontWeight: '700',
-    marginBottom: 6,
-    textAlign: 'center',
-  },
-  emptySubtitle: {
-    color: '#9ca3af',
-    fontSize: 13,
-    textAlign: 'center',
-    lineHeight: 18,
-    marginBottom: 12,
-  },
-  scanNowButton: {
+  rescanChip: {
+    marginLeft: 'auto',
     backgroundColor: '#16221c',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#34d399',
-  },
-  scanNowButtonText: {
-    color: '#34d399',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  mediaItemCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#121a15',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     borderRadius: 12,
-    padding: 10,
-    marginBottom: 8,
     borderWidth: 1,
     borderColor: '#243029',
   },
-  mediaItemCardSelected: {
-    borderColor: '#10b981',
-    backgroundColor: '#14261c',
+  rescanChipText: {
+    color: '#34d399',
+    fontSize: 11,
+    fontWeight: '700',
   },
-  checkboxCircle: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    borderWidth: 1.5,
-    borderColor: '#6b7280',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
+  lockNowChip: {
+    marginLeft: 'auto',
+    backgroundColor: '#261c1c',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#543333',
   },
-  checkboxCircleActive: {
-    borderColor: '#10b981',
-    backgroundColor: '#10b981',
+  lockNowChipText: {
+    color: '#f87171',
+    fontSize: 11,
+    fontWeight: '700',
   },
-  checkboxCheckText: {
+  permBanner: {
+    backgroundColor: '#261c1c',
+    borderLeftWidth: 4,
+    borderLeftColor: '#ef4444',
+    padding: 14,
+    marginHorizontal: 16,
+    marginTop: 10,
+    borderRadius: 8,
+  },
+  permTitle: {
+    color: '#fca5a5',
+    fontWeight: '700',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  permSubtitle: {
+    color: '#f87171',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  permBtn: {
+    backgroundColor: '#ef4444',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    alignSelf: 'flex-start',
+  },
+  permBtnText: {
     color: '#ffffff',
     fontSize: 12,
-    fontWeight: '800',
-  },
-  mediaItemThumb: {
-    width: 52,
-    height: 52,
-    borderRadius: 8,
-    backgroundColor: '#1b2a20',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-    overflow: 'hidden',
-  },
-  thumbImage: {
-    width: '100%',
-    height: '100%',
-  },
-  mediaItemIconText: {
-    fontSize: 20,
-  },
-  videoBadge: {
-    position: 'absolute',
-    bottom: 2,
-    right: 2,
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    borderRadius: 4,
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-  },
-  videoBadgeText: {
-    color: '#34d399',
-    fontSize: 8,
     fontWeight: '700',
   },
-  mediaItemDetails: {
+  destinationBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#111814',
+    marginHorizontal: 16,
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1e2923',
+  },
+  destinationInfo: {
     flex: 1,
-    marginRight: 8,
   },
-  mediaItemName: {
-    color: '#f9fafb',
-    fontSize: 14,
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  mediaItemPath: {
+  destinationLabel: {
+    fontSize: 9,
     color: '#6b7280',
-    fontSize: 11,
-    marginBottom: 3,
+    fontWeight: '800',
+    letterSpacing: 0.5,
   },
-  mediaItemMeta: {
-    color: '#9ca3af',
-    fontSize: 11,
+  destinationTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#e5e7eb',
+    marginTop: 2,
   },
-  restoreItemButton: {
-    backgroundColor: '#1b3327',
-    paddingHorizontal: 12,
+  openTgBtn: {
+    backgroundColor: '#16221c',
+    paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 6,
     borderWidth: 1,
-    borderColor: '#34d399',
+    borderColor: '#2d3d34',
   },
-  restoreItemButtonText: {
+  openTgBtnText: {
     color: '#34d399',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  deviceStatusCol: {
-    alignItems: 'flex-end',
-  },
-  badgeBackedUp: {
-    backgroundColor: 'rgba(16, 185, 129, 0.15)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
-  },
-  badgeBackedUpText: {
-    color: '#10b981',
     fontSize: 11,
-    fontWeight: '600',
+    fontWeight: '700',
   },
-  badgePending: {
-    backgroundColor: 'rgba(59, 130, 246, 0.15)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
+  lockedBanner: {
+    backgroundColor: '#1b1b13',
+    marginHorizontal: 16,
+    marginTop: 8,
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#4d4625',
   },
-  badgePendingText: {
-    color: '#60a5fa',
-    fontSize: 11,
-    fontWeight: '600',
+  lockedBannerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
   },
-  badgeExcluded: {
-    backgroundColor: 'rgba(107, 114, 128, 0.15)',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 6,
+  lockedBannerIcon: {
+    fontSize: 22,
+    marginRight: 10,
   },
-  badgeExcludedText: {
-    color: '#9ca3af',
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  limitNotice: {
-    color: '#6b7280',
-    fontSize: 12,
-    textAlign: 'center',
-    marginVertical: 12,
-  },
-  viewerOverlay: {
+  lockedBannerTextContainer: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.92)',
-    justifyContent: 'center',
-    padding: 16,
   },
-  viewerSheet: {
-    backgroundColor: '#121a15',
-    borderRadius: 16,
-    padding: 16,
+  lockedBannerTitle: {
+    color: '#fbbf24',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  lockedBannerSubtitle: {
+    color: '#d1d5db',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  enterKeyBtn: {
+    backgroundColor: '#d97706',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  enterKeyBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  gridContent: {
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: 90,
+    gap: 6,
+  },
+  thumbnailContainer: {
+    margin: 3,
+    borderRadius: 8,
+    overflow: 'hidden',
+    backgroundColor: '#111814',
+    borderWidth: 1,
+    borderColor: '#1e2923',
+    position: 'relative',
+  },
+  thumbnailSelected: {
+    borderColor: '#10b981',
+    borderWidth: 2,
+  },
+  thumbnailImage: {
+    width: '100%',
+    height: '100%',
+  },
+  thumbnailFallback: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#16221c',
+  },
+  thumbnailFallbackIcon: {
+    fontSize: 28,
+  },
+  cloudThumbnailBox: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#16221c',
+  },
+  lockedThumbnailBox: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#161414',
+  },
+  lockedIcon: {
+    fontSize: 24,
+    marginBottom: 4,
+  },
+  lockedText: {
+    color: '#fbbf24',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  videoBadge: {
+    position: 'absolute',
+    bottom: 6,
+    right: 6,
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  videoBadgeText: {
+    color: '#ffffff',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  backedUpBadge: {
+    position: 'absolute',
+    bottom: 6,
+    left: 6,
+    backgroundColor: '#10b981',
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  backedUpBadgeText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '900',
+  },
+  encryptedBadge: {
+    position: 'absolute',
+    top: 6,
+    left: 6,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    padding: 3,
+    borderRadius: 4,
+  },
+  encryptedBadgeText: {
+    fontSize: 11,
+  },
+  selectionOverlayCheck: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 2,
+    borderColor: '#ffffff',
+    backgroundColor: 'rgba(0, 0, 0, 0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  selectionOverlayCheckActive: {
+    backgroundColor: '#10b981',
+    borderColor: '#10b981',
+  },
+  selectionCheckmarkText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  emptyContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+    marginTop: 60,
+  },
+  emptyIcon: {
+    fontSize: 44,
+    marginBottom: 12,
+  },
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#ffffff',
+    marginBottom: 6,
+  },
+  emptySubtitle: {
+    fontSize: 13,
+    color: '#9ca3af',
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  resyncBtn: {
+    marginTop: 16,
+    backgroundColor: '#16221c',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: '#243029',
-    maxHeight: '90%',
+  },
+  resyncBtnText: {
+    color: '#34d399',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  selectionBar: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: '#0e1411',
+    borderTopWidth: 1,
+    borderTopColor: '#243029',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  selectionBarInfo: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  selectionCountText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  selectionBytesText: {
+    color: '#9ca3af',
+    fontSize: 12,
+  },
+  selectionBarActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  selectToggleBtn: {
+    backgroundColor: '#16221c',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#243029',
+  },
+  selectToggleBtnText: {
+    color: '#9ca3af',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  cancelSelectBtn: {
+    backgroundColor: '#1f2937',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+  },
+  cancelSelectBtnText: {
+    color: '#d1d5db',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  backupSelectedBtn: {
+    flex: 1,
+    backgroundColor: '#10b981',
+    paddingVertical: 8,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  backupSelectedBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  btnDisabled: {
+    opacity: 0.5,
+  },
+  viewerContainer: {
+    flex: 1,
+    backgroundColor: '#000000',
   },
   viewerTopBar: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 12,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 10,
   },
-  viewerTitle: {
-    color: '#f9fafb',
-    fontSize: 16,
-    fontWeight: '700',
-    flex: 1,
-    marginRight: 10,
+  viewerSpacer: {
+    width: 40,
   },
   viewerCloseBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#1f2e24',
-    alignItems: 'center',
-    justifyContent: 'center',
+    padding: 6,
   },
-  viewerCloseText: {
-    color: '#9ca3af',
-    fontSize: 16,
+  viewerCloseBtnText: {
+    color: '#ffffff',
+    fontSize: 14,
     fontWeight: '700',
   },
-  viewerImageContainer: {
-    width: '100%',
-    height: 240,
-    backgroundColor: '#0a0f0d',
-    borderRadius: 12,
-    overflow: 'hidden',
+  viewerTitle: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+    flex: 1,
+    textAlign: 'center',
+    marginHorizontal: 10,
+  },
+  viewerImageArea: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 14,
+    position: 'relative',
   },
-  viewerFullImage: {
+  fullImage: {
     width: '100%',
     height: '100%',
   },
@@ -1756,201 +1569,187 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   viewerPlaceholderIcon: {
-    fontSize: 48,
-    marginBottom: 8,
+    fontSize: 64,
+    marginBottom: 12,
   },
   viewerPlaceholderText: {
-    color: '#6b7280',
+    color: '#9ca3af',
     fontSize: 14,
-    fontWeight: '600',
+    maxWidth: '80%',
+    textAlign: 'center',
   },
-  viewerDetails: {
-    backgroundColor: '#0a0f0d',
-    borderRadius: 10,
-    padding: 12,
-    marginBottom: 14,
+  videoPlayOverlayBtn: {
+    position: 'absolute',
+    bottom: 20,
+    backgroundColor: 'rgba(16, 185, 129, 0.9)',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 20,
   },
-  viewerDetailRow: {
+  videoPlayOverlayText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  viewerBottomBar: {
+    backgroundColor: '#0e1411',
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#1e2923',
+  },
+  viewerMetaRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingVertical: 5,
-    borderBottomWidth: 1,
-    borderBottomColor: '#16221c',
+    alignItems: 'center',
+    marginBottom: 12,
   },
-  viewerDetailLabel: {
-    color: '#6b7280',
+  viewerMetaText: {
+    color: '#9ca3af',
+    fontSize: 13,
+  },
+  viewerStatusHighlight: {
+    color: '#34d399',
     fontSize: 12,
+    fontWeight: '700',
   },
-  viewerDetailValue: {
-    color: '#f9fafb',
-    fontSize: 12,
-    fontWeight: '600',
-    maxWidth: '70%',
+  viewerActionsRow: {
+    flexDirection: 'row',
+    gap: 10,
   },
-  viewerActions: {
-    gap: 8,
-  },
-  viewerActionPrimary: {
+  viewerPrimaryBtn: {
+    flex: 1,
     backgroundColor: '#10b981',
     paddingVertical: 12,
     borderRadius: 8,
     alignItems: 'center',
   },
-  viewerActionPrimaryText: {
+  viewerPrimaryBtnText: {
     color: '#ffffff',
     fontSize: 14,
     fontWeight: '700',
   },
-  viewerActionSecondary: {
-    paddingVertical: 10,
+  viewerRestoreBtn: {
+    flex: 1,
+    backgroundColor: '#2563eb',
+    paddingVertical: 12,
     borderRadius: 8,
     alignItems: 'center',
-    backgroundColor: '#16221c',
   },
-  viewerActionSecondaryText: {
-    color: '#9ca3af',
-    fontSize: 13,
-    fontWeight: '600',
+  viewerRestoreBtnText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
   },
-  modalOverlay: {
+  modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
     justifyContent: 'center',
+    alignItems: 'center',
     padding: 20,
   },
-  modalSheet: {
-    backgroundColor: '#121a15',
-    borderRadius: 16,
+  unlockModalCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#16221c',
+    borderRadius: 14,
     padding: 20,
     borderWidth: 1,
     borderColor: '#243029',
-    maxHeight: '80%',
   },
-  modalTitle: {
-    color: '#f9fafb',
-    fontSize: 18,
-    fontWeight: '700',
-    marginBottom: 6,
-  },
-  modalSub: {
-    color: '#d1d5db',
-    fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 16,
-  },
-  modalPath: {
-    color: '#6b7280',
-    fontSize: 12,
-    marginBottom: 16,
-  },
-  modalFolderSection: {
-    marginBottom: 16,
-  },
-  folderToggleHeader: {
-    paddingVertical: 8,
-  },
-  folderToggleHeaderText: {
-    color: '#34d399',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  modalFolderScroll: {
-    maxHeight: 150,
-    marginTop: 6,
-    backgroundColor: '#0a0f0d',
-    borderRadius: 8,
-    padding: 8,
-  },
-  folderRow: {
+  unlockModalHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 6,
-    borderBottomWidth: 1,
-    borderBottomColor: '#16221c',
-  },
-  folderInfoCol: {
-    flex: 1,
-  },
-  folderRowTitle: {
-    color: '#f9fafb',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  folderRowMeta: {
-    color: '#6b7280',
-    fontSize: 11,
-  },
-  policyHeading: {
-    color: '#9ca3af',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 0.8,
     marginBottom: 10,
   },
-  policyChoices: {
-    marginBottom: 16,
+  unlockModalIcon: {
+    fontSize: 22,
+    marginRight: 8,
   },
-  policyChoice: {
+  unlockModalTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  unlockModalDesc: {
+    fontSize: 13,
+    color: '#9ca3af',
+    lineHeight: 18,
+    marginBottom: 14,
+  },
+  passphraseTextInput: {
     backgroundColor: '#0a0f0d',
     borderWidth: 1,
     borderColor: '#243029',
     borderRadius: 8,
-    padding: 10,
-    marginBottom: 8,
-  },
-  policyChoiceSelected: {
-    borderColor: '#10b981',
-    backgroundColor: '#162b20',
-  },
-  policyChoiceTitle: {
-    color: '#f9fafb',
-    fontSize: 13,
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  policyChoiceDesc: {
-    color: '#9ca3af',
-    fontSize: 11,
-  },
-  modalStatusText: {
-    color: '#34d399',
-    fontSize: 12,
-    textAlign: 'center',
+    color: '#ffffff',
+    padding: 12,
+    fontSize: 14,
+    textAlignVertical: 'top',
     marginBottom: 12,
   },
-  modalActions: {
+  modalErrorText: {
+    color: '#ef4444',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 10,
+  },
+  modalSuccessText: {
+    color: '#34d399',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 10,
+  },
+  modalActionsRow: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
-    marginTop: 8,
+    gap: 10,
+    marginTop: 6,
   },
-  modalCancelButton: {
-    paddingHorizontal: 16,
+  modalCancelBtn: {
     paddingVertical: 10,
+    paddingHorizontal: 16,
     borderRadius: 8,
-    marginRight: 8,
   },
-  modalCancelButtonText: {
+  modalCancelBtnText: {
     color: '#9ca3af',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '600',
   },
-  modalConfirmButton: {
+  modalConfirmBtn: {
     backgroundColor: '#10b981',
+    paddingVertical: 10,
     paddingHorizontal: 18,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalConfirmBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  policyRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 14,
+  },
+  policyChip: {
+    flex: 1,
+    backgroundColor: '#111814',
     paddingVertical: 10,
     borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#243029',
   },
-  modalConfirmButtonText: {
+  policyChipActive: {
+    backgroundColor: '#16221c',
+    borderColor: '#10b981',
+  },
+  policyChipText: {
     color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-  viewerStatusHighlight: {
-    color: '#34d399',
-    fontWeight: '700',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

@@ -20,6 +20,7 @@ interface TelegramBridgeNativeModule {
     limit: number,
     fromMessageId: string,
   ): Promise<TelegramHistoryItem[]>;
+  openChatInTelegram(chatId: string): Promise<boolean>;
 }
 
 const { TelegramBridge } = NativeModules;
@@ -122,6 +123,7 @@ const fallbackMock: TelegramBridgeNativeModule = {
     ],
   }),
   getChannelHistory: async () => [],
+  openChatInTelegram: async () => true,
 };
 
 const nativeModule: TelegramBridgeNativeModule =
@@ -148,6 +150,7 @@ export const TelegramBridgeService = {
     limit: number = 50,
     fromMessageId: string = '0',
   ) => nativeModule.getChannelHistory(chatId, limit, fromMessageId),
+  openChatInTelegram: (chatId: string) => nativeModule.openChatInTelegram(chatId),
 
   subscribeToAuthState: (callback: (state: TelegramAuthState) => void) => {
     if (Platform.OS === 'android' && TelegramBridge) {
