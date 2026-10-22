@@ -211,13 +211,19 @@ export const MainApp: React.FC = () => {
     refreshScan(currentExcluded);
   };
 
-  const handleConfirmBackup = async () => {
-    const { confirmed, eligibleItemIds } = confirmInitialScan(scanReview);
-    if (!confirmed || eligibleItemIds.length === 0) return;
+  const handleConfirmBackup = async (selectedIds?: string[]) => {
+    let eligibleIds: string[];
+    if (selectedIds && selectedIds.length > 0) {
+      eligibleIds = selectedIds;
+    } else {
+      const { confirmed, eligibleItemIds } = confirmInitialScan(scanReview);
+      if (!confirmed || eligibleItemIds.length === 0) return;
+      eligibleIds = eligibleItemIds;
+    }
 
     // Persist discovered eligible items to repository
     for (const item of scanReview.items) {
-      if (!item.isExcluded) {
+      if (eligibleIds.includes(item.id) && !item.isExcluded) {
         await repo.upsertMediaItem({
           id: item.id,
           sourceKey: item.sourceKey,
@@ -238,7 +244,7 @@ export const MainApp: React.FC = () => {
     }
 
     // Enqueue jobs in SQLite engine
-    await engine.queueMediaForBackup(eligibleItemIds);
+    await engine.queueMediaForBackup(eligibleIds);
 
     // Run queue simulation
     engine.runQueue(networkPolicy, true, {

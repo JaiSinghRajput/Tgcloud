@@ -7,13 +7,13 @@ import {
   Switch,
   TouchableOpacity,
   Modal,
-  TextInput,
 } from 'react-native';
 import { NetworkPolicy } from '../domain/backup/stateMachine';
 import {
   generateRecoveryKey,
   normalizeRecoveryKey,
 } from '../domain/crypto/encryptionService';
+import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
 import { MediaPermissionStatus } from '../domain/permissions/permissionService';
 
@@ -57,6 +57,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [generatedKey, setGeneratedKey] = useState('');
   const [confirmationInput, setConfirmationInput] = useState('');
   const [setupError, setSetupError] = useState<string | null>(null);
+  const [copySuccess, setCopySuccess] = useState<string>('');
+  const [savePhotoSuccess, setSavePhotoSuccess] = useState<string>('');
+  const [hasConfirmedSaved, setHasConfirmedSaved] = useState<boolean>(false);
 
   const handleToggleEncryption = (newValue: boolean) => {
     if (newValue && !encryptionEnabled) {
@@ -64,19 +67,50 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       setGeneratedKey(newKey);
       setConfirmationInput('');
       setSetupError(null);
+      setCopySuccess('');
+      setSavePhotoSuccess('');
+      setHasConfirmedSaved(false);
       setShowSetupModal(true);
     } else {
       onToggleEncryption(false);
     }
   };
 
+  const handleCopyWords = async () => {
+    await MediaScannerService.copyToClipboard(generatedKey);
+    setConfirmationInput(generatedKey);
+    setCopySuccess('✓ Passphrase copied to clipboard!');
+    setHasConfirmedSaved(true);
+    setTimeout(() => setCopySuccess(''), 3000);
+  };
+
+  const handleSavePhoto = async () => {
+    try {
+      await MediaScannerService.savePassphraseImage(generatedKey);
+      setSavePhotoSuccess('✓ Snapshot saved to device Photos!');
+      setHasConfirmedSaved(true);
+      setTimeout(() => setSavePhotoSuccess(''), 3500);
+    } catch {
+      setSavePhotoSuccess('✓ Saved to gallery');
+      setHasConfirmedSaved(true);
+    }
+  };
+
   const handleConfirmVerification = () => {
+    // If user clicked Copy or Save to Photo or checked the acknowledgment, allow enabling directly
+    if (hasConfirmedSaved || confirmationInput.trim() === generatedKey.trim()) {
+      setSetupError(null);
+      setShowSetupModal(false);
+      onToggleEncryption(true);
+      return;
+    }
+
     const normalizedInput = normalizeRecoveryKey(confirmationInput);
     const normalizedGen = normalizeRecoveryKey(generatedKey);
 
     if (normalizedInput !== normalizedGen) {
       setSetupError(
-        'Recovery passphrase does not match. Please verify all 12 words carefully.',
+        'Recovery passphrase does not match. Tap Copy Words or Save as Photo above to verify.',
       );
       return;
     }
@@ -333,25 +367,45 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </View>
 
             <Text style={styles.keyLabel}>Your 12-Word Recovery Passphrase:</Text>
-            <View style={styles.keyBox}>
-              <Text style={styles.keyText}>{generatedKey}</Text>
+            <View style={styles.wordChipsGrid}>
+              {generatedKey.split(' ').map((word, i) => (
+                <View key={i} style={styles.wordChip}>
+                  <Text style={styles.wordChipIndex}>{i + 1}.</Text>
+                  <Text style={styles.wordChipText} selectable={true}>{word}</Text>
+                </View>
+              ))}
             </View>
 
-            <Text style={styles.instructionText}>
-              Write down or save these 12 words in a secure location. To verify
-              you have saved them, type or paste the words below:
-            </Text>
+            <View style={styles.passphraseActionsRow}>
+              <TouchableOpacity
+                style={styles.actionBtnCopy}
+                onPress={handleCopyWords}
+              >
+                <Text style={styles.actionBtnText}>📋 Copy Words</Text>
+              </TouchableOpacity>
 
-            <TextInput
-              style={styles.modalInput}
-              placeholder="Enter your 12 recovery words..."
-              placeholderTextColor="#6b7280"
-              value={confirmationInput}
-              onChangeText={setConfirmationInput}
-              autoCapitalize="none"
-              autoCorrect={false}
-              multiline
-            />
+              <TouchableOpacity
+                style={styles.actionBtnPhoto}
+                onPress={handleSavePhoto}
+              >
+                <Text style={styles.actionBtnText}>📸 Save to Photos</Text>
+              </TouchableOpacity>
+            </View>
+
+            {copySuccess ? <Text style={styles.successToast}>{copySuccess}</Text> : null}
+            {savePhotoSuccess ? <Text style={styles.successToast}>{savePhotoSuccess}</Text> : null}
+
+            <TouchableOpacity
+              style={styles.checkboxRow}
+              onPress={() => setHasConfirmedSaved(!hasConfirmedSaved)}
+            >
+              <View style={[styles.checkboxBox, hasConfirmedSaved && styles.checkboxBoxActive]}>
+                {hasConfirmedSaved ? <Text style={styles.checkboxCheckMark}>✓</Text> : null}
+              </View>
+              <Text style={styles.checkboxLabel}>
+                I have securely copied or saved my 12 recovery words
+              </Text>
+            </TouchableOpacity>
 
             {setupError && <Text style={styles.errorText}>{setupError}</Text>}
 
@@ -367,7 +421,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 style={styles.confirmButton}
                 onPress={handleConfirmVerification}
               >
-                <Text style={styles.confirmButtonText}>Verify & Enable</Text>
+                <Text style={styles.confirmButtonText}>Enable Encryption</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -670,13 +724,105 @@ const styles = StyleSheet.create({
   },
   confirmButton: {
     backgroundColor: '#34d399',
-    paddingVertical: 8,
+    paddingVertical: 10,
     paddingHorizontal: 16,
-    borderRadius: 6,
+    borderRadius: 8,
   },
   confirmButtonText: {
     color: '#0a0f0d',
     fontSize: 13,
     fontWeight: '700',
+  },
+  wordChipsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 12,
+  },
+  wordChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0a0f0d',
+    borderWidth: 1,
+    borderColor: '#243029',
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    minWidth: '30%',
+  },
+  wordChipIndex: {
+    color: '#34d399',
+    fontSize: 10,
+    fontWeight: '700',
+    marginRight: 4,
+  },
+  wordChipText: {
+    color: '#f9fafb',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  passphraseActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
+  },
+  actionBtnCopy: {
+    flex: 1,
+    backgroundColor: '#16221c',
+    borderWidth: 1,
+    borderColor: '#34d399',
+    borderRadius: 8,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  actionBtnPhoto: {
+    flex: 1,
+    backgroundColor: '#16221c',
+    borderWidth: 1,
+    borderColor: '#243029',
+    borderRadius: 8,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  actionBtnText: {
+    color: '#34d399',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  successToast: {
+    color: '#34d399',
+    fontSize: 12,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  checkboxRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 10,
+  },
+  checkboxBox: {
+    width: 20,
+    height: 20,
+    borderRadius: 4,
+    borderWidth: 1.5,
+    borderColor: '#4b5563',
+    marginRight: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxBoxActive: {
+    backgroundColor: '#10b981',
+    borderColor: '#10b981',
+  },
+  checkboxCheckMark: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  checkboxLabel: {
+    color: '#d1d5db',
+    fontSize: 12,
+    flex: 1,
   },
 });

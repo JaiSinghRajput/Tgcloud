@@ -1,8 +1,18 @@
 package com.telegramgallerybackup.app.media
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentUris
+import android.content.ContentValues
+import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -71,6 +81,100 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
             if (ext) "granted" else "denied"
         }
         promise.resolve(status)
+    }
+
+    @ReactMethod
+    fun copyToClipboard(text: String, promise: Promise) {
+        try {
+            val clipboard = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("TGCloud Recovery", text)
+            clipboard.setPrimaryClip(clip)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            promise.reject("CLIPBOARD_ERROR", e.message, e)
+        }
+    }
+
+    @ReactMethod
+    fun savePassphraseImage(passphrase: String, promise: Promise) {
+        scope.launch {
+            try {
+                val width = 1080
+                val height = 760
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bitmap)
+
+                // Dark Theme Background
+                val bgPaint = Paint().apply { color = Color.parseColor("#0a0f0d") }
+                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
+
+                // Header Title
+                val headerPaint = Paint().apply {
+                    color = Color.parseColor("#34d399")
+                    textSize = 46f
+                    isAntiAlias = true
+                    typeface = Typeface.DEFAULT_BOLD
+                }
+                canvas.drawText("TG Cloud Recovery Passphrase", 60f, 100f, headerPaint)
+
+                val subPaint = Paint().apply {
+                    color = Color.parseColor("#9ca3af")
+                    textSize = 28f
+                    isAntiAlias = true
+                }
+                canvas.drawText("Save this securely. Required to decrypt your private Telegram backup.", 60f, 150f, subPaint)
+
+                // Card container
+                val cardPaint = Paint().apply { color = Color.parseColor("#121a15") }
+                val rectF = RectF(60f, 190f, width - 60f, height - 60f)
+                canvas.drawRoundRect(rectF, 24f, 24f, cardPaint)
+
+                // Passphrase Words
+                val wordPaint = Paint().apply {
+                    color = Color.parseColor("#f9fafb")
+                    textSize = 36f
+                    isAntiAlias = true
+                    typeface = Typeface.MONOSPACE
+                }
+                val words = passphrase.trim().split(Regex("\\s+"))
+                val cols = 3
+                val colWidth = (width - 160f) / cols
+                for (i in words.indices) {
+                    val col = i % cols
+                    val row = i / cols
+                    val x = 90f + col * colWidth
+                    val y = 270f + row * 100f
+                    canvas.drawText("${i + 1}. ${words[i]}", x, y, wordPaint)
+                }
+
+                val resolver = reactContext.contentResolver
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, "TGCloud_Recovery_${System.currentTimeMillis()}.png")
+                    put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TGCloud")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+
+                val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { stream ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        contentValues.clear()
+                        contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                        resolver.update(uri, contentValues, null, null)
+                    }
+                    promise.resolve(uri.toString())
+                } else {
+                    promise.reject("SAVE_FAILED", "Failed to insert into MediaStore")
+                }
+            } catch (e: Exception) {
+                promise.reject("SAVE_ERROR", e.message, e)
+            }
+        }
     }
 
     @ReactMethod

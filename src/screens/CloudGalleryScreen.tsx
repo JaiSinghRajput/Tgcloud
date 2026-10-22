@@ -8,6 +8,7 @@ import {
   TouchableOpacity,
   Modal,
   Switch,
+  Image,
 } from 'react-native';
 import { ConflictPolicy } from '../domain/backup/stateMachine';
 import { BackupTransferProgress } from '../domain/backup/engine';
@@ -57,7 +58,7 @@ export interface CloudGalleryScreenProps {
   onOpenAppSettings?: () => void;
   onRescan?: () => void;
   onToggleFolderExclusion?: (folderKey: string) => void;
-  onConfirmBackup?: () => void;
+  onConfirmBackup?: (selectedIds?: string[]) => void;
   onTogglePause?: () => void;
   onRestoreItem: (
     item: CloudMediaItem,
@@ -88,6 +89,18 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [filterType, setFilterType] = useState<'all' | 'photo' | 'video'>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedFolder, setSelectedFolder] = useState<string>('all');
+
+  // Multi-Selection Mode State (Activated on Long Press)
+  const [isSelectionMode, setIsSelectionMode] = useState<boolean>(false);
+  const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
+
+  // In-App Media Viewer / Preview Modal State
+  const [previewItem, setPreviewItem] = useState<
+    DiscoveredMediaItem | CloudMediaItem | null
+  >(null);
+
+  // Thumbnail load error tracking
+  const [imageErrorMap, setImageErrorMap] = useState<Record<string, boolean>>({});
 
   // Initial Backup confirmation modal
   const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
@@ -180,6 +193,53 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     });
   }, [scannedItems, filterType, selectedFolder, searchQuery]);
 
+  // Selection calculations
+  const totalSelectedBytes = useMemo(() => {
+    return scannedItems
+      .filter(i => selectedItemIds.has(i.id))
+      .reduce((acc, curr) => acc + curr.sizeBytes, 0);
+  }, [scannedItems, selectedItemIds]);
+
+  const handleItemPress = (item: DiscoveredMediaItem) => {
+    if (isSelectionMode) {
+      const next = new Set(selectedItemIds);
+      if (next.has(item.id)) {
+        next.delete(item.id);
+        if (next.size === 0) {
+          setIsSelectionMode(false);
+        }
+      } else {
+        next.add(item.id);
+      }
+      setSelectedItemIds(next);
+    } else {
+      setPreviewItem(item);
+    }
+  };
+
+  const handleItemLongPress = (item: DiscoveredMediaItem) => {
+    if (!isSelectionMode) {
+      setIsSelectionMode(true);
+      setSelectedItemIds(new Set([item.id]));
+    }
+  };
+
+  const handleToggleSelectAll = () => {
+    if (selectedItemIds.size === filteredDeviceItems.length) {
+      setSelectedItemIds(new Set());
+      setIsSelectionMode(false);
+    } else {
+      setSelectedItemIds(new Set(filteredDeviceItems.map(i => i.id)));
+    }
+  };
+
+  const handleBackupSelected = () => {
+    const ids = Array.from(selectedItemIds);
+    setIsSelectionMode(false);
+    setSelectedItemIds(new Set());
+    onConfirmBackup?.(ids);
+  };
+
   const handleExecuteRestore = async () => {
     if (!restoreModalItem) return;
     setRestoring(true);
@@ -210,6 +270,56 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
   return (
     <View style={styles.container}>
+      {/* Sticky Selection Mode Bar */}
+      {isSelectionMode && (
+        <View style={styles.selectionBar}>
+          <View style={styles.selectionBarInfo}>
+            <Text style={styles.selectionBarTitle}>
+              {selectedItemIds.size} Selected
+            </Text>
+            <Text style={styles.selectionBarSub}>
+              {formatBytes(totalSelectedBytes)}
+            </Text>
+          </View>
+
+          <View style={styles.selectionBarActions}>
+            <TouchableOpacity
+              style={styles.selectionBarBtnSecondary}
+              onPress={handleToggleSelectAll}
+            >
+              <Text style={styles.selectionBarBtnSecondaryText}>
+                {selectedItemIds.size === filteredDeviceItems.length
+                  ? 'Deselect'
+                  : 'All'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.selectionBarBtnSecondary}
+              onPress={() => {
+                setIsSelectionMode(false);
+                setSelectedItemIds(new Set());
+              }}
+            >
+              <Text style={styles.selectionBarBtnSecondaryText}>Cancel</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[
+                styles.selectionBarBtnPrimary,
+                selectedItemIds.size === 0 && styles.buttonDisabled,
+              ]}
+              onPress={handleBackupSelected}
+              disabled={selectedItemIds.size === 0}
+            >
+              <Text style={styles.selectionBarBtnPrimaryText}>
+                Backup ({selectedItemIds.size})
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
       <ScrollView contentContainerStyle={styles.content}>
         {/* Screen Header */}
         <View style={styles.header}>
@@ -242,7 +352,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               </Text>
             </View>
             <Text style={styles.permissionAlertDesc}>
-              Telegram Gallery Backup needs permission to access your device storage so it can discover and back up your photos and videos.
+              TG Cloud needs access to your device storage to discover, preview, and back up your photos and videos.
             </Text>
             <TouchableOpacity
               style={styles.permissionActionButton}
@@ -407,6 +517,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             onPress={() => {
               setActiveView('cloud');
               setSelectedFolder('all');
+              setIsSelectionMode(false);
             }}
           >
             <Text
@@ -552,6 +663,13 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           </ScrollView>
         )}
 
+        {/* Selection mode tip */}
+        {activeView === 'device' && !isSelectionMode && scannedItems.length > 0 && (
+          <Text style={styles.selectionTipText}>
+            💡 Long press any item to select and back up specific photos
+          </Text>
+        )}
+
         {/* 5. Items Display List */}
         {activeView === 'cloud' ? (
           <View style={styles.itemsList}>
@@ -570,8 +688,13 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               </View>
             ) : (
               filteredCloudItems.map(item => (
-                <View key={item.id} style={styles.mediaItemCard}>
-                  <View style={styles.mediaItemIcon}>
+                <TouchableOpacity
+                  key={item.id}
+                  style={styles.mediaItemCard}
+                  activeOpacity={0.7}
+                  onPress={() => setPreviewItem(item)}
+                >
+                  <View style={styles.mediaItemThumb}>
                     <Text style={styles.mediaItemIconText}>
                       {item.mediaType === 'video' ? '▶' : '🖼'}
                     </Text>
@@ -595,7 +718,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                   >
                     <Text style={styles.restoreItemButtonText}>Restore</Text>
                   </TouchableOpacity>
-                </View>
+                </TouchableOpacity>
               ))
             )}
           </View>
@@ -625,12 +748,59 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             ) : (
               filteredDeviceItems.slice(0, 50).map(item => {
                 const isBackedUp = backedUpIdSet.has(item.id);
+                const isSelected = selectedItemIds.has(item.id);
+                const hasImageError = !!imageErrorMap[item.id];
+
                 return (
-                  <View key={item.id} style={styles.mediaItemCard}>
-                    <View style={styles.mediaItemIcon}>
-                      <Text style={styles.mediaItemIconText}>
-                        {item.mediaType === 'video' ? '▶' : '🖼'}
-                      </Text>
+                  <TouchableOpacity
+                    key={item.id}
+                    style={[
+                      styles.mediaItemCard,
+                      isSelected && styles.mediaItemCardSelected,
+                    ]}
+                    activeOpacity={0.7}
+                    onPress={() => handleItemPress(item)}
+                    onLongPress={() => handleItemLongPress(item)}
+                  >
+                    {/* Checkbox when in Multi-Selection Mode */}
+                    {isSelectionMode && (
+                      <View
+                        style={[
+                          styles.checkboxCircle,
+                          isSelected && styles.checkboxCircleActive,
+                        ]}
+                      >
+                        {isSelected && (
+                          <Text style={styles.checkboxCheckText}>✓</Text>
+                        )}
+                      </View>
+                    )}
+
+                    {/* Rich Thumbnail with Real Photo Preview */}
+                    <View style={styles.mediaItemThumb}>
+                      {item.sourceKey && !hasImageError ? (
+                        <Image
+                          source={{ uri: item.sourceKey }}
+                          style={styles.thumbImage}
+                          resizeMode="cover"
+                          fadeDuration={0}
+                          onError={() =>
+                            setImageErrorMap(prev => ({
+                              ...prev,
+                              [item.id]: true,
+                            }))
+                          }
+                        />
+                      ) : (
+                        <Text style={styles.mediaItemIconText}>
+                          {item.mediaType === 'video' ? '▶' : '🖼'}
+                        </Text>
+                      )}
+                      {item.mediaType === 'video' && (
+                        <View style={styles.videoBadge}>
+                          <Text style={styles.videoBadgeText}>▶</Text>
+                        </View>
+                      )}
                     </View>
 
                     <View style={styles.mediaItemDetails}>
@@ -660,15 +830,128 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                         </View>
                       )}
                     </View>
-                  </View>
+                  </TouchableOpacity>
                 );
               })
+            )}
+            {filteredDeviceItems.length > 50 && (
+              <Text style={styles.limitNotice}>
+                Showing latest 50 items. Use search or folder filters to narrow down.
+              </Text>
             )}
           </View>
         )}
       </ScrollView>
 
-      {/* 6. Initial Backup Confirmation Modal */}
+      {/* 6. In-App Photo & Video Detail Viewer Modal */}
+      {previewItem && (
+        <Modal transparent animationType="fade" visible={!!previewItem}>
+          <View style={styles.viewerOverlay}>
+            <View style={styles.viewerSheet}>
+              {/* Top Bar */}
+              <View style={styles.viewerTopBar}>
+                <Text style={styles.viewerTitle} numberOfLines={1}>
+                  {(previewItem as any).displayName ||
+                    (previewItem as any).originalName}
+                </Text>
+                <TouchableOpacity
+                  style={styles.viewerCloseBtn}
+                  onPress={() => setPreviewItem(null)}
+                >
+                  <Text style={styles.viewerCloseText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Large Media Preview */}
+              <View style={styles.viewerImageContainer}>
+                {(previewItem as any).sourceKey &&
+                previewItem.mediaType === 'photo' ? (
+                  <Image
+                    source={{ uri: (previewItem as any).sourceKey }}
+                    style={styles.viewerFullImage}
+                    resizeMode="contain"
+                    fadeDuration={0}
+                  />
+                ) : (
+                  <View style={styles.viewerPlaceholder}>
+                    <Text style={styles.viewerPlaceholderIcon}>
+                      {previewItem.mediaType === 'video' ? '▶' : '🖼'}
+                    </Text>
+                    <Text style={styles.viewerPlaceholderText}>
+                      {previewItem.mediaType === 'video'
+                        ? 'Video Preview'
+                        : 'Media File'}
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Item Details */}
+              <View style={styles.viewerDetails}>
+                <View style={styles.viewerDetailRow}>
+                  <Text style={styles.viewerDetailLabel}>File Size</Text>
+                  <Text style={styles.viewerDetailValue}>
+                    {formatBytes(previewItem.sizeBytes)}
+                  </Text>
+                </View>
+
+                <View style={styles.viewerDetailRow}>
+                  <Text style={styles.viewerDetailLabel}>Path</Text>
+                  <Text
+                    style={styles.viewerDetailValue}
+                    numberOfLines={1}
+                  >
+                    {previewItem.relativePath}
+                  </Text>
+                </View>
+
+                <View style={styles.viewerDetailRow}>
+                  <Text style={styles.viewerDetailLabel}>Modified</Text>
+                  <Text style={styles.viewerDetailValue}>
+                    {formatDate(previewItem.modifiedAtMs)}
+                  </Text>
+                </View>
+
+                <View style={styles.viewerDetailRow}>
+                  <Text style={styles.viewerDetailLabel}>Status</Text>
+                  <Text style={[styles.viewerDetailValue, styles.viewerStatusHighlight]}>
+                    {backedUpIdSet.has(previewItem.id)
+                      ? '✓ Backed Up to Telegram'
+                      : 'Local Device Media'}
+                  </Text>
+                </View>
+              </View>
+
+              {/* Modal Actions */}
+              <View style={styles.viewerActions}>
+                {!backedUpIdSet.has(previewItem.id) && onConfirmBackup && (
+                  <TouchableOpacity
+                    style={styles.viewerActionPrimary}
+                    onPress={() => {
+                      const id = previewItem.id;
+                      setPreviewItem(null);
+                      onConfirmBackup([id]);
+                    }}
+                  >
+                    <Text style={styles.viewerActionPrimaryText}>
+                      Back Up This Item Now
+                    </Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity
+                  style={styles.viewerActionSecondary}
+                  onPress={() => setPreviewItem(null)}
+                >
+                  <Text style={styles.viewerActionSecondaryText}>Close</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        </Modal>
+      )}
+
+      {/* 7. Initial Backup Confirmation Modal */}
       {showConfirmModal && (
         <Modal transparent animationType="fade" visible={showConfirmModal}>
           <View style={styles.modalOverlay}>
@@ -741,7 +1024,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         </Modal>
       )}
 
-      {/* 7. Restore Modal Sheet with Conflict Policy */}
+      {/* 8. Restore Modal Sheet with Conflict Policy */}
       {restoreModalItem && (
         <Modal transparent animationType="slide" visible={!!restoreModalItem}>
           <View style={styles.modalOverlay}>
@@ -837,8 +1120,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#0a0f0d',
   },
   content: {
-    padding: 20,
-    paddingBottom: 40,
+    padding: 16,
+    paddingBottom: 60,
   },
   header: {
     marginBottom: 16,
@@ -878,6 +1161,64 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     marginTop: 6,
+  },
+  selectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#162b20',
+    borderBottomWidth: 1,
+    borderBottomColor: '#34d399',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    zIndex: 99,
+  },
+  selectionBarInfo: {
+    flex: 1,
+  },
+  selectionBarTitle: {
+    color: '#34d399',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  selectionBarSub: {
+    color: '#9ca3af',
+    fontSize: 11,
+  },
+  selectionBarActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  selectionBarBtnSecondary: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: '#121a15',
+    borderWidth: 1,
+    borderColor: '#243029',
+  },
+  selectionBarBtnSecondaryText: {
+    color: '#d1d5db',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  selectionBarBtnPrimary: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: '#10b981',
+  },
+  selectionBarBtnPrimaryText: {
+    color: '#0a0f0d',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  selectionTipText: {
+    color: '#6b7280',
+    fontSize: 12,
+    marginBottom: 10,
+    textAlign: 'center',
   },
   permissionAlertCard: {
     backgroundColor: 'rgba(239, 68, 68, 0.1)',
@@ -1222,23 +1563,65 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#121a15',
-    borderRadius: 10,
-    padding: 12,
+    borderRadius: 12,
+    padding: 10,
     marginBottom: 8,
     borderWidth: 1,
     borderColor: '#243029',
   },
-  mediaItemIcon: {
-    width: 40,
-    height: 40,
+  mediaItemCardSelected: {
+    borderColor: '#10b981',
+    backgroundColor: '#14261c',
+  },
+  checkboxCircle: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    borderWidth: 1.5,
+    borderColor: '#6b7280',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  checkboxCircleActive: {
+    borderColor: '#10b981',
+    backgroundColor: '#10b981',
+  },
+  checkboxCheckText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  mediaItemThumb: {
+    width: 52,
+    height: 52,
     borderRadius: 8,
     backgroundColor: '#1b2a20',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
+    overflow: 'hidden',
+  },
+  thumbImage: {
+    width: '100%',
+    height: '100%',
   },
   mediaItemIconText: {
-    fontSize: 18,
+    fontSize: 20,
+  },
+  videoBadge: {
+    position: 'absolute',
+    bottom: 2,
+    right: 2,
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    borderRadius: 4,
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+  },
+  videoBadgeText: {
+    color: '#34d399',
+    fontSize: 8,
+    fontWeight: '700',
   },
   mediaItemDetails: {
     flex: 1,
@@ -1306,6 +1689,127 @@ const styles = StyleSheet.create({
   badgeExcludedText: {
     color: '#9ca3af',
     fontSize: 11,
+    fontWeight: '600',
+  },
+  limitNotice: {
+    color: '#6b7280',
+    fontSize: 12,
+    textAlign: 'center',
+    marginVertical: 12,
+  },
+  viewerOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.92)',
+    justifyContent: 'center',
+    padding: 16,
+  },
+  viewerSheet: {
+    backgroundColor: '#121a15',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#243029',
+    maxHeight: '90%',
+  },
+  viewerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  viewerTitle: {
+    color: '#f9fafb',
+    fontSize: 16,
+    fontWeight: '700',
+    flex: 1,
+    marginRight: 10,
+  },
+  viewerCloseBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: '#1f2e24',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerCloseText: {
+    color: '#9ca3af',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  viewerImageContainer: {
+    width: '100%',
+    height: 240,
+    backgroundColor: '#0a0f0d',
+    borderRadius: 12,
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  viewerFullImage: {
+    width: '100%',
+    height: '100%',
+  },
+  viewerPlaceholder: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerPlaceholderIcon: {
+    fontSize: 48,
+    marginBottom: 8,
+  },
+  viewerPlaceholderText: {
+    color: '#6b7280',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  viewerDetails: {
+    backgroundColor: '#0a0f0d',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 14,
+  },
+  viewerDetailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 5,
+    borderBottomWidth: 1,
+    borderBottomColor: '#16221c',
+  },
+  viewerDetailLabel: {
+    color: '#6b7280',
+    fontSize: 12,
+  },
+  viewerDetailValue: {
+    color: '#f9fafb',
+    fontSize: 12,
+    fontWeight: '600',
+    maxWidth: '70%',
+  },
+  viewerActions: {
+    gap: 8,
+  },
+  viewerActionPrimary: {
+    backgroundColor: '#10b981',
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  viewerActionPrimaryText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  viewerActionSecondary: {
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    backgroundColor: '#16221c',
+  },
+  viewerActionSecondaryText: {
+    color: '#9ca3af',
+    fontSize: 13,
     fontWeight: '600',
   },
   modalOverlay: {
@@ -1444,5 +1948,9 @@ const styles = StyleSheet.create({
   },
   buttonDisabled: {
     opacity: 0.5,
+  },
+  viewerStatusHighlight: {
+    color: '#34d399',
+    fontWeight: '700',
   },
 });
