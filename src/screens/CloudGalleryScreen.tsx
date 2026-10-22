@@ -11,10 +11,13 @@ import {
   Dimensions,
   ActivityIndicator,
 } from 'react-native';
+import { Buffer } from 'buffer';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ConflictPolicy } from '../domain/backup/stateMachine';
 import { BackupTransferProgress } from '../domain/backup/engine';
 import { MediaPermissionStatus } from '../domain/permissions/permissionService';
 import { TelegramBackupChannels } from '../types/telegram';
+import { TelegramBridgeService } from '../native/TelegramBridge';
 import {
   SessionKeyStore,
   verifyPassphraseAgainstItem,
@@ -22,6 +25,16 @@ import {
   normalizeRecoveryKey,
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
+
+const defaultInsets = { top: 16, bottom: 16, left: 0, right: 0 };
+function useSafeInsetsFallback() {
+  try {
+    const insets = useSafeAreaInsets();
+    return insets || defaultInsets;
+  } catch {
+    return defaultInsets;
+  }
+}
 
 const SCREEN_WIDTH = Dimensions.get('window').width;
 
@@ -120,11 +133,96 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [isSelectionMode, setIsSelectionMode] = useState<boolean>(false);
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
 
-  // In-App Full-Screen Viewer State
+  // In-App Full-Screen Viewer State & Safe-Area Aware Playback Lifecycle
+  const insets = useSafeInsetsFallback();
   const [previewItem, setPreviewItem] = useState<
     DiscoveredMediaItem | CloudMediaItem | null
   >(null);
-  const [isPlayingVideo, setIsPlayingVideo] = useState<boolean>(false);
+  const [videoState, setVideoState] = useState<
+    'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error'
+  >('idle');
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoLoadingMsg, setVideoLoadingMsg] = useState<string>('');
+  const [activeTempVideoPath, setActiveTempVideoPath] = useState<string | null>(null);
+
+  const handleCloseViewer = async () => {
+    setPreviewItem(null);
+    setVideoState('idle');
+    setVideoError(null);
+    setVideoLoadingMsg('');
+    if (activeTempVideoPath) {
+      const p = activeTempVideoPath;
+      setActiveTempVideoPath(null);
+      await TelegramBridgeService.cleanupTempMedia(p);
+    }
+  };
+
+  const handlePlayVideo = async () => {
+    if (!previewItem || previewItem.mediaType !== 'video') return;
+
+    if (videoState === 'playing') {
+      setVideoState('paused');
+      return;
+    }
+    if (videoState === 'paused') {
+      setVideoState('playing');
+      return;
+    }
+
+    setVideoState('loading');
+    setVideoError(null);
+    setVideoLoadingMsg('Preparing video...');
+
+    try {
+      let playableUri = '';
+
+      if ('sourceKey' in previewItem && previewItem.sourceKey) {
+        playableUri = previewItem.sourceKey;
+      } else if ('fileId' in previewItem && previewItem.fileId) {
+        const isEncrypted = !!previewItem.isEncrypted;
+        let masterKeyHex = '';
+
+        if (isEncrypted) {
+          const key = SessionKeyStore.getSessionKey();
+          if (!key) {
+            setVideoState('idle');
+            setShowUnlockModal(true);
+            return;
+          }
+          masterKeyHex = key.toString('hex');
+          setVideoLoadingMsg('Decrypting video media...');
+        } else {
+          setVideoLoadingMsg('Downloading from Telegram...');
+        }
+
+        const envelopeStr =
+          typeof previewItem.encryptionEnvelope === 'object'
+            ? JSON.stringify(previewItem.encryptionEnvelope)
+            : previewItem.encryptionEnvelope || '{}';
+
+        const prepared = await TelegramBridgeService.prepareCloudVideo(
+          previewItem.fileId,
+          isEncrypted,
+          envelopeStr,
+          masterKeyHex,
+        );
+
+        playableUri = prepared.localUri;
+        if (prepared.isTemporary && prepared.tempFilePath) {
+          setActiveTempVideoPath(prepared.tempFilePath);
+        }
+      } else {
+        throw new Error('Video source reference is unavailable.');
+      }
+
+      setVideoLoadingMsg('Starting video player...');
+      await TelegramBridgeService.playVideo(playableUri);
+      setVideoState('playing');
+    } catch (err: any) {
+      setVideoState('error');
+      setVideoError(err?.message || 'Video playback failed.');
+    }
+  };
 
   // Unlock Recovery Modal State
   const [showUnlockModal, setShowUnlockModal] = useState<boolean>(false);
@@ -210,7 +308,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setSelectedItemIds(next);
     } else {
       setPreviewItem(item);
-      setIsPlayingVideo(false);
+      setVideoState('idle');
+      setVideoError(null);
     }
   };
 
@@ -223,7 +322,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setShowUnlockModal(true);
     } else {
       setPreviewItem(item);
-      setIsPlayingVideo(false);
+      setVideoState('idle');
+      setVideoError(null);
     }
   };
 
@@ -386,6 +486,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         activeOpacity={0.8}
         onPress={() => handleItemPress(item)}
         onLongPress={() => handleItemLongPress(item)}
+        accessibilityLabel={item.displayName}
+        testID={`device-item-${item.id}`}
       >
         {item.sourceKey && !hasImageError ? (
           <Image
@@ -444,6 +546,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         style={[styles.thumbnailContainer, { width: itemSize, height: itemSize }]}
         activeOpacity={0.8}
         onPress={() => handleCloudItemPress(item)}
+        accessibilityLabel={item.originalName}
+        testID={`cloud-item-${item.id}`}
       >
         {isItemLocked ? (
           <View style={styles.lockedThumbnailBox}>
@@ -809,14 +913,25 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           visible={true}
           transparent={false}
           animationType="fade"
-          onRequestClose={() => setPreviewItem(null)}
+          onRequestClose={handleCloseViewer}
         >
           <View style={styles.viewerContainer}>
-            {/* Viewer Top Bar */}
-            <View style={styles.viewerTopBar}>
+            {/* Viewer Top Bar with Safe Area Padding */}
+            <View
+              style={[
+                styles.viewerTopBar,
+                {
+                  paddingTop: Math.max(insets.top, 16),
+                  paddingLeft: Math.max(insets.left, 16),
+                  paddingRight: Math.max(insets.right, 16),
+                },
+              ]}
+            >
               <TouchableOpacity
                 style={styles.viewerCloseBtn}
-                onPress={() => setPreviewItem(null)}
+                onPress={handleCloseViewer}
+                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+                accessibilityLabel="Close media viewer"
               >
                 <Text style={styles.viewerCloseBtnText}>✕ Close</Text>
               </TouchableOpacity>
@@ -835,6 +950,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                   source={{ uri: previewItem.sourceKey }}
                   style={styles.fullImage}
                   resizeMode="contain"
+                  accessibilityLabel="Full screen image preview"
+                  testID="full-viewer-image"
                 />
               ) : (
                 <View style={styles.viewerPlaceholder}>
@@ -849,21 +966,63 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                 </View>
               )}
 
-              {/* Video Playback overlay */}
+              {/* Video Playback overlay with Real Lifecycle States */}
               {previewItem.mediaType === 'video' && (
-                <TouchableOpacity
-                  style={styles.videoPlayOverlayBtn}
-                  onPress={() => setIsPlayingVideo(!isPlayingVideo)}
-                >
-                  <Text style={styles.videoPlayOverlayText}>
-                    {isPlayingVideo ? '⏸ Pause' : '▶ Play Video'}
-                  </Text>
-                </TouchableOpacity>
+                <View style={styles.videoControlsOverlay}>
+                  {videoState === 'loading' && (
+                    <View style={styles.videoPlayerStatusBox}>
+                      <ActivityIndicator size="small" color="#34d399" />
+                      <Text style={styles.videoPlayerStatusText}>
+                        {videoLoadingMsg}
+                      </Text>
+                    </View>
+                  )}
+
+                  {videoState === 'error' && (
+                    <View style={styles.videoPlayerErrorBox}>
+                      <Text style={styles.videoPlayerErrorText}>
+                        ⚠ {videoError}
+                      </Text>
+                    </View>
+                  )}
+
+                  <TouchableOpacity
+                    style={[
+                      styles.videoPlayOverlayBtn,
+                      videoState === 'playing' && styles.videoPlayingBtn,
+                      videoState === 'loading' && styles.videoLoadingBtn,
+                    ]}
+                    onPress={handlePlayVideo}
+                    disabled={videoState === 'loading'}
+                    accessibilityLabel="Toggle video playback"
+                  >
+                    <Text style={styles.videoPlayOverlayText}>
+                      {videoState === 'playing'
+                        ? '⏸ Pause'
+                        : videoState === 'paused'
+                        ? '▶ Resume Video'
+                        : videoState === 'loading'
+                        ? '⏳ Preparing...'
+                        : videoState === 'error'
+                        ? '↻ Retry Playback'
+                        : '▶ Play Video'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
               )}
             </View>
 
-            {/* Viewer Details & Bottom Actions */}
-            <View style={styles.viewerBottomBar}>
+            {/* Viewer Details & Bottom Actions with Safe Area Insets */}
+            <View
+              style={[
+                styles.viewerBottomBar,
+                {
+                  paddingBottom: Math.max(insets.bottom, 16),
+                  paddingLeft: Math.max(insets.left, 16),
+                  paddingRight: Math.max(insets.right, 16),
+                },
+              ]}
+            >
               <View style={styles.viewerMetaRow}>
                 <Text style={styles.viewerMetaText}>
                   {formatBytes(previewItem.sizeBytes)} ·{' '}
@@ -882,7 +1041,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                     style={styles.viewerPrimaryBtn}
                     onPress={() => {
                       const id = previewItem.id;
-                      setPreviewItem(null);
+                      handleCloseViewer();
                       onConfirmBackup([id]);
                     }}
                   >
@@ -897,7 +1056,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                     style={styles.viewerRestoreBtn}
                     onPress={() => {
                       setRestoreModalItem(previewItem as CloudMediaItem);
-                      setPreviewItem(null);
+                      handleCloseViewer();
                     }}
                   >
                     <Text style={styles.viewerRestoreBtnText}>
@@ -1578,18 +1737,66 @@ const styles = StyleSheet.create({
     maxWidth: '80%',
     textAlign: 'center',
   },
-  videoPlayOverlayBtn: {
+  videoControlsOverlay: {
     position: 'absolute',
-    bottom: 20,
-    backgroundColor: 'rgba(16, 185, 129, 0.9)',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 20,
+    bottom: 24,
+    left: 20,
+    right: 20,
+    alignItems: 'center',
+  },
+  videoPlayOverlayBtn: {
+    backgroundColor: 'rgba(16, 185, 129, 0.95)',
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  videoPlayingBtn: {
+    backgroundColor: 'rgba(239, 68, 68, 0.9)',
+  },
+  videoLoadingBtn: {
+    backgroundColor: 'rgba(55, 65, 81, 0.85)',
   },
   videoPlayOverlayText: {
     color: '#ffffff',
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '700',
+  },
+  videoPlayerStatusBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(18, 26, 21, 0.9)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#34d399',
+  },
+  videoPlayerStatusText: {
+    color: '#34d399',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  videoPlayerErrorBox: {
+    backgroundColor: 'rgba(127, 29, 29, 0.9)',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#ef4444',
+  },
+  videoPlayerErrorText: {
+    color: '#fecaca',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   viewerBottomBar: {
     backgroundColor: '#0e1411',

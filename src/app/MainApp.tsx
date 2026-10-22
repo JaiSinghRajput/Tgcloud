@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -7,6 +7,7 @@ import {
   StatusBar,
   AppState,
 } from 'react-native';
+import { Buffer } from 'buffer';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   CloudGalleryScreen,
@@ -122,10 +123,20 @@ export const MainApp: React.FC = () => {
     }
   }, [repo]);
 
-  // Synchronize Telegram Backup Channels and Remote Cloud History
+  // Concurrency guard to prevent parallel channel synchronizations
+  const isSyncingDestinationsRef = useRef(false);
+
+  // Synchronize Telegram Backup Channels (Read-Only) and Remote Cloud History
+  // CRITICAL: MUST NEVER CREATE A CHANNEL UNDER ANY CIRCUMSTANCES ON REFRESH!
   const syncChannelsAndCloudHistory = useCallback(async () => {
+    if (isSyncingDestinationsRef.current) return;
+    isSyncingDestinationsRef.current = true;
     try {
-      const ch = await TelegramBridgeService.setupChannels();
+      const ch = await TelegramBridgeService.refreshDestinations();
+      if (!ch) {
+        // Read-only discovery: zero channels created!
+        return;
+      }
       setChannels(ch);
 
       const photoHistory = await TelegramBridgeService.getChannelHistory(
@@ -167,9 +178,31 @@ export const MainApp: React.FC = () => {
 
       setCloudItems(mapped);
     } catch {
-      // Handled safely
+      // Handled safely without creating channels
+    } finally {
+      isSyncingDestinationsRef.current = false;
     }
   }, [restoreManager]);
+
+  // Restore persisted encryption configuration on startup
+  useEffect(() => {
+    const loadPersistedSettings = async () => {
+      try {
+        const savedConfigStr = await repo.getSetting('client_encryption_config');
+        if (savedConfigStr) {
+          const cfg = JSON.parse(savedConfigStr);
+          SessionKeyStore.setConfig(cfg);
+        }
+        const savedEnc = await repo.getSetting('encryption_enabled');
+        if (savedEnc === 'true') {
+          setEncryptionEnabled(true);
+        }
+      } catch {
+        // Ignored
+      }
+    };
+    loadPersistedSettings();
+  }, [repo]);
 
   // Backup Engine with bounded execution, encryption support, and remote channel routing
   const engine = useMemo(() => {
@@ -654,7 +687,9 @@ export const MainApp: React.FC = () => {
               setEncryptionEnabled(enabled);
               if (setup) {
                 SessionKeyStore.setConfig(setup.config);
+                repo.setSetting('client_encryption_config', JSON.stringify(setup.config));
               }
+              repo.setSetting('encryption_enabled', enabled ? 'true' : 'false');
             }}
             onTogglePause={handleTogglePause}
             onRequestPermission={handleRequestPermission}

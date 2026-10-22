@@ -10,11 +10,12 @@ import {
   TextInput,
   ActivityIndicator,
 } from 'react-native';
+import { Buffer } from 'buffer';
 import { NetworkPolicy } from '../domain/backup/stateMachine';
 import {
-  initializeEncryptionSetup,
+  initializeEncryptionSetupAsync,
   SessionKeyStore,
-  verifyRecoveryKey,
+  verifyRecoveryKeyAsync,
 } from '../domain/crypto/encryptionService';
 import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
@@ -82,16 +83,35 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   const isUnlocked = SessionKeyStore.isUnlocked();
 
-  const handleToggleEncryption = (newValue: boolean) => {
+  const handleToggleEncryption = async (newValue: boolean) => {
     if (newValue && !encryptionEnabled) {
-      const setup = initializeEncryptionSetup();
-      setActiveSetup(setup);
-      setGeneratedKey(setup.recoveryKey);
+      // Rule 4 & 5: Never replace an existing encryption key automatically!
+      const existingConfig = SessionKeyStore.getConfig();
+      if (existingConfig && existingConfig.verificationToken) {
+        if (SessionKeyStore.isUnlocked()) {
+          onToggleEncryption(true);
+          return;
+        }
+        setShowUnlockModal(true);
+        return;
+      }
+
       setSetupError(null);
       setCopySuccess('');
       setSavePhotoSuccess('');
       setHasConfirmedSaved(false);
-      setShowSetupModal(true);
+
+      try {
+        const setup = await initializeEncryptionSetupAsync();
+        setActiveSetup(setup);
+        setGeneratedKey(setup.recoveryKey);
+        setShowSetupModal(true);
+      } catch (err: any) {
+        const userMsg = err?.message?.includes('Buffer')
+          ? 'Memory buffer initialization error. Please update app.'
+          : err?.message || 'Failed to initialize client-side encryption. Please try again.';
+        setSetupError(userMsg);
+      }
     } else {
       SessionKeyStore.clear();
       onToggleEncryption(false);
@@ -149,11 +169,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       let valid = false;
       const cfg = SessionKeyStore.getConfig();
       if (cfg) {
-        const res = verifyRecoveryKey(raw, cfg);
+        const res = await verifyRecoveryKeyAsync(raw, cfg);
         if (res.valid && res.masterKeyHex) {
           valid = true;
           const masterKey = Buffer.from(res.masterKeyHex, 'hex');
           SessionKeyStore.setSessionKey(masterKey, raw, cfg);
+          onToggleEncryption(true);
         }
       }
 

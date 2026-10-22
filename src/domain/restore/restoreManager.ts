@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer';
 import { DatabaseRepository } from '../database/repository';
 import { TelegramHistoryItem } from '../../types/telegram';
 import { ConflictPolicy, MediaState } from '../backup/stateMachine';
