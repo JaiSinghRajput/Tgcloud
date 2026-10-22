@@ -127,9 +127,14 @@ const fallbackMock: TelegramBridgeNativeModule = {
 const nativeModule: TelegramBridgeNativeModule =
   Platform.OS === 'android' && TelegramBridge ? TelegramBridge : fallbackMock;
 
+export const DEFAULT_TELEGRAM_API_ID = 2040;
+export const DEFAULT_TELEGRAM_API_HASH = 'b18441a1ff607e10a989891a5462e627';
+
 export const TelegramBridgeService = {
-  initialize: (apiId: number, apiHash: string) =>
-    nativeModule.initialize(apiId, apiHash),
+  initialize: (
+    apiId: number = DEFAULT_TELEGRAM_API_ID,
+    apiHash: string = DEFAULT_TELEGRAM_API_HASH,
+  ) => nativeModule.initialize(apiId, apiHash),
   getAuthState: () => nativeModule.getAuthState(),
   sendPhoneNumber: (phoneNumber: string) =>
     nativeModule.sendPhoneNumber(phoneNumber),

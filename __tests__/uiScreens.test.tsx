@@ -4,6 +4,7 @@ import { DashboardScreen } from '../src/screens/DashboardScreen';
 import { ScanReviewScreen } from '../src/screens/ScanReviewScreen';
 import { CloudGalleryScreen } from '../src/screens/CloudGalleryScreen';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
+import { LoginScreen } from '../src/screens/LoginScreen';
 import { MainApp } from '../src/app/MainApp';
 import { NetworkPolicy } from '../src/domain/backup/stateMachine';
 
@@ -127,6 +128,16 @@ describe('React Native Product UI Screens (Phase 5)', () => {
     let tree: ReactTestRenderer.ReactTestRenderer;
     await ReactTestRenderer.act(async () => {
       tree = ReactTestRenderer.create(<MainApp />);
+    });
+    expect(tree!.toJSON()).toBeDefined();
+  });
+
+  it('renders LoginScreen with phone number and OTP flow', async () => {
+    let tree: ReactTestRenderer.ReactTestRenderer;
+    await ReactTestRenderer.act(async () => {
+      tree = ReactTestRenderer.create(
+        <LoginScreen onLoginSuccess={jest.fn()} />,
+      );
     });
     expect(tree!.toJSON()).toBeDefined();
   });

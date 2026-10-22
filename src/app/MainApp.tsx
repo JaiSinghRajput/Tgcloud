@@ -15,6 +15,8 @@ import {
 } from '../screens/CloudGalleryScreen';
 import { TelegramPocScreen } from '../screens/TelegramPocScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { LoginScreen } from '../screens/LoginScreen';
+import { TelegramBridgeService } from '../native/TelegramBridge';
 import { InMemoryDatabaseRepository } from '../domain/database/repository';
 import { BackupEngine, BackupTransferProgress } from '../domain/backup/engine';
 import {
@@ -34,6 +36,58 @@ export type AppTab =
 
 export const MainApp: React.FC = () => {
   const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
+
+  // Telegram Authentication State Gate
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [_currentUser, setCurrentUser] = useState<{
+    userId: number;
+    firstName: string;
+    lastName: string;
+  } | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    TelegramBridgeService.getAuthState()
+      .then(state => {
+        if (!mounted) return;
+        if (state.state === 'READY') {
+          setIsLoggedIn(true);
+          setCurrentUser({
+            userId: state.userId ?? 0,
+            firstName: state.firstName ?? '',
+            lastName: state.lastName ?? '',
+          });
+        } else {
+          setIsLoggedIn(false);
+          setCurrentUser(null);
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setIsLoggedIn(false);
+        }
+      });
+
+    const unsubscribe = TelegramBridgeService.subscribeToAuthState(state => {
+      if (!mounted) return;
+      if (state.state === 'READY') {
+        setIsLoggedIn(true);
+        setCurrentUser({
+          userId: state.userId ?? 0,
+          firstName: state.firstName ?? '',
+          lastName: state.lastName ?? '',
+        });
+      } else {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+      }
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Repositories & Engine
   const repo = useMemo(() => new InMemoryDatabaseRepository(), []);
@@ -102,11 +156,13 @@ export const MainApp: React.FC = () => {
     setMetrics(m);
   }, [repo]);
 
-  // Initial gallery scan and metrics sync
+  // Initial gallery scan and metrics sync when logged in
   useEffect(() => {
-    refreshScan();
-    refreshMetrics();
-  }, [refreshScan, refreshMetrics]);
+    if (isLoggedIn) {
+      refreshScan();
+      refreshMetrics();
+    }
+  }, [isLoggedIn, refreshScan, refreshMetrics]);
 
   const handleToggleFolderExclusion = (folderKey: string) => {
     const isCurrentlyExcluded = scanReview.folders.find(
@@ -194,6 +250,21 @@ export const MainApp: React.FC = () => {
     return new Promise(resolve => setTimeout(() => resolve(true), 800));
   };
 
+  // Render LoginScreen exclusively if user is not authenticated
+  if (!isLoggedIn) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" />
+        <LoginScreen
+          onLoginSuccess={user => {
+            setIsLoggedIn(true);
+            setCurrentUser(user);
+          }}
+        />
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
@@ -209,7 +280,7 @@ export const MainApp: React.FC = () => {
             onTogglePause={handleTogglePause}
             onTriggerScan={() => refreshScan()}
             onNavigateToScanReview={() => setActiveTab('scan-review')}
-            onNavigateToTelegram={() => setActiveTab('telegram')}
+            onNavigateToTelegram={() => setActiveTab('settings')}
           />
         )}
 
@@ -245,7 +316,15 @@ export const MainApp: React.FC = () => {
             }
             onToggleCharging={setRequiresCharging}
             onToggleEncryption={setEncryptionEnabled}
-            onDisconnectTelegram={() => setActiveTab('telegram')}
+            onDisconnectTelegram={async () => {
+              try {
+                await TelegramBridgeService.logOut();
+              } catch {
+                // Handled
+              }
+              setIsLoggedIn(false);
+              setCurrentUser(null);
+            }}
           />
         )}
       </View>

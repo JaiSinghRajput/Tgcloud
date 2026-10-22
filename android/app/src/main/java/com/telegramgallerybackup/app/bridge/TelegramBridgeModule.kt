@@ -60,7 +60,9 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun initialize(apiId: Double, apiHash: String, promise: Promise) {
         try {
-            tdLibService.initialize(apiId.toInt(), apiHash)
+            val id = if (apiId > 0) apiId.toInt() else TdLibService.DEFAULT_API_ID
+            val hash = if (apiHash.isNotBlank()) apiHash else TdLibService.DEFAULT_API_HASH
+            tdLibService.initialize(id, hash)
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("INIT_ERROR", e.message, e)

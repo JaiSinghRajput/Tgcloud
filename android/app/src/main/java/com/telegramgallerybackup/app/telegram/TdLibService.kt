@@ -41,6 +41,9 @@ class TdLibService(private val context: Context) {
     val authState: StateFlow<TelegramAuthState> = _authState.asStateFlow()
 
     companion object {
+        const val DEFAULT_API_ID = 2040
+        const val DEFAULT_API_HASH = "b18441a1ff607e10a989891a5462e627"
+
         private var isNativeLoaded = false
 
         fun loadNativeLibrary() {
@@ -57,21 +60,26 @@ class TdLibService(private val context: Context) {
 
     init {
         loadNativeLibrary()
+        try {
+            initialize(DEFAULT_API_ID, DEFAULT_API_HASH)
+        } catch (e: Exception) {
+            Log.e(tag, "Initial TDLib startup error: ${e.message}")
+        }
     }
 
     /**
-     * Initializes TDLib with the user's API credentials.
+     * Initializes TDLib with the API credentials. Defaults to standard Telegram client credentials.
      * State is stored in app-private files directory: context.filesDir/tdlib
      */
     @Synchronized
-    fun initialize(apiId: Int, apiHash: String) {
+    fun initialize(apiId: Int = DEFAULT_API_ID, apiHash: String = DEFAULT_API_HASH) {
         if (client != null) {
             Log.d(tag, "TDLib client already initialized")
             return
         }
 
-        this.apiId = apiId
-        this.apiHash = apiHash
+        this.apiId = if (apiId > 0) apiId else DEFAULT_API_ID
+        this.apiHash = if (apiHash.isNotBlank()) apiHash else DEFAULT_API_HASH
 
         // Ensure app-private storage directory exists
         val tdlibDir = File(context.filesDir, "tdlib").apply { mkdirs() }
