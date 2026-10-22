@@ -76,7 +76,7 @@ data class TelegramMetadataEnvelope(
                 val sizeBytes = json.getLong("size")
                 val modifiedAtMs = json.getLong("mod")
                 val contentHash = if (json.has("hash")) json.getString("hash") else null
-                val encryptionEnvelope = if (json.has("enc")) json.getString("enc") else null
+                val encryptionEnvelope = if (json.has("enc")) json.get("enc").toString() else null
 
                 TelegramMetadataEnvelope(
                     schemaVersion = version,

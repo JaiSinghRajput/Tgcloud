@@ -184,4 +184,121 @@ describe('Restore Manager & Remote Index Recovery (Phase 6)', () => {
       expect(results[0].restoredPath).toBeNull();
     });
   });
+
+  describe('Gate E: Encrypted History Index Rebuild & Decryption Restore', () => {
+    const masterKey = Buffer.alloc(32, 0x55);
+    const plaintext = Buffer.from('Confidential Image Payload', 'utf8');
+    const sensitiveMeta = {
+      originalName: 'ConfidentialDoc.pdf',
+      relativePath: 'Vault/ConfidentialDoc.pdf',
+      mimeType: 'application/pdf',
+      sizeBytes: plaintext.length,
+      modifiedAtMs: 1792680000000,
+      contentHash: 'hash-secret-doc',
+    };
+
+    // Encrypt payload
+    const { encryptedMedia, envelope } =
+      require('../src/domain/crypto/encryptionService').encryptMediaPayload(
+        plaintext,
+        sensitiveMeta,
+        masterKey,
+      );
+
+    const encryptedHistoryItem: TelegramHistoryItem = {
+      messageId: '999',
+      chatId: '-100123456789',
+      fileId: 777,
+      mediaId: 'enc-media-999',
+      mediaType: 'photo',
+      originalName: 'encrypted.bin',
+      relativePath: '',
+      sizeBytes: encryptedMedia.length,
+      modifiedAtMs: 0,
+      contentHash: undefined,
+      date: 1792680000,
+      encryptionEnvelope: envelope,
+    };
+
+    it('decrypts metadata during index rebuild when master key is supplied', async () => {
+      const { indexedCount } =
+        await restoreManager.rebuildIndexFromRemoteHistory(
+          [encryptedHistoryItem],
+          masterKey,
+        );
+
+      expect(indexedCount).toBe(1);
+      const item = await repo.getMediaItem('enc-media-999');
+      expect(item).not.toBeNull();
+      expect(item?.displayName).toBe('ConfidentialDoc.pdf');
+      expect(item?.relativePath).toBe('Vault/ConfidentialDoc.pdf');
+    });
+
+    it('safely marks encrypted items as locked when rebuilt without master key', async () => {
+      const repoLocked = new InMemoryDatabaseRepository();
+      const rmLocked = new RestoreManager(repoLocked);
+
+      await rmLocked.rebuildIndexFromRemoteHistory([encryptedHistoryItem]); // no masterKey
+
+      const item = await repoLocked.getMediaItem('enc-media-999');
+      expect(item).not.toBeNull();
+      expect(item?.displayName).toBe('Encrypted Item (Locked)');
+    });
+
+    it('decrypts media payload and restores original file when master key is provided', async () => {
+      let writtenData: string | undefined;
+      let writtenPath: string | undefined;
+
+      const mockDownloader = jest.fn().mockResolvedValue({
+        bytes: encryptedMedia.length,
+        content: encryptedMedia.toString('base64'),
+      });
+
+      const mockWriteFile = jest
+        .fn()
+        .mockImplementation(async (path, content) => {
+          writtenPath = path;
+          writtenData = content;
+        });
+
+      const results = await restoreManager.restoreItems(
+        [encryptedHistoryItem],
+        '/storage/emulated/0',
+        ConflictPolicy.KEEP_BOTH,
+        mockDownloader,
+        () => false,
+        mockWriteFile,
+        masterKey,
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('restored');
+      expect(results[0].originalName).toBe('ConfidentialDoc.pdf');
+      expect(writtenPath).toBe('/storage/emulated/0/Vault/ConfidentialDoc.pdf');
+      expect(Buffer.from(writtenData!, 'base64').toString('utf8')).toBe(
+        'Confidential Image Payload',
+      );
+    });
+
+    it('fails gracefully when attempting to restore encrypted media without master key', async () => {
+      const mockDownloader = jest.fn().mockResolvedValue({
+        bytes: encryptedMedia.length,
+        content: encryptedMedia.toString('base64'),
+      });
+
+      const results = await restoreManager.restoreItems(
+        [encryptedHistoryItem],
+        '/storage/emulated/0',
+        ConflictPolicy.KEEP_BOTH,
+        mockDownloader,
+        () => false,
+        jest.fn(),
+        // no master key!
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('failed');
+      expect(results[0].error).toContain('Decryption key required');
+    });
+  });
 });

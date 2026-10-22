@@ -2,6 +2,11 @@ import { DatabaseRepository } from '../database/repository';
 import { TelegramHistoryItem } from '../../types/telegram';
 import { ConflictPolicy, MediaState } from '../backup/stateMachine';
 import { DbMediaItem, DbTelegramObject } from '../database/types';
+import { EncryptedItemEnvelope } from '../../types/encryption';
+import {
+  decryptBuffer,
+  decryptMediaPayload,
+} from '../crypto/encryptionService';
 
 export interface RestoreItemResult {
   mediaId: string;
@@ -13,17 +18,18 @@ export interface RestoreItemResult {
 
 /**
  * Manages remote-history index rebuild, multi-item/folder restore,
- * and filename collision policies as defined in PRD.md Section 5.5 and Gate B.
+ * filename collision policies, and client-side decryption as defined in Gate B & Gate E.
  */
 export class RestoreManager {
   constructor(private readonly repo: DatabaseRepository) {}
 
   /**
    * Rebuilds the local database index from remote Telegram channel history.
-   * Validates Gate B: clean installation recoverability without prior SQLite database.
+   * Validates Gate B & Gate E: reconstructs virtual gallery and decrypts metadata if master key is provided.
    */
   async rebuildIndexFromRemoteHistory(
     historyItems: TelegramHistoryItem[],
+    masterKey?: Buffer,
   ): Promise<{ indexedCount: number; duplicateCount: number }> {
     let indexedCount = 0;
     let duplicateCount = 0;
@@ -36,18 +42,64 @@ export class RestoreManager {
         continue;
       }
 
+      let displayName = item.originalName;
+      let relativePath = item.relativePath;
+      let mimeType = item.mediaType === 'video' ? 'video/mp4' : 'image/jpeg';
+      let contentHash = item.contentHash || null;
+
+      // If item has encryption envelope and masterKey is available, decrypt metadata
+      if (item.encryptionEnvelope) {
+        const encObj: EncryptedItemEnvelope | null =
+          typeof item.encryptionEnvelope === 'string'
+            ? (() => {
+                try {
+                  return JSON.parse(item.encryptionEnvelope as string);
+                } catch {
+                  return null;
+                }
+              })()
+            : item.encryptionEnvelope;
+
+        if (masterKey && encObj?.encryptedDek && encObj?.encryptedMeta) {
+          try {
+            const dekBuffer = Buffer.from(encObj.encryptedDek, 'base64');
+            const dek = decryptBuffer(
+              dekBuffer,
+              masterKey,
+              encObj.dekIv,
+              encObj.dekTag,
+            );
+            const metaJson = decryptBuffer(
+              Buffer.from(encObj.encryptedMeta, 'base64'),
+              dek,
+              encObj.metaIv!,
+              encObj.metaTag!,
+            ).toString('utf8');
+            const meta = JSON.parse(metaJson);
+            displayName = meta.originalName || displayName;
+            relativePath = meta.relativePath || relativePath;
+            mimeType = meta.mimeType || mimeType;
+            contentHash = meta.contentHash || contentHash;
+          } catch {
+            displayName = 'Encrypted Item (Corrupted or Bad Key)';
+          }
+        } else if (!masterKey && item.originalName === 'encrypted.bin') {
+          displayName = 'Encrypted Item (Locked)';
+        }
+      }
+
       // Reconstruct local media record from remote metadata envelope
       const mediaItem: DbMediaItem = {
         id: item.mediaId,
         sourceKey: null, // remote index rebuild has no prior local MediaStore key
         mediaType: item.mediaType,
-        displayName: item.originalName,
-        relativePath: item.relativePath,
-        mimeType: item.mediaType === 'video' ? 'video/mp4' : 'image/jpeg',
+        displayName,
+        relativePath,
+        mimeType,
         sizeBytes: item.sizeBytes,
         modifiedAtMs: item.modifiedAtMs,
         createdAtMs: item.modifiedAtMs,
-        contentHash: item.contentHash || null,
+        contentHash,
         state: MediaState.BACKED_UP,
         isExcluded: false,
         lastScannedAtMs: Date.now(),
@@ -65,7 +117,7 @@ export class RestoreManager {
         messageId: item.messageId,
         remoteFileId: item.fileId.toString(),
         metadataVersion: 1,
-        contentHash: item.contentHash || null,
+        contentHash,
         uploadedAtMs: item.date * 1000,
         verifiedAtMs: Date.now(),
         status: 'available',
@@ -128,7 +180,7 @@ export class RestoreManager {
   }
 
   /**
-   * Restores items executing download, conflict resolution, and path preservation.
+   * Restores items executing download, decryption (if encrypted), conflict resolution, and path preservation.
    */
   async restoreItems(
     items: TelegramHistoryItem[],
@@ -139,16 +191,11 @@ export class RestoreManager {
     ) => Promise<{ bytes: number; content?: string } | null>,
     fileExistsFn: (path: string) => boolean,
     writeFileFn: (path: string, content?: string) => Promise<void>,
+    masterKey?: Buffer,
   ): Promise<RestoreItemResult[]> {
     const results: RestoreItemResult[] = [];
 
     for (const item of items) {
-      const targetRelPath = item.relativePath || item.originalName;
-      const targetFullPath = `${targetBaseDir.replace(
-        /\\/g,
-        '/',
-      )}/${targetRelPath.replace(/\\/g, '/')}`;
-
       try {
         // Download from Telegram
         const downloaded = await downloader(item.fileId);
@@ -163,6 +210,49 @@ export class RestoreManager {
           continue;
         }
 
+        let writeContent: string | undefined = downloaded.content;
+        let resolvedName = item.originalName;
+        let resolvedRelPath = item.relativePath || item.originalName;
+
+        // Decrypt if item is encrypted
+        if (item.encryptionEnvelope) {
+          if (!masterKey) {
+            results.push({
+              mediaId: item.mediaId,
+              originalName: item.originalName,
+              restoredPath: null,
+              status: 'failed',
+              error: 'Decryption key required to restore encrypted media',
+            });
+            continue;
+          }
+
+          const encObj: EncryptedItemEnvelope =
+            typeof item.encryptionEnvelope === 'string'
+              ? JSON.parse(item.encryptionEnvelope as string)
+              : item.encryptionEnvelope;
+
+          const encryptedBuffer = Buffer.from(
+            downloaded.content || '',
+            'base64',
+          );
+          const decrypted = decryptMediaPayload(
+            encryptedBuffer,
+            encObj,
+            masterKey,
+          );
+
+          writeContent = decrypted.decryptedMedia.toString('base64');
+          resolvedName = decrypted.metadata.originalName;
+          resolvedRelPath =
+            decrypted.metadata.relativePath || decrypted.metadata.originalName;
+        }
+
+        const targetFullPath = `${targetBaseDir.replace(
+          /\\/g,
+          '/',
+        )}/${resolvedRelPath.replace(/\\/g, '/')}`;
+
         // Apply conflict policy
         const resolution = this.resolveConflict(
           targetFullPath,
@@ -172,7 +262,7 @@ export class RestoreManager {
         if (resolution.action === 'skip') {
           results.push({
             mediaId: item.mediaId,
-            originalName: item.originalName,
+            originalName: resolvedName,
             restoredPath: null,
             status: 'skipped',
           });
@@ -180,11 +270,11 @@ export class RestoreManager {
         }
 
         // Write restored file
-        await writeFileFn(resolution.finalPath, downloaded.content);
+        await writeFileFn(resolution.finalPath, writeContent);
 
         results.push({
           mediaId: item.mediaId,
-          originalName: item.originalName,
+          originalName: resolvedName,
           restoredPath: resolution.finalPath,
           status: 'restored',
         });

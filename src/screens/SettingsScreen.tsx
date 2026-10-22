@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -6,8 +6,14 @@ import {
   ScrollView,
   Switch,
   TouchableOpacity,
+  Modal,
+  TextInput,
 } from 'react-native';
 import { NetworkPolicy } from '../domain/backup/stateMachine';
+import {
+  generateRecoveryKey,
+  normalizeRecoveryKey,
+} from '../domain/crypto/encryptionService';
 
 interface SettingsScreenProps {
   networkPolicy: NetworkPolicy;
@@ -30,6 +36,41 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 }) => {
   const isWifiOnly = networkPolicy === NetworkPolicy.WIFI_ONLY;
 
+  // Encryption setup modal state
+  const [showSetupModal, setShowSetupModal] = useState(false);
+  const [generatedKey, setGeneratedKey] = useState('');
+  const [confirmationInput, setConfirmationInput] = useState('');
+  const [setupError, setSetupError] = useState<string | null>(null);
+
+  const handleToggleEncryption = (newValue: boolean) => {
+    if (newValue && !encryptionEnabled) {
+      // Must generate and verify recovery key before enabling!
+      const newKey = generateRecoveryKey();
+      setGeneratedKey(newKey);
+      setConfirmationInput('');
+      setSetupError(null);
+      setShowSetupModal(true);
+    } else {
+      onToggleEncryption(false);
+    }
+  };
+
+  const handleConfirmVerification = () => {
+    const normalizedInput = normalizeRecoveryKey(confirmationInput);
+    const normalizedGen = normalizeRecoveryKey(generatedKey);
+
+    if (normalizedInput !== normalizedGen) {
+      setSetupError(
+        'Recovery passphrase does not match. Please verify all 12 words carefully.',
+      );
+      return;
+    }
+
+    setSetupError(null);
+    setShowSetupModal(false);
+    onToggleEncryption(true);
+  };
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       {/* Header */}
@@ -38,7 +79,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         <Text style={styles.headerTitle}>Settings & Policies</Text>
         <Text style={styles.headerDesc}>
           Manage background network transfer constraints, deletion safety rules,
-          and encryption.
+          and client-side encryption.
         </Text>
       </View>
 
@@ -103,12 +144,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         </View>
       </View>
 
-      {/* Client-Side Encryption */}
+      {/* Client-Side Encryption (Phase 7 - Gate E) */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Client-Side Encryption (Phase 7)</Text>
+        <Text style={styles.cardTitle}>Client-Side Encryption (Gate E)</Text>
         <Text style={styles.cardDesc}>
-          Optionally encrypt media and thumbnails with AES-256-GCM before
-          uploading to Telegram.
+          Zero-knowledge authenticated encryption using AES-256-GCM and
+          PBKDF2-HMAC-SHA256. Sensitive filenames, relative paths, and content
+          hashes are strictly concealed.
         </Text>
 
         <View style={styles.settingRow}>
@@ -118,17 +160,28 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </Text>
             <Text style={styles.settingSubtitle}>
               {encryptionEnabled
-                ? 'Client-side AES-256-GCM encryption is armed'
+                ? 'AES-256-GCM encryption is ACTIVE & verified'
                 : 'Media is backed up in private Telegram channels with standard MTProto transport'}
             </Text>
           </View>
           <Switch
             value={encryptionEnabled}
-            onValueChange={onToggleEncryption}
+            onValueChange={handleToggleEncryption}
             trackColor={{ false: '#374151', true: '#047857' }}
             thumbColor={encryptionEnabled ? '#10b981' : '#9ca3af'}
           />
         </View>
+
+        {encryptionEnabled && (
+          <View style={styles.activeEncryptionBanner}>
+            <Text style={styles.activeEncryptionBadge}>ARMED</Text>
+            <Text style={styles.activeEncryptionText}>
+              Per-item random 256-bit DEKs and 96-bit nonces protect all
+              uploaded media. No plaintext metadata is exposed in message
+              captions.
+            </Text>
+          </View>
+        )}
       </View>
 
       {/* Telegram Session */}
@@ -158,6 +211,71 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           TDLib 1.8.x · Kotlin 2.2 · RN 0.88
         </Text>
       </View>
+
+      {/* Setup / Verification Modal for Encryption */}
+      <Modal
+        visible={showSetupModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowSetupModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Setup Client-Side Encryption</Text>
+
+            <View style={styles.warningBox}>
+              <Text style={styles.warningTitle}>IMPORTANT WARNING</Text>
+              <Text style={styles.warningText}>
+                Private Telegram channels are NOT end-to-end encrypted storage.
+                With client-side encryption, only you possess the master key. If
+                you lose your recovery passphrase, your backups will be
+                PERMANENTLY UNRECOVERABLE. Telegram cannot recover them.
+              </Text>
+            </View>
+
+            <Text style={styles.keyLabel}>
+              Your 12-Word Recovery Passphrase:
+            </Text>
+            <View style={styles.keyBox}>
+              <Text style={styles.keyText}>{generatedKey}</Text>
+            </View>
+
+            <Text style={styles.instructionText}>
+              Write down or save these 12 words in a secure location. To verify
+              you have saved them, type or paste the words below:
+            </Text>
+
+            <TextInput
+              style={styles.input}
+              placeholder="Enter your 12 recovery words..."
+              placeholderTextColor="#6b7280"
+              value={confirmationInput}
+              onChangeText={setConfirmationInput}
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline
+            />
+
+            {setupError && <Text style={styles.errorText}>{setupError}</Text>}
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => setShowSetupModal(false)}
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmButton}
+                onPress={handleConfirmVerification}
+              >
+                <Text style={styles.confirmButtonText}>Verify & Enable</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </ScrollView>
   );
 };
@@ -263,6 +381,26 @@ const styles = StyleSheet.create({
     lineHeight: 17,
     marginTop: 4,
   },
+  activeEncryptionBanner: {
+    backgroundColor: '#064e3b',
+    borderColor: '#10b981',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 14,
+  },
+  activeEncryptionBadge: {
+    color: '#34d399',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 1,
+    marginBottom: 2,
+  },
+  activeEncryptionText: {
+    color: '#d1fae5',
+    fontSize: 12,
+    lineHeight: 16,
+  },
   disconnectButton: {
     backgroundColor: '#374151',
     borderRadius: 8,
@@ -281,5 +419,116 @@ const styles = StyleSheet.create({
   footerInfoText: {
     color: '#4b5563',
     fontSize: 12,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: '#121815',
+    borderColor: '#243029',
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 20,
+    width: '100%',
+    maxWidth: 480,
+  },
+  modalTitle: {
+    color: '#f9fafb',
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 12,
+  },
+  warningBox: {
+    backgroundColor: '#451a03',
+    borderColor: '#f59e0b',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 14,
+  },
+  warningTitle: {
+    color: '#fbbf24',
+    fontSize: 11,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+    marginBottom: 4,
+  },
+  warningText: {
+    color: '#fef3c7',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  keyLabel: {
+    color: '#9ca3af',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  keyBox: {
+    backgroundColor: '#0a0f0d',
+    borderColor: '#10b981',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 14,
+  },
+  keyText: {
+    color: '#6ee7b7',
+    fontSize: 14,
+    fontFamily: 'monospace',
+    lineHeight: 20,
+  },
+  instructionText: {
+    color: '#d1d5db',
+    fontSize: 12,
+    lineHeight: 16,
+    marginBottom: 8,
+  },
+  input: {
+    backgroundColor: '#1b2420',
+    borderColor: '#374151',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    color: '#f9fafb',
+    fontSize: 13,
+    minHeight: 60,
+    textAlignVertical: 'top',
+    marginBottom: 8,
+  },
+  errorText: {
+    color: '#f87171',
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 10,
+  },
+  cancelButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    marginRight: 10,
+  },
+  cancelButtonText: {
+    color: '#9ca3af',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  confirmButton: {
+    backgroundColor: '#059669',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
+  confirmButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

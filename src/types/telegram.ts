@@ -1,3 +1,5 @@
+import { EncryptedItemEnvelope } from './encryption';
+
 export type TelegramAuthStateType =
   | 'UNINITIALIZED'
   | 'WAIT_PARAMETERS'
@@ -40,7 +42,7 @@ export interface TelegramMetadataEnvelope {
   sizeBytes: number;
   modifiedAtMs: number;
   contentHash?: string | null;
-  encryptionEnvelope?: string | null;
+  encryptionEnvelope?: EncryptedItemEnvelope | string | null;
 }
 
 export interface PocStepResult {
@@ -70,4 +72,5 @@ export interface TelegramHistoryItem {
   modifiedAtMs: number;
   contentHash?: string;
   date: number;
+  encryptionEnvelope?: EncryptedItemEnvelope | string | null;
 }
