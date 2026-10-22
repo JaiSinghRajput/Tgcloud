@@ -34,6 +34,7 @@ export interface ScanReviewResult {
 
 interface MediaScannerNativeModule {
   checkPermissions(): Promise<boolean>;
+  getPermissionStatus(): Promise<'granted' | 'partial' | 'denied'>;
   scanMediaStore(excludedFolders: string[]): Promise<ScanReviewResult>;
 }
 
@@ -42,6 +43,7 @@ const { MediaScanner } = NativeModules;
 // Fallback fixture for test / non-Android environments
 const fallbackScannerMock: MediaScannerNativeModule = {
   checkPermissions: async () => true,
+  getPermissionStatus: async () => 'granted',
   scanMediaStore: async (excludedFolders: string[]) => {
     const excludedSet = new Set(excludedFolders);
     const mockItems: ScannedMediaItem[] = [
@@ -208,6 +210,10 @@ const nativeModule: MediaScannerNativeModule =
 
 export const MediaScannerService = {
   checkPermissions: () => nativeModule.checkPermissions(),
+  getPermissionStatus: () =>
+    nativeModule.getPermissionStatus
+      ? nativeModule.getPermissionStatus()
+      : Promise.resolve('granted' as const),
   scanMediaStore: async (
     excludedFolders: string[] = [],
   ): Promise<ScanReviewResult> => {

@@ -14,14 +14,23 @@ import {
   generateRecoveryKey,
   normalizeRecoveryKey,
 } from '../domain/crypto/encryptionService';
+import { UserProfileInfo } from './ProfileScreen';
+import { MediaPermissionStatus } from '../domain/permissions/permissionService';
 
 interface SettingsScreenProps {
   networkPolicy: NetworkPolicy;
   requiresCharging: boolean;
   encryptionEnabled: boolean;
+  isPaused?: boolean;
+  mediaPermissionStatus?: MediaPermissionStatus;
+  user?: UserProfileInfo | null;
   onToggleNetworkPolicy: (wifiOnly: boolean) => void;
   onToggleCharging: (chargingOnly: boolean) => void;
   onToggleEncryption: (enabled: boolean) => void;
+  onTogglePause?: () => void;
+  onRequestPermission?: () => void;
+  onOpenAppSettings?: () => void;
+  onNavigateToProfile?: () => void;
   onDisconnectTelegram: () => void;
 }
 
@@ -29,9 +38,16 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   networkPolicy,
   requiresCharging,
   encryptionEnabled,
+  isPaused = false,
+  mediaPermissionStatus = 'granted',
+  user,
   onToggleNetworkPolicy,
   onToggleCharging,
   onToggleEncryption,
+  onTogglePause,
+  onRequestPermission,
+  onOpenAppSettings,
+  onNavigateToProfile,
   onDisconnectTelegram,
 }) => {
   const isWifiOnly = networkPolicy === NetworkPolicy.WIFI_ONLY;
@@ -44,7 +60,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   const handleToggleEncryption = (newValue: boolean) => {
     if (newValue && !encryptionEnabled) {
-      // Must generate and verify recovery key before enabling!
       const newKey = generateRecoveryKey();
       setGeneratedKey(newKey);
       setConfirmationInput('');
@@ -71,145 +86,230 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     onToggleEncryption(true);
   };
 
+  const displayName = [user?.firstName, user?.lastName]
+    .filter(Boolean)
+    .join(' ') || 'Connected Account';
+
+  const getPermissionLabel = () => {
+    switch (mediaPermissionStatus) {
+      case 'granted':
+        return { label: 'Full Access Granted', color: '#10b981', bg: 'rgba(16, 185, 129, 0.15)' };
+      case 'partial':
+        return { label: 'Selected Photos Only', color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.15)' };
+      case 'blocked':
+        return { label: 'Access Blocked in Settings', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)' };
+      default:
+        return { label: 'Permission Denied', color: '#ef4444', bg: 'rgba(239, 68, 68, 0.15)' };
+    }
+  };
+
+  const perm = getPermissionLabel();
+
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.headerEyebrow}>CONFIGURATION</Text>
-        <Text style={styles.headerTitle}>Settings & Policies</Text>
-        <Text style={styles.headerDesc}>
-          Manage background network transfer constraints, deletion safety rules,
-          and client-side encryption.
+        <Text style={styles.headerTitle}>Settings</Text>
+        <Text style={styles.headerSubtitle}>
+          Preferences, backup rules, and account management
         </Text>
       </View>
 
-      {/* Network Policy */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Network Transfer Policy</Text>
-        <Text style={styles.cardDesc}>
-          Configure network types permitted to perform background media
-          transfers.
-        </Text>
-
-        <View style={styles.settingRow}>
-          <View style={styles.settingTextCol}>
-            <Text style={styles.settingTitle}>Wi-Fi Only Transfer</Text>
-            <Text style={styles.settingSubtitle}>
-              {isWifiOnly
-                ? 'Backups will only execute on unmetered Wi-Fi connections'
-                : 'Backups are allowed on both Wi-Fi and Cellular data'}
-            </Text>
+      {/* 1. ACCOUNT SECTION */}
+      <View style={styles.section}>
+        <Text style={styles.sectionHeader}>Account</Text>
+        <View style={styles.card}>
+          <View style={styles.accountRow}>
+            <View style={styles.accountAvatar}>
+              <Text style={styles.accountAvatarText}>
+                {user?.firstName?.[0] || 'TG'}
+              </Text>
+            </View>
+            <View style={styles.accountInfo}>
+              <Text style={styles.accountName}>{displayName}</Text>
+              <Text style={styles.accountSub}>
+                {user?.userId ? `User ID: ${user.userId}` : 'Logged In via TDLib'}
+              </Text>
+            </View>
+            {onNavigateToProfile && (
+              <TouchableOpacity
+                style={styles.profileBadgeBtn}
+                onPress={onNavigateToProfile}
+              >
+                <Text style={styles.profileBadgeText}>Profile →</Text>
+              </TouchableOpacity>
+            )}
           </View>
-          <Switch
-            value={isWifiOnly}
-            onValueChange={onToggleNetworkPolicy}
-            trackColor={{ false: '#374151', true: '#047857' }}
-            thumbColor={isWifiOnly ? '#10b981' : '#9ca3af'}
-          />
-        </View>
 
-        <View style={styles.divider} />
+          <View style={styles.divider} />
 
-        <View style={styles.settingRow}>
-          <View style={styles.settingTextCol}>
-            <Text style={styles.settingTitle}>Charging Only Preference</Text>
-            <Text style={styles.settingSubtitle}>
-              Pause automated background transfers while on battery power
-            </Text>
-          </View>
-          <Switch
-            value={requiresCharging}
-            onValueChange={onToggleCharging}
-            trackColor={{ false: '#374151', true: '#047857' }}
-            thumbColor={requiresCharging ? '#10b981' : '#9ca3af'}
-          />
+          <TouchableOpacity
+            style={styles.actionRow}
+            onPress={onDisconnectTelegram}
+          >
+            <Text style={styles.dangerActionText}>Log Out of Telegram</Text>
+            <Text style={styles.chevronText}>›</Text>
+          </TouchableOpacity>
         </View>
       </View>
 
-      {/* Deletion Safety Policy */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Deletion Safety Policy</Text>
-        <View style={styles.policyNotice}>
-          <Text style={styles.policyNoticeBadge}>
-            ACTIVE RULE (DECISIONS.md)
-          </Text>
-          <Text style={styles.policyNoticeTitle}>
-            Local deletion preserves cloud copies
-          </Text>
-          <Text style={styles.policyNoticeDesc}>
-            Deleting a photo or video from your device gallery does NOT delete
-            the backup in your Telegram channels. Telegram copies are retained
-            safely until explicitly removed.
-          </Text>
+      {/* 2. BACKUP PREFERENCES */}
+      <View style={styles.section}>
+        <Text style={styles.sectionHeader}>Backup</Text>
+        <View style={styles.card}>
+          {/* Pause / Resume */}
+          {onTogglePause && (
+            <>
+              <View style={styles.settingRow}>
+                <View style={styles.settingTextCol}>
+                  <Text style={styles.settingTitle}>Pause Automatic Backup</Text>
+                  <Text style={styles.settingSubtitle}>
+                    {isPaused
+                      ? 'Backups are currently paused'
+                      : 'Backups run automatically when conditions are met'}
+                  </Text>
+                </View>
+                <Switch
+                  value={isPaused}
+                  onValueChange={onTogglePause}
+                  trackColor={{ false: '#243029', true: '#ef4444' }}
+                  thumbColor={isPaused ? '#f87171' : '#9ca3af'}
+                />
+              </View>
+              <View style={styles.divider} />
+            </>
+          )}
+
+          {/* Wi-Fi Only */}
+          <View style={styles.settingRow}>
+            <View style={styles.settingTextCol}>
+              <Text style={styles.settingTitle}>Wi-Fi Only</Text>
+              <Text style={styles.settingSubtitle}>
+                {isWifiOnly
+                  ? 'Uploads only run over Wi-Fi networks to save mobile data'
+                  : 'Uploads are allowed over both Wi-Fi and mobile data'}
+              </Text>
+            </View>
+            <Switch
+              value={isWifiOnly}
+              onValueChange={onToggleNetworkPolicy}
+              trackColor={{ false: '#243029', true: '#047857' }}
+              thumbColor={isWifiOnly ? '#34d399' : '#9ca3af'}
+            />
+          </View>
+
+          <View style={styles.divider} />
+
+          {/* Charging Only */}
+          <View style={styles.settingRow}>
+            <View style={styles.settingTextCol}>
+              <Text style={styles.settingTitle}>Only While Charging</Text>
+              <Text style={styles.settingSubtitle}>
+                Pause background uploads while running on battery power
+              </Text>
+            </View>
+            <Switch
+              value={requiresCharging}
+              onValueChange={onToggleCharging}
+              trackColor={{ false: '#243029', true: '#047857' }}
+              thumbColor={requiresCharging ? '#34d399' : '#9ca3af'}
+            />
+          </View>
+
+          <View style={styles.divider} />
+
+          {/* Deletion Safety Info */}
+          <View style={styles.infoNoteBox}>
+            <Text style={styles.infoNoteTitle}>🛡️ Deletion Protection Active</Text>
+            <Text style={styles.infoNoteText}>
+              Deleting photos or videos from your phone never deletes your cloud backup. Cloud copies remain safe in your private Telegram channels.
+            </Text>
+          </View>
         </View>
       </View>
 
-      {/* Client-Side Encryption (Phase 7 - Gate E) */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Client-Side Encryption (Gate E)</Text>
-        <Text style={styles.cardDesc}>
-          Zero-knowledge authenticated encryption using AES-256-GCM and
-          PBKDF2-HMAC-SHA256. Sensitive filenames, relative paths, and content
-          hashes are strictly concealed.
-        </Text>
-
-        <View style={styles.settingRow}>
-          <View style={styles.settingTextCol}>
-            <Text style={styles.settingTitle}>
-              Enable Client-Side Encryption
-            </Text>
-            <Text style={styles.settingSubtitle}>
-              {encryptionEnabled
-                ? 'AES-256-GCM encryption is ACTIVE & verified'
-                : 'Media is backed up in private Telegram channels with standard MTProto transport'}
-            </Text>
+      {/* 3. STORAGE & PERMISSIONS */}
+      <View style={styles.section}>
+        <Text style={styles.sectionHeader}>Storage and Permissions</Text>
+        <View style={styles.card}>
+          <View style={styles.permissionStatusRow}>
+            <View style={styles.settingTextCol}>
+              <Text style={styles.settingTitle}>Photo & Video Access</Text>
+              <Text style={styles.settingSubtitle}>
+                Required to read your device gallery and upload media to your backup.
+              </Text>
+            </View>
+            <View style={[styles.permBadge, { backgroundColor: perm.bg }]}>
+              <Text style={[styles.permBadgeText, { color: perm.color }]}>
+                {perm.label}
+              </Text>
+            </View>
           </View>
-          <Switch
-            value={encryptionEnabled}
-            onValueChange={handleToggleEncryption}
-            trackColor={{ false: '#374151', true: '#047857' }}
-            thumbColor={encryptionEnabled ? '#10b981' : '#9ca3af'}
-          />
+
+          {mediaPermissionStatus !== 'granted' && (
+            <View style={styles.permActionContainer}>
+              {mediaPermissionStatus === 'blocked' ? (
+                <TouchableOpacity
+                  style={styles.permButton}
+                  onPress={onOpenAppSettings}
+                >
+                  <Text style={styles.permButtonText}>Open Android App Settings</Text>
+                </TouchableOpacity>
+              ) : (
+                <TouchableOpacity
+                  style={styles.permButton}
+                  onPress={onRequestPermission}
+                >
+                  <Text style={styles.permButtonText}>Allow Photo & Video Access</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
         </View>
+      </View>
 
-        {encryptionEnabled && (
-          <View style={styles.activeEncryptionBanner}>
-            <Text style={styles.activeEncryptionBadge}>ARMED</Text>
-            <Text style={styles.activeEncryptionText}>
-              Per-item random 256-bit DEKs and 96-bit nonces protect all
-              uploaded media. No plaintext metadata is exposed in message
-              captions.
-            </Text>
+      {/* 4. SECURITY (CLIENT-SIDE ENCRYPTION) */}
+      <View style={styles.section}>
+        <Text style={styles.sectionHeader}>Security</Text>
+        <View style={styles.card}>
+          <View style={styles.settingRow}>
+            <View style={styles.settingTextCol}>
+              <Text style={styles.settingTitle}>Client-Side Encryption</Text>
+              <Text style={styles.settingSubtitle}>
+                {encryptionEnabled
+                  ? 'Active: Media and filenames are encrypted with AES-256-GCM before upload'
+                  : 'Off: Media is stored directly in your private Telegram backup channels'}
+              </Text>
+            </View>
+            <Switch
+              value={encryptionEnabled}
+              onValueChange={handleToggleEncryption}
+              trackColor={{ false: '#243029', true: '#047857' }}
+              thumbColor={encryptionEnabled ? '#34d399' : '#9ca3af'}
+            />
           </View>
-        )}
+        </View>
       </View>
 
-      {/* Telegram Session */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Telegram Session & Storage</Text>
-        <Text style={styles.cardDesc}>
-          Credentials and TDLib state are isolated strictly inside app-private
-          sandboxed storage.
-        </Text>
-
-        <TouchableOpacity
-          style={styles.disconnectButton}
-          onPress={onDisconnectTelegram}
-        >
-          <Text style={styles.disconnectButtonText}>
-            Disconnect Telegram Account
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Build Info */}
-      <View style={styles.footerInfo}>
-        <Text style={styles.footerInfoText}>
-          Telegram Gallery Backup v0.0.1
-        </Text>
-        <Text style={styles.footerInfoText}>
-          TDLib 1.8.x · Kotlin 2.2 · RN 0.88
-        </Text>
+      {/* 5. ABOUT */}
+      <View style={styles.section}>
+        <Text style={styles.sectionHeader}>About</Text>
+        <View style={styles.card}>
+          <View style={styles.aboutRow}>
+            <Text style={styles.aboutLabel}>Application</Text>
+            <Text style={styles.aboutValue}>TG Cloud - Telegram Gallery Backup</Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.aboutRow}>
+            <Text style={styles.aboutLabel}>Version</Text>
+            <Text style={styles.aboutValue}>1.0.0</Text>
+          </View>
+          <View style={styles.divider} />
+          <View style={styles.aboutRow}>
+            <Text style={styles.aboutLabel}>Connection</Text>
+            <Text style={styles.aboutValue}>Direct MTProto via TDLib</Text>
+          </View>
+        </View>
       </View>
 
       {/* Setup / Verification Modal for Encryption */}
@@ -226,16 +326,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <View style={styles.warningBox}>
               <Text style={styles.warningTitle}>IMPORTANT WARNING</Text>
               <Text style={styles.warningText}>
-                Private Telegram channels are NOT end-to-end encrypted storage.
                 With client-side encryption, only you possess the master key. If
                 you lose your recovery passphrase, your backups will be
                 PERMANENTLY UNRECOVERABLE. Telegram cannot recover them.
               </Text>
             </View>
 
-            <Text style={styles.keyLabel}>
-              Your 12-Word Recovery Passphrase:
-            </Text>
+            <Text style={styles.keyLabel}>Your 12-Word Recovery Passphrase:</Text>
             <View style={styles.keyBox}>
               <Text style={styles.keyText}>{generatedKey}</Text>
             </View>
@@ -246,7 +343,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </Text>
 
             <TextInput
-              style={styles.input}
+              style={styles.modalInput}
               placeholder="Enter your 12 recovery words..."
               placeholderTextColor="#6b7280"
               value={confirmationInput}
@@ -286,18 +383,12 @@ const styles = StyleSheet.create({
     backgroundColor: '#0a0f0d',
   },
   content: {
-    padding: 20,
+    padding: 16,
     paddingBottom: 40,
   },
   header: {
     marginBottom: 20,
-  },
-  headerEyebrow: {
-    color: '#10b981',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1.2,
-    marginBottom: 6,
+    marginTop: 8,
   },
   headerTitle: {
     color: '#f9fafb',
@@ -305,215 +396,272 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: -0.5,
   },
-  headerDesc: {
-    color: '#9ca3af',
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 4,
-  },
-  card: {
-    backgroundColor: '#121815',
-    borderColor: '#243029',
-    borderWidth: 1,
-    borderRadius: 14,
-    padding: 16,
-    marginBottom: 16,
-  },
-  cardTitle: {
-    color: '#f9fafb',
-    fontSize: 16,
-    fontWeight: '700',
-    marginBottom: 4,
-  },
-  cardDesc: {
+  headerSubtitle: {
     color: '#9ca3af',
     fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 14,
+    marginTop: 4,
+  },
+  section: {
+    marginBottom: 20,
+  },
+  sectionHeader: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#9ca3af',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginBottom: 8,
+    marginLeft: 4,
+  },
+  card: {
+    backgroundColor: '#121a15',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#243029',
+    overflow: 'hidden',
+  },
+  accountRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+  },
+  accountAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#1b3327',
+    borderWidth: 1,
+    borderColor: '#34d399',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  accountAvatarText: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#34d399',
+  },
+  accountInfo: {
+    flex: 1,
+  },
+  accountName: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#f9fafb',
+  },
+  accountSub: {
+    fontSize: 12,
+    color: '#9ca3af',
+    marginTop: 2,
+  },
+  profileBadgeBtn: {
+    backgroundColor: '#16221c',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#243029',
+  },
+  profileBadgeText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#34d399',
+  },
+  actionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+  },
+  dangerActionText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#f87171',
+  },
+  chevronText: {
+    fontSize: 18,
+    color: '#6b7280',
+    fontWeight: '600',
   },
   settingRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    padding: 16,
   },
   settingTextCol: {
     flex: 1,
-    marginRight: 14,
+    paddingRight: 16,
   },
   settingTitle: {
-    color: '#f3f4f6',
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '600',
+    color: '#f3f4f6',
+    marginBottom: 4,
   },
   settingSubtitle: {
-    color: '#6b7280',
     fontSize: 12,
-    marginTop: 2,
+    color: '#9ca3af',
     lineHeight: 16,
   },
   divider: {
     height: 1,
-    backgroundColor: '#1f2e26',
-    marginVertical: 14,
+    backgroundColor: '#1c2820',
   },
-  policyNotice: {
-    backgroundColor: '#16281e',
-    borderColor: '#047857',
-    borderWidth: 1,
-    borderRadius: 10,
+  infoNoteBox: {
+    backgroundColor: '#0e1511',
     padding: 14,
   },
-  policyNoticeBadge: {
-    color: '#10b981',
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 1,
+  infoNoteTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#34d399',
     marginBottom: 4,
   },
-  policyNoticeTitle: {
-    color: '#f9fafb',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  policyNoticeDesc: {
-    color: '#d1d5db',
-    fontSize: 12,
-    lineHeight: 17,
-    marginTop: 4,
-  },
-  activeEncryptionBanner: {
-    backgroundColor: '#064e3b',
-    borderColor: '#10b981',
-    borderWidth: 1,
-    borderRadius: 8,
-    padding: 12,
-    marginTop: 14,
-  },
-  activeEncryptionBadge: {
-    color: '#34d399',
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 1,
-    marginBottom: 2,
-  },
-  activeEncryptionText: {
-    color: '#d1fae5',
-    fontSize: 12,
+  infoNoteText: {
+    fontSize: 11,
+    color: '#9ca3af',
     lineHeight: 16,
   },
-  disconnectButton: {
-    backgroundColor: '#374151',
-    borderRadius: 8,
-    paddingVertical: 12,
-    alignItems: 'center',
+  permissionStatusRow: {
+    padding: 16,
   },
-  disconnectButtonText: {
-    color: '#fca5a5',
-    fontSize: 13,
+  permBadge: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    marginTop: 8,
+  },
+  permBadgeText: {
+    fontSize: 11,
     fontWeight: '700',
   },
-  footerInfo: {
-    alignItems: 'center',
-    marginTop: 10,
+  permActionContainer: {
+    paddingHorizontal: 16,
+    paddingBottom: 16,
   },
-  footerInfoText: {
-    color: '#4b5563',
-    fontSize: 12,
+  permButton: {
+    backgroundColor: '#16221c',
+    borderColor: '#34d399',
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  permButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#34d399',
+  },
+  aboutRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    padding: 14,
+  },
+  aboutLabel: {
+    fontSize: 13,
+    color: '#9ca3af',
+  },
+  aboutValue: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#e5e7eb',
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
     justifyContent: 'center',
-    alignItems: 'center',
     padding: 20,
   },
   modalContent: {
-    backgroundColor: '#121815',
-    borderColor: '#243029',
-    borderWidth: 1,
+    backgroundColor: '#121a15',
     borderRadius: 16,
     padding: 20,
-    width: '100%',
-    maxWidth: 480,
+    borderWidth: 1,
+    borderColor: '#243029',
   },
   modalTitle: {
-    color: '#f9fafb',
     fontSize: 18,
     fontWeight: '800',
+    color: '#f9fafb',
     marginBottom: 12,
   },
   warningBox: {
-    backgroundColor: '#451a03',
-    borderColor: '#f59e0b',
+    backgroundColor: '#2d1515',
+    borderColor: '#7f1d1d',
     borderWidth: 1,
     borderRadius: 8,
     padding: 12,
     marginBottom: 14,
   },
   warningTitle: {
-    color: '#fbbf24',
-    fontSize: 11,
+    color: '#f87171',
     fontWeight: '800',
-    letterSpacing: 0.8,
+    fontSize: 11,
+    letterSpacing: 0.5,
     marginBottom: 4,
   },
   warningText: {
-    color: '#fef3c7',
-    fontSize: 12,
+    color: '#fca5a5',
+    fontSize: 11,
     lineHeight: 16,
   },
   keyLabel: {
-    color: '#9ca3af',
     fontSize: 12,
-    fontWeight: '600',
+    fontWeight: '700',
+    color: '#d1d5db',
     marginBottom: 6,
   },
   keyBox: {
     backgroundColor: '#0a0f0d',
-    borderColor: '#10b981',
+    borderColor: '#243029',
     borderWidth: 1,
     borderRadius: 8,
     padding: 12,
-    marginBottom: 14,
+    marginBottom: 12,
   },
   keyText: {
-    color: '#6ee7b7',
-    fontSize: 14,
     fontFamily: 'monospace',
+    color: '#34d399',
+    fontSize: 13,
     lineHeight: 20,
   },
   instructionText: {
-    color: '#d1d5db',
     fontSize: 12,
-    lineHeight: 16,
+    color: '#9ca3af',
     marginBottom: 8,
+    lineHeight: 16,
   },
-  input: {
-    backgroundColor: '#1b2420',
-    borderColor: '#374151',
+  modalInput: {
+    backgroundColor: '#0a0f0d',
+    borderColor: '#243029',
     borderWidth: 1,
     borderRadius: 8,
-    padding: 12,
+    padding: 10,
     color: '#f9fafb',
     fontSize: 13,
     minHeight: 60,
+    marginBottom: 12,
     textAlignVertical: 'top',
-    marginBottom: 8,
   },
   errorText: {
     color: '#f87171',
     fontSize: 12,
-    marginBottom: 10,
+    marginBottom: 12,
   },
   modalActions: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
-    marginTop: 10,
+    gap: 12,
   },
   cancelButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    marginRight: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#374151',
   },
   cancelButtonText: {
     color: '#9ca3af',
@@ -521,13 +669,13 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   confirmButton: {
-    backgroundColor: '#059669',
-    borderRadius: 8,
-    paddingVertical: 10,
+    backgroundColor: '#34d399',
+    paddingVertical: 8,
     paddingHorizontal: 16,
+    borderRadius: 6,
   },
   confirmButtonText: {
-    color: '#ffffff',
+    color: '#0a0f0d',
     fontSize: 13,
     fontWeight: '700',
   },

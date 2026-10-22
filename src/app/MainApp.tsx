@@ -1,20 +1,19 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   StatusBar,
+  AppState,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { DashboardScreen } from '../screens/DashboardScreen';
-import { ScanReviewScreen } from '../screens/ScanReviewScreen';
 import {
   CloudGalleryScreen,
   CloudMediaItem,
 } from '../screens/CloudGalleryScreen';
-import { TelegramPocScreen } from '../screens/TelegramPocScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
+import { ProfileScreen, UserProfileInfo } from '../screens/ProfileScreen';
 import { LoginScreen } from '../screens/LoginScreen';
 import { TelegramBridgeService } from '../native/TelegramBridge';
 import { InMemoryDatabaseRepository } from '../domain/database/repository';
@@ -24,29 +23,38 @@ import {
   ScanReviewResult,
   confirmInitialScan,
 } from '../domain/media/scanner';
+import {
+  PermissionService,
+  MediaPermissionStatus,
+} from '../domain/permissions/permissionService';
 import { NetworkPolicy, ConflictPolicy } from '../domain/backup/stateMachine';
-import { DashboardMetrics } from '../domain/database/types';
 
-export type AppTab =
-  | 'dashboard'
-  | 'scan-review'
-  | 'cloud-gallery'
-  | 'telegram'
-  | 'settings';
+export type AppTab = 'gallery' | 'settings' | 'profile';
 
 export const MainApp: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<AppTab>('dashboard');
+  const [activeTab, setActiveTab] = useState<AppTab>('gallery');
 
   // Telegram Authentication State Gate
   const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
-  const [_currentUser, setCurrentUser] = useState<{
-    userId: number;
-    firstName: string;
-    lastName: string;
-  } | null>(null);
+  const [currentUser, setCurrentUser] = useState<UserProfileInfo | null>(null);
+
+  // Android Media Permission State
+  const [permissionStatus, setPermissionStatus] =
+    useState<MediaPermissionStatus>('denied');
+
+  const checkPermissionState = useCallback(async () => {
+    try {
+      const status = await PermissionService.checkMediaPermission();
+      setPermissionStatus(status);
+      return status;
+    } catch {
+      return 'denied';
+    }
+  }, []);
 
   useEffect(() => {
     let mounted = true;
+
     TelegramBridgeService.getAuthState()
       .then(state => {
         if (!mounted) return;
@@ -103,17 +111,7 @@ export const MainApp: React.FC = () => {
     );
   }, [repo]);
 
-  // States
-  const [metrics, setMetrics] = useState<DashboardMetrics>({
-    totalDiscovered: 0,
-    pending: 0,
-    backedUp: 0,
-    uploading: 0,
-    failed: 0,
-    excluded: 0,
-    lastBackupTimeMs: null,
-  });
-
+  // Operational Settings & Backup State
   const [networkPolicy, setNetworkPolicy] = useState<NetworkPolicy>(
     NetworkPolicy.WIFI_ONLY,
   );
@@ -137,7 +135,7 @@ export const MainApp: React.FC = () => {
 
   const [cloudItems, setCloudItems] = useState<CloudMediaItem[]>([]);
 
-  const refreshScan = React.useCallback(
+  const refreshScan = useCallback(
     async (excludedFolders: string[] = []) => {
       try {
         const review = await MediaScannerService.scanMediaStore(
@@ -145,24 +143,51 @@ export const MainApp: React.FC = () => {
         );
         setScanReview(review);
       } catch {
-        // handled
+        // Handled safely
       }
     },
     [],
   );
 
-  const refreshMetrics = React.useCallback(async () => {
-    const m = await repo.getDashboardMetrics();
-    setMetrics(m);
-  }, [repo]);
-
-  // Initial gallery scan and metrics sync when logged in
+  // Sync permissions and initial scan on login
   useEffect(() => {
     if (isLoggedIn) {
-      refreshScan();
-      refreshMetrics();
+      checkPermissionState().then(status => {
+        if (status === 'granted' || status === 'partial') {
+          refreshScan();
+        }
+      });
     }
-  }, [isLoggedIn, refreshScan, refreshMetrics]);
+  }, [isLoggedIn, checkPermissionState, refreshScan]);
+
+  // Refresh permissions and scan when returning to foreground
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (nextAppState === 'active' && isLoggedIn) {
+        checkPermissionState().then(status => {
+          if (status === 'granted' || status === 'partial') {
+            refreshScan();
+          }
+        });
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [isLoggedIn, checkPermissionState, refreshScan]);
+
+  const handleRequestPermission = async () => {
+    const status = await PermissionService.requestMediaPermission();
+    setPermissionStatus(status);
+    if (status === 'granted' || status === 'partial') {
+      refreshScan();
+    }
+  };
+
+  const handleOpenAppSettings = async () => {
+    await PermissionService.openAppSettings();
+  };
 
   const handleToggleFolderExclusion = (folderKey: string) => {
     const isCurrentlyExcluded = scanReview.folders.find(
@@ -203,11 +228,8 @@ export const MainApp: React.FC = () => {
       }
     }
 
-    // Enqueue jobs in SQLite
+    // Enqueue jobs in SQLite engine
     await engine.queueMediaForBackup(eligibleItemIds);
-    await refreshMetrics();
-
-    setActiveTab('dashboard');
 
     // Run queue simulation
     engine.runQueue(networkPolicy, true, {
@@ -227,7 +249,6 @@ export const MainApp: React.FC = () => {
           },
         ]);
         setActiveProgress(null);
-        refreshMetrics();
       },
     });
   };
@@ -250,6 +271,30 @@ export const MainApp: React.FC = () => {
     return new Promise(resolve => setTimeout(() => resolve(true), 800));
   };
 
+  const handleLogout = async () => {
+    try {
+      await TelegramBridgeService.logOut();
+    } catch {
+      // Handled
+    }
+    // Clear user state and cached media to prevent leaks across sessions
+    setIsLoggedIn(false);
+    setCurrentUser(null);
+    setCloudItems([]);
+    setScanReview({
+      totalCount: 0,
+      totalBytes: 0,
+      eligibleCount: 0,
+      eligibleBytes: 0,
+      excludedCount: 0,
+      excludedBytes: 0,
+      folders: [],
+      items: [],
+      userConfirmed: false,
+    });
+    setActiveTab('gallery');
+  };
+
   // Render LoginScreen exclusively if user is not authenticated
   if (!isLoggedIn) {
     return (
@@ -269,44 +314,36 @@ export const MainApp: React.FC = () => {
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
 
-      {/* Main Content Area */}
+      {/* Main Screen Content */}
       <View style={styles.screenContainer}>
-        {activeTab === 'dashboard' && (
-          <DashboardScreen
-            metrics={metrics}
-            networkPolicy={networkPolicy}
-            isPaused={isPaused}
-            activeProgress={activeProgress}
-            onTogglePause={handleTogglePause}
-            onTriggerScan={() => refreshScan()}
-            onNavigateToScanReview={() => setActiveTab('scan-review')}
-            onNavigateToTelegram={() => setActiveTab('settings')}
-          />
-        )}
-
-        {activeTab === 'scan-review' && (
-          <ScanReviewScreen
-            scanReview={scanReview}
-            onToggleFolderExclusion={handleToggleFolderExclusion}
-            onConfirmBackup={handleConfirmBackup}
-            onRescan={() => refreshScan()}
-          />
-        )}
-
-        {activeTab === 'cloud-gallery' && (
+        {activeTab === 'gallery' && (
           <CloudGalleryScreen
             items={cloudItems}
+            scannedItems={scanReview.items}
+            folders={scanReview.folders}
+            eligibleCount={scanReview.eligibleCount}
+            eligibleBytes={scanReview.eligibleBytes}
+            isPaused={isPaused}
+            activeProgress={activeProgress}
+            mediaPermissionStatus={permissionStatus}
+            onRequestPermission={handleRequestPermission}
+            onOpenAppSettings={handleOpenAppSettings}
+            onRescan={() => refreshScan()}
+            onToggleFolderExclusion={handleToggleFolderExclusion}
+            onConfirmBackup={handleConfirmBackup}
+            onTogglePause={handleTogglePause}
             onRestoreItem={handleRestoreItem}
           />
         )}
-
-        {activeTab === 'telegram' && <TelegramPocScreen />}
 
         {activeTab === 'settings' && (
           <SettingsScreen
             networkPolicy={networkPolicy}
             requiresCharging={requiresCharging}
             encryptionEnabled={encryptionEnabled}
+            isPaused={isPaused}
+            mediaPermissionStatus={permissionStatus}
+            user={currentUser}
             onToggleNetworkPolicy={wifiOnly =>
               setNetworkPolicy(
                 wifiOnly
@@ -316,90 +353,45 @@ export const MainApp: React.FC = () => {
             }
             onToggleCharging={setRequiresCharging}
             onToggleEncryption={setEncryptionEnabled}
-            onDisconnectTelegram={async () => {
-              try {
-                await TelegramBridgeService.logOut();
-              } catch {
-                // Handled
-              }
-              setIsLoggedIn(false);
-              setCurrentUser(null);
-            }}
+            onTogglePause={handleTogglePause}
+            onRequestPermission={handleRequestPermission}
+            onOpenAppSettings={handleOpenAppSettings}
+            onNavigateToProfile={() => setActiveTab('profile')}
+            onDisconnectTelegram={handleLogout}
+          />
+        )}
+
+        {activeTab === 'profile' && (
+          <ProfileScreen
+            user={currentUser}
+            onLogout={handleLogout}
+            onNavigateToSettings={() => setActiveTab('settings')}
           />
         )}
       </View>
 
-      {/* Bottom Navigation Bar */}
+      {/* Minimal 3-Tab Bottom Navigation Bar */}
       <View style={styles.navBar}>
         <TouchableOpacity
           style={[
             styles.navItem,
-            activeTab === 'dashboard' && styles.navItemActive,
+            activeTab === 'gallery' && styles.navItemActive,
           ]}
-          onPress={() => setActiveTab('dashboard')}
+          onPress={() => setActiveTab('gallery')}
+          accessibilityLabel="Gallery tab"
         >
           <Text
             style={[
               styles.navIcon,
-              activeTab === 'dashboard' && styles.navIconActive,
+              activeTab === 'gallery' && styles.navIconActive,
             ]}
           >
-            📊
+            🖼️
           </Text>
           <Text
             style={[
               styles.navLabel,
-              activeTab === 'dashboard' && styles.navLabelActive,
-            ]}
-          >
-            Dashboard
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[
-            styles.navItem,
-            activeTab === 'scan-review' && styles.navItemActive,
-          ]}
-          onPress={() => setActiveTab('scan-review')}
-        >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'scan-review' && styles.navIconActive,
-            ]}
-          >
-            📁
-          </Text>
-          <Text
-            style={[
-              styles.navLabel,
-              activeTab === 'scan-review' && styles.navLabelActive,
-            ]}
-          >
-            Scan Review
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[
-            styles.navItem,
-            activeTab === 'cloud-gallery' && styles.navItemActive,
-          ]}
-          onPress={() => setActiveTab('cloud-gallery')}
-        >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'cloud-gallery' && styles.navIconActive,
-            ]}
-          >
-            ☁️
-          </Text>
-          <Text
-            style={[
-              styles.navLabel,
-              activeTab === 'cloud-gallery' && styles.navLabelActive,
+              activeTab === 'gallery' && styles.navLabelActive,
             ]}
           >
             Gallery
@@ -409,34 +401,10 @@ export const MainApp: React.FC = () => {
         <TouchableOpacity
           style={[
             styles.navItem,
-            activeTab === 'telegram' && styles.navItemActive,
-          ]}
-          onPress={() => setActiveTab('telegram')}
-        >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'telegram' && styles.navIconActive,
-            ]}
-          >
-            ✈️
-          </Text>
-          <Text
-            style={[
-              styles.navLabel,
-              activeTab === 'telegram' && styles.navLabelActive,
-            ]}
-          >
-            Telegram
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[
-            styles.navItem,
             activeTab === 'settings' && styles.navItemActive,
           ]}
           onPress={() => setActiveTab('settings')}
+          accessibilityLabel="Settings tab"
         >
           <Text
             style={[
@@ -453,6 +421,32 @@ export const MainApp: React.FC = () => {
             ]}
           >
             Settings
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[
+            styles.navItem,
+            activeTab === 'profile' && styles.navItemActive,
+          ]}
+          onPress={() => setActiveTab('profile')}
+          accessibilityLabel="Profile tab"
+        >
+          <Text
+            style={[
+              styles.navIcon,
+              activeTab === 'profile' && styles.navIconActive,
+            ]}
+          >
+            👤
+          </Text>
+          <Text
+            style={[
+              styles.navLabel,
+              activeTab === 'profile' && styles.navLabelActive,
+            ]}
+          >
+            Profile
           </Text>
         </TouchableOpacity>
       </View>
@@ -474,20 +468,20 @@ const styles = StyleSheet.create({
     borderTopColor: '#243029',
     borderTopWidth: 1,
     paddingVertical: 10,
-    paddingHorizontal: 8,
+    paddingHorizontal: 16,
   },
   navItem: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 4,
+    paddingVertical: 6,
     borderRadius: 8,
   },
   navItemActive: {
     backgroundColor: '#16221c',
   },
   navIcon: {
-    fontSize: 18,
+    fontSize: 20,
     opacity: 0.6,
   },
   navIconActive: {
@@ -495,9 +489,9 @@ const styles = StyleSheet.create({
   },
   navLabel: {
     color: '#6b7280',
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '600',
-    marginTop: 2,
+    marginTop: 3,
   },
   navLabelActive: {
     color: '#34d399',

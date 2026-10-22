@@ -38,6 +38,30 @@ jobs:
       - name: Make Gradlew executable
         run: chmod +x android/gradlew
 
+      - name: Generate Release Keystore
+        run: |
+          keytool -genkeypair -v -storetype PKCS12 \
+            -keystore android/app/release.keystore \
+            -alias telegrambackup \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass telegrambackup123 \
+            -keypass telegrambackup123 \
+            -dname "CN=Telegram Gallery Backup, OU=Mobile, O=TGCloud, C=US"
+
+      - name: Build Release APK
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Upload Release APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apks
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
       - name: Build Debug APK
         run: |
           cd android

@@ -1,88 +1,90 @@
 import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
-import { DashboardScreen } from '../src/screens/DashboardScreen';
-import { ScanReviewScreen } from '../src/screens/ScanReviewScreen';
 import { CloudGalleryScreen } from '../src/screens/CloudGalleryScreen';
 import { SettingsScreen } from '../src/screens/SettingsScreen';
+import { ProfileScreen } from '../src/screens/ProfileScreen';
 import { LoginScreen } from '../src/screens/LoginScreen';
 import { MainApp } from '../src/app/MainApp';
+import { TelegramBridgeService } from '../src/native/TelegramBridge';
 import { NetworkPolicy } from '../src/domain/backup/stateMachine';
 
-describe('React Native Product UI Screens (Phase 5)', () => {
-  it('renders DashboardScreen with persisted metrics correctly', async () => {
+describe('React Native Simplified UI Screens', () => {
+  it('renders ProfileScreen with user details and triggers logout', async () => {
+    const handleLogout = jest.fn();
+    const handleNavSettings = jest.fn();
+
     let tree: ReactTestRenderer.ReactTestRenderer;
     await ReactTestRenderer.act(async () => {
       tree = ReactTestRenderer.create(
-        <DashboardScreen
-          metrics={{
-            totalDiscovered: 120,
-            pending: 15,
-            backedUp: 100,
-            uploading: 1,
-            failed: 0,
-            excluded: 4,
-            lastBackupTimeMs: 1792660000000,
+        <ProfileScreen
+          user={{
+            userId: 98765432,
+            firstName: 'Alex',
+            lastName: 'Hunter',
           }}
+          onLogout={handleLogout}
+          onNavigateToSettings={handleNavSettings}
+        />,
+      );
+    });
+
+    const root = tree!.root;
+    expect(root.findByProps({ children: 'Alex Hunter' })).toBeDefined();
+    expect(root.findByProps({ children: 'AH' })).toBeDefined();
+
+    const logoutBtn = root.findByProps({ children: 'Log Out of Telegram' });
+    expect(logoutBtn).toBeDefined();
+  });
+
+  it('renders SettingsScreen with consolidated sections and permission badge', async () => {
+    const handleToggleNetwork = jest.fn();
+    const handleToggleCharging = jest.fn();
+    const handleToggleEncryption = jest.fn();
+    const handleTogglePause = jest.fn();
+    const handleRequestPerm = jest.fn();
+    const handleOpenSettings = jest.fn();
+    const handleDisconnect = jest.fn();
+
+    let tree: ReactTestRenderer.ReactTestRenderer;
+    await ReactTestRenderer.act(async () => {
+      tree = ReactTestRenderer.create(
+        <SettingsScreen
           networkPolicy={NetworkPolicy.WIFI_ONLY}
+          requiresCharging={false}
+          encryptionEnabled={false}
           isPaused={false}
-          activeProgress={{
-            mediaItemId: 'm1',
-            displayName: 'IMG_2026.jpg',
-            bytesUploaded: 1000000,
-            totalBytes: 2000000,
-            state: 'Uploading' as any,
+          mediaPermissionStatus="granted"
+          user={{
+            userId: 12345,
+            firstName: 'John',
+            lastName: 'Doe',
           }}
-          onTogglePause={jest.fn()}
-          onTriggerScan={jest.fn()}
-          onNavigateToScanReview={jest.fn()}
-          onNavigateToTelegram={jest.fn()}
+          onToggleNetworkPolicy={handleToggleNetwork}
+          onToggleCharging={handleToggleCharging}
+          onToggleEncryption={handleToggleEncryption}
+          onTogglePause={handleTogglePause}
+          onRequestPermission={handleRequestPerm}
+          onOpenAppSettings={handleOpenSettings}
+          onDisconnectTelegram={handleDisconnect}
         />,
       );
     });
-    expect(tree!.toJSON()).toBeDefined();
+
+    const root = tree!.root;
+    // Section headers
+    expect(root.findByProps({ children: 'Account' })).toBeDefined();
+    expect(root.findByProps({ children: 'Backup' })).toBeDefined();
+    expect(root.findByProps({ children: 'Storage and Permissions' })).toBeDefined();
+    expect(root.findByProps({ children: 'Security' })).toBeDefined();
+    expect(root.findByProps({ children: 'About' })).toBeDefined();
+    // Live permission badge
+    expect(root.findByProps({ children: 'Full Access Granted' })).toBeDefined();
   });
 
-  it('renders ScanReviewScreen with folder exclusion controls', async () => {
-    let tree: ReactTestRenderer.ReactTestRenderer;
-    await ReactTestRenderer.act(async () => {
-      tree = ReactTestRenderer.create(
-        <ScanReviewScreen
-          scanReview={{
-            totalCount: 50,
-            totalBytes: 150000000,
-            eligibleCount: 45,
-            eligibleBytes: 135000000,
-            excludedCount: 5,
-            excludedBytes: 15000000,
-            folders: [
-              {
-                folderKey: 'DCIM/Camera',
-                displayLabel: 'Camera',
-                itemCount: 45,
-                byteSize: 135000000,
-                isExcluded: false,
-              },
-              {
-                folderKey: 'Pictures/Screenshots',
-                displayLabel: 'Screenshots',
-                itemCount: 5,
-                byteSize: 15000000,
-                isExcluded: true,
-              },
-            ],
-            items: [],
-            userConfirmed: false,
-          }}
-          onToggleFolderExclusion={jest.fn()}
-          onConfirmBackup={jest.fn()}
-          onRescan={jest.fn()}
-        />,
-      );
-    });
-    expect(tree!.toJSON()).toBeDefined();
-  });
+  it('renders CloudGalleryScreen with concise status, permission banner and items', async () => {
+    const handleRestore = jest.fn().mockResolvedValue(true);
+    const handleRequestPerm = jest.fn();
 
-  it('renders CloudGalleryScreen with virtual folders and items', async () => {
     let tree: ReactTestRenderer.ReactTestRenderer;
     await ReactTestRenderer.act(async () => {
       tree = ReactTestRenderer.create(
@@ -99,37 +101,74 @@ describe('React Native Product UI Screens (Phase 5)', () => {
               channelId: '-1001',
             },
           ]}
-          onRestoreItem={jest.fn()}
+          scannedItems={[
+            {
+              id: 'c1',
+              sourceKey: 'src_1',
+              mediaType: 'photo',
+              displayName: 'IMG_01.jpg',
+              relativePath: 'DCIM/Camera/IMG_01.jpg',
+              sizeBytes: 2500000,
+              modifiedAtMs: 1792600000000,
+            },
+          ]}
+          folders={[
+            {
+              folderKey: 'DCIM/Camera',
+              displayLabel: 'Camera',
+              itemCount: 1,
+              byteSize: 2500000,
+              isExcluded: false,
+            },
+          ]}
+          eligibleCount={0}
+          eligibleBytes={0}
+          isPaused={false}
+          activeProgress={null}
+          mediaPermissionStatus="denied"
+          onRequestPermission={handleRequestPerm}
+          onRestoreItem={handleRestore}
         />,
       );
     });
-    expect(tree!.toJSON()).toBeDefined();
+
+    const root = tree!.root;
+    // Permission warning banner rendered because status is 'denied'
+    expect(
+      root.findByProps({ children: 'Photo & Video Permission Needed' }),
+    ).toBeDefined();
+    expect(
+      root.findByProps({ children: 'Allow Photo & Video Access' }),
+    ).toBeDefined();
+    // Gallery header
+    expect(root.findByProps({ children: 'Gallery' })).toBeDefined();
   });
 
-  it('renders SettingsScreen with deletion policy and network toggles', async () => {
-    let tree: ReactTestRenderer.ReactTestRenderer;
-    await ReactTestRenderer.act(async () => {
-      tree = ReactTestRenderer.create(
-        <SettingsScreen
-          networkPolicy={NetworkPolicy.WIFI_ONLY}
-          requiresCharging={false}
-          encryptionEnabled={false}
-          onToggleNetworkPolicy={jest.fn()}
-          onToggleCharging={jest.fn()}
-          onToggleEncryption={jest.fn()}
-          onDisconnectTelegram={jest.fn()}
-        />,
-      );
+  it('renders MainApp shell with minimal 3-tab navigation', async () => {
+    jest.spyOn(TelegramBridgeService, 'getAuthState').mockResolvedValue({
+      state: 'READY',
+      userId: 12345,
+      firstName: 'Alex',
+      lastName: 'Hunter',
     });
-    expect(tree!.toJSON()).toBeDefined();
-  });
 
-  it('renders MainApp shell and allows tab switching', async () => {
     let tree: ReactTestRenderer.ReactTestRenderer;
     await ReactTestRenderer.act(async () => {
       tree = ReactTestRenderer.create(<MainApp />);
     });
+
     expect(tree!.toJSON()).toBeDefined();
+    const root = tree!.root;
+
+    // Verify minimal 3 tabs are present
+    expect(root.findByProps({ accessibilityLabel: 'Gallery tab' })).toBeDefined();
+    expect(root.findByProps({ accessibilityLabel: 'Settings tab' })).toBeDefined();
+    expect(root.findByProps({ accessibilityLabel: 'Profile tab' })).toBeDefined();
+
+    // Verify old removed tabs are NOT present
+    expect(root.findAllByProps({ accessibilityLabel: 'Dashboard tab' })).toHaveLength(0);
+    expect(root.findAllByProps({ accessibilityLabel: 'Scan Review tab' })).toHaveLength(0);
+    expect(root.findAllByProps({ accessibilityLabel: 'Telegram tab' })).toHaveLength(0);
   });
 
   it('renders LoginScreen with phone number and OTP flow', async () => {
