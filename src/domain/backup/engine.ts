@@ -5,6 +5,7 @@ import {
   NetworkPolicy,
   calculateNextRetryDelay,
   isTransientError,
+  parseFloodWaitSeconds,
 } from './stateMachine';
 import { DbUploadJob, DbMediaItem } from '../database/types';
 
@@ -20,6 +21,7 @@ export interface BackupEngineCallbacks {
   onProgress?: (progress: BackupTransferProgress) => void;
   onJobCompleted?: (job: DbUploadJob, mediaItem: DbMediaItem) => void;
   onJobFailed?: (job: DbUploadJob, error: string, isRetryable: boolean) => void;
+  onRateLimited?: (waitSeconds: number) => void;
 }
 
 /**
@@ -85,6 +87,24 @@ export class BackupEngine {
 
     try {
       while (!this.isPaused) {
+        // 1. Honor persisted Telegram rate limit if active
+        try {
+          const floodWaitUntilStr = await this.repo.getSetting('telegram_flood_wait_until');
+          if (floodWaitUntilStr) {
+            const floodWaitUntil = parseInt(floodWaitUntilStr, 10);
+            if (!isNaN(floodWaitUntil) && Date.now() < floodWaitUntil) {
+              const remainingSec = Math.ceil((floodWaitUntil - Date.now()) / 1000);
+              callbacks?.onRateLimited?.(remainingSec);
+              await new Promise(r => setTimeout(r, Math.min(remainingSec * 1000, 2000)));
+              continue;
+            } else if (!isNaN(floodWaitUntil) && floodWaitUntil > 0) {
+              await this.repo.setSetting('telegram_flood_wait_until', '0');
+            }
+          }
+        } catch {
+          // Ignore settings read error
+        }
+
         const job = await this.repo.claimNextUploadJob();
         if (!job) break;
 
@@ -160,9 +180,30 @@ export class BackupEngine {
         } catch (err: any) {
           failed++;
           const errorMessage = err?.message || 'Unknown upload error';
-          const isRetryable = isTransientError(errorMessage);
+          const floodWaitSec = parseFloodWaitSeconds(errorMessage);
+          const isRateLimit = floodWaitSec !== null;
+          const isRetryable = isRateLimit || isTransientError(errorMessage);
 
-          if (isRetryable && job.attemptCount < 5) {
+          if (isRateLimit && floodWaitSec) {
+            const resumeAt = Date.now() + (floodWaitSec * 1000) + 1000;
+            try {
+              await this.repo.setSetting('telegram_flood_wait_until', resumeAt.toString());
+            } catch {
+              // Ignore
+            }
+            await this.repo.upsertMediaItem({
+              ...media,
+              state: MediaState.RETRY_PENDING,
+            });
+            await this.repo.updateUploadJobState(
+              job.id,
+              UploadJobState.FAILED_RETRYABLE,
+              'FLOOD_WAIT',
+              `Rate limited by Telegram. Waiting ${floodWaitSec}s before retrying.`,
+              resumeAt,
+            );
+            callbacks?.onRateLimited?.(floodWaitSec);
+          } else if (isRetryable && job.attemptCount < 5) {
             const nextDelay = calculateNextRetryDelay(job.attemptCount);
             const nextAttemptAt = Date.now() + Math.max(nextDelay, 1000);
 

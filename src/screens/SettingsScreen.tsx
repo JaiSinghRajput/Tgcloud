@@ -116,7 +116,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [showUnlockModal, setShowUnlockModal] = useState(false);
   const [unlockPassphraseInput, setUnlockPassphraseInput] = useState('');
   const [unlockError, setUnlockError] = useState<string | null>(null);
-  const [isVerifying, setIsVerifying] = useState(false);
+  const [backgroundUnlockStatus, setBackgroundUnlockStatus] = useState<{
+    status: 'verifying' | 'success' | 'error';
+    message: string;
+  } | null>(null);
 
   // Deleted Channel Recreation State
   const [showRecreateModal, setShowRecreateModal] = useState(false);
@@ -281,8 +284,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       return;
     }
 
-    setIsVerifying(true);
-    setUnlockError(null);
+    // Instantly dismiss modal so UI never hangs!
+    setShowUnlockModal(false);
+    setBackgroundUnlockStatus({
+      status: 'verifying',
+      message: 'Verifying recovery passphrase in background...',
+    });
 
     try {
       let valid = false;
@@ -303,15 +310,22 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       }
 
       if (valid) {
-        setShowUnlockModal(false);
-        setUnlockPassphraseInput('');
+        setBackgroundUnlockStatus({
+          status: 'success',
+          message: '✓ Recovery passphrase verified! Encryption unlocked.',
+        });
+        setTimeout(() => setBackgroundUnlockStatus(null), 4000);
       } else {
-        setUnlockError('Incorrect recovery passphrase. Please verify your 12 words.');
+        setBackgroundUnlockStatus({
+          status: 'error',
+          message: '⚠ Incorrect recovery passphrase. Tap here to retry.',
+        });
       }
     } catch (e: any) {
-      setUnlockError(`Verification error: ${e?.message || 'Authentication failed'}`);
-    } finally {
-      setIsVerifying(false);
+      setBackgroundUnlockStatus({
+        status: 'error',
+        message: `⚠ Verification error: ${e?.message || 'Authentication failed'}. Tap to retry.`,
+      });
     }
   };
 
@@ -336,6 +350,41 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      {/* Background Status Banner for Instant Unlock Feedback */}
+      {backgroundUnlockStatus && (
+        <TouchableOpacity
+          activeOpacity={backgroundUnlockStatus.status === 'error' ? 0.7 : 1}
+          style={[
+            styles.bgStatusBanner,
+            backgroundUnlockStatus.status === 'verifying' && styles.bgStatusBannerVerifying,
+            backgroundUnlockStatus.status === 'success' && styles.bgStatusBannerSuccess,
+            backgroundUnlockStatus.status === 'error' && styles.bgStatusBannerError,
+          ]}
+          onPress={() => {
+            if (backgroundUnlockStatus.status === 'error') {
+              setUnlockError(
+                backgroundUnlockStatus.message.replace('Tap here to retry.', '').replace('⚠ ', '').trim(),
+              );
+              setShowUnlockModal(true);
+            }
+          }}
+        >
+          {backgroundUnlockStatus.status === 'verifying' && (
+            <ActivityIndicator size="small" color="#60a5fa" style={styles.bgStatusSpinner} />
+          )}
+          <Text
+            style={[
+              styles.bgStatusBannerText,
+              backgroundUnlockStatus.status === 'verifying' && styles.bgStatusTextVerifying,
+              backgroundUnlockStatus.status === 'success' && styles.bgStatusTextSuccess,
+              backgroundUnlockStatus.status === 'error' && styles.bgStatusTextError,
+            ]}
+          >
+            {backgroundUnlockStatus.message}
+          </Text>
+        </TouchableOpacity>
+      )}
+
       {/* 1. ACCOUNT */}
       <View style={styles.section}>
         <Text style={styles.sectionHeader}>Account</Text>
@@ -805,14 +854,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
               <TouchableOpacity
                 style={styles.confirmBtn}
-                disabled={isVerifying}
                 onPress={handleUnlockInSettings}
               >
-                {isVerifying ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
-                ) : (
-                  <Text style={styles.confirmBtnText}>Unlock</Text>
-                )}
+                <Text style={styles.confirmBtnText}>Unlock</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -1566,5 +1610,43 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 13,
     fontWeight: '700',
+  },
+  bgStatusBanner: {
+    marginBottom: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  bgStatusBannerVerifying: {
+    backgroundColor: '#0f1f2e',
+    borderColor: '#1e3a5f',
+  },
+  bgStatusBannerSuccess: {
+    backgroundColor: '#062619',
+    borderColor: '#059669',
+  },
+  bgStatusBannerError: {
+    backgroundColor: '#2d1515',
+    borderColor: '#b91c1c',
+  },
+  bgStatusBannerText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  bgStatusTextVerifying: {
+    color: '#60a5fa',
+  },
+  bgStatusTextSuccess: {
+    color: '#34d399',
+  },
+  bgStatusTextError: {
+    color: '#f87171',
+  },
+  bgStatusSpinner: {
+    marginRight: 8,
   },
 });

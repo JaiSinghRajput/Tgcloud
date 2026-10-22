@@ -21,8 +21,8 @@ import { TelegramBackupChannels } from '../types/telegram';
 import { TelegramBridgeService } from '../native/TelegramBridge';
 import {
   SessionKeyStore,
-  verifyPassphraseAgainstItem,
-  verifyRecoveryKey,
+  verifyPassphraseAgainstItemAsync,
+  verifyRecoveryKeyAsync,
   normalizeRecoveryKey,
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
@@ -155,6 +155,18 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [playableVideoUri, setPlayableVideoUri] = useState<string>('');
   const activeTempVideoPathRef = useRef<string | null>(null);
 
+  // Photo Preparation & Decryption State
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const [photoLoadingMsg, setPhotoLoadingMsg] = useState<string>('');
+  const [viewablePhotoUri, setViewablePhotoUri] = useState<string>('');
+  const activeTempPhotoPathRef = useRef<string | null>(null);
+
+  // Background Passphrase Unlock Banner State
+  const [backgroundUnlockStatus, setBackgroundUnlockStatus] = useState<{
+    status: 'verifying' | 'success' | 'error';
+    message: string;
+  } | null>(null);
+
   // Destination Recreation Modal State
   const [showRecreateModal, setShowRecreateModal] = useState<boolean>(false);
   const [recreateTarget, setRecreateTarget] = useState<'photo' | 'video' | null>(null);
@@ -167,9 +179,17 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     setPlayableVideoUri('');
     setVideoError(null);
     setVideoLoadingMsg('');
+    setViewablePhotoUri('');
+    setPhotoError(null);
+    setPhotoLoadingMsg('');
     if (activeTempVideoPathRef.current) {
       const p = activeTempVideoPathRef.current;
       activeTempVideoPathRef.current = null;
+      await TelegramBridgeService.cleanupTempMedia(p);
+    }
+    if (activeTempPhotoPathRef.current) {
+      const p = activeTempPhotoPathRef.current;
+      activeTempPhotoPathRef.current = null;
       await TelegramBridgeService.cleanupTempMedia(p);
     }
   };
@@ -240,20 +260,114 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     }
   }, [scannedItems]);
 
+  const preparePhotoSource = useCallback(
+    async (item: DiscoveredMediaItem | CloudMediaItem) => {
+      if (activeTempPhotoPathRef.current) {
+        const oldPath = activeTempPhotoPathRef.current;
+        activeTempPhotoPathRef.current = null;
+        await TelegramBridgeService.cleanupTempMedia(oldPath);
+      }
+      setPhotoLoadingMsg('Preparing photo...');
+      setPhotoError(null);
+      setViewablePhotoUri('');
+
+      try {
+        if ('sourceKey' in item && (item as any).sourceKey) {
+          setViewablePhotoUri((item as any).sourceKey);
+          setPhotoLoadingMsg('');
+          return;
+        }
+
+        // Check if this item is present in local scanned items
+        const localMatch = scannedItems?.find(
+          s =>
+            s.id === item.id ||
+            ('originalName' in item &&
+              s.displayName === (item as any).originalName),
+        );
+        if (localMatch && localMatch.sourceKey) {
+          setViewablePhotoUri(localMatch.sourceKey);
+          setPhotoLoadingMsg('');
+          return;
+        }
+
+        if ('fileId' in item && item.fileId) {
+          const isEncrypted = !!item.isEncrypted;
+          let masterKeyHex = '';
+
+          if (isEncrypted) {
+            const key = SessionKeyStore.getSessionKey();
+            if (!key) {
+              setPhotoError('Passphrase required to decrypt this photo.');
+              setPhotoLoadingMsg('');
+              return;
+            }
+            masterKeyHex = key.toString('hex');
+            setPhotoLoadingMsg('Decrypting photo...');
+          } else {
+            setPhotoLoadingMsg('Downloading from Telegram...');
+          }
+
+          const envelopeStr =
+            typeof item.encryptionEnvelope === 'object'
+              ? JSON.stringify(item.encryptionEnvelope)
+              : item.encryptionEnvelope || '{}';
+
+          const prepared = await TelegramBridgeService.prepareCloudPhoto(
+            item.fileId,
+            isEncrypted,
+            envelopeStr,
+            masterKeyHex,
+          );
+
+          setViewablePhotoUri(prepared.localUri);
+          setPhotoLoadingMsg('');
+          if (prepared.isTemporary && prepared.tempFilePath) {
+            activeTempPhotoPathRef.current = prepared.tempFilePath;
+          }
+        } else {
+          throw new Error('Photo source reference is unavailable.');
+        }
+      } catch (err: any) {
+        setPhotoError(err?.message || 'Photo preparation failed.');
+        setPhotoLoadingMsg('');
+      }
+    },
+    [scannedItems],
+  );
+
   useEffect(() => {
-    if (previewItem && previewItem.mediaType === 'video') {
-      prepareVideoSource(previewItem);
+    if (previewItem) {
+      if (previewItem.mediaType === 'video') {
+        prepareVideoSource(previewItem);
+        setViewablePhotoUri('');
+        setPhotoError(null);
+        setPhotoLoadingMsg('');
+      } else {
+        preparePhotoSource(previewItem);
+        setPlayableVideoUri('');
+        setVideoError(null);
+        setVideoLoadingMsg('');
+      }
     } else {
       setPlayableVideoUri('');
       setVideoError(null);
       setVideoLoadingMsg('');
+      setViewablePhotoUri('');
+      setPhotoError(null);
+      setPhotoLoadingMsg('');
       if (activeTempVideoPathRef.current) {
         const p = activeTempVideoPathRef.current;
         activeTempVideoPathRef.current = null;
         TelegramBridgeService.cleanupTempMedia(p);
       }
+      if (activeTempPhotoPathRef.current) {
+        const p = activeTempPhotoPathRef.current;
+        activeTempPhotoPathRef.current = null;
+        TelegramBridgeService.cleanupTempMedia(p);
+      }
     }
-  }, [previewItem, prepareVideoSource]);
+  }, [previewItem, prepareVideoSource, preparePhotoSource]);
 
   const handleRetryVideoPreparation = () => {
     if (previewItem && previewItem.mediaType === 'video') {
@@ -292,7 +406,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [passphraseInput, setPassphraseInput] = useState<string>('');
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [unlockSuccess, setUnlockSuccess] = useState<string | null>(null);
-  const [isVerifyingKey, setIsVerifyingKey] = useState<boolean>(false);
 
   // Restore Modal State
   const [restoreModalItem, setRestoreModalItem] = useState<CloudMediaItem | null>(null);
@@ -465,8 +578,12 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       return;
     }
 
-    setIsVerifyingKey(true);
-    setUnlockError(null);
+    // Instantly close modal as requested so the popup never hangs!
+    setShowUnlockModal(false);
+    setBackgroundUnlockStatus({
+      status: 'verifying',
+      message: 'Deriving key and unlocking backups in background...',
+    });
 
     try {
       // Attempt verification against the first locked encrypted item or config
@@ -482,56 +599,71 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             ? JSON.parse(sampleLockedItem.encryptionEnvelope)
             : sampleLockedItem.encryptionEnvelope;
 
-        const verifyResult = verifyPassphraseAgainstItem(raw, encObj);
+        const verifyResult = await verifyPassphraseAgainstItemAsync(raw, encObj);
         if (verifyResult.valid && verifyResult.masterKey) {
           isValid = true;
           SessionKeyStore.setSessionKey(verifyResult.masterKey, raw);
         } else {
-          setUnlockError(
-            verifyResult.errorMessage ||
-              'Incorrect recovery passphrase. Please verify your 12 words.',
-          );
-          setIsVerifyingKey(false);
+          setBackgroundUnlockStatus({
+            status: 'error',
+            message:
+              verifyResult.errorMessage ||
+              'Incorrect recovery passphrase. Tap here to retry.',
+          });
           return;
         }
       } else {
         // Fallback: check config if available
         const cfg = SessionKeyStore.getConfig();
         if (cfg) {
-          const verifyResult = verifyRecoveryKey(raw, cfg);
-          if (verifyResult.valid) {
+          const verifyResult = await verifyRecoveryKeyAsync(raw, cfg);
+          if (verifyResult.valid && verifyResult.masterKeyHex) {
             isValid = true;
-            const masterKey = Buffer.from(verifyResult.masterKeyHex!, 'hex');
+            const masterKey = Buffer.from(verifyResult.masterKeyHex, 'hex');
             SessionKeyStore.setSessionKey(masterKey, raw, cfg);
           } else {
-            setUnlockError(verifyResult.errorMessage || 'Incorrect recovery passphrase.');
-            setIsVerifyingKey(false);
+            setBackgroundUnlockStatus({
+              status: 'error',
+              message:
+                verifyResult.errorMessage ||
+                'Incorrect recovery passphrase. Tap here to retry.',
+            });
             return;
           }
         } else {
-          // No encrypted object or config exists yet
-          setUnlockError(
-            'Cannot verify passphrase: no encrypted cloud media exists yet to authenticate against.',
-          );
-          setIsVerifyingKey(false);
+          setBackgroundUnlockStatus({
+            status: 'error',
+            message: 'No encrypted backups found to verify passphrase against.',
+          });
           return;
         }
       }
 
       if (isValid) {
-        setUnlockSuccess('✓ Passphrase verified! Decrypting cloud media...');
+        setBackgroundUnlockStatus({
+          status: 'success',
+          message: '✓ Recovery passphrase verified! Unlocked cloud backups.',
+        });
         if (onUnlockPassphrase) {
           await onUnlockPassphrase(raw);
         }
+        // Refresh preview if an item was already open
+        if (previewItem) {
+          if (previewItem.mediaType === 'video') {
+            prepareVideoSource(previewItem);
+          } else {
+            preparePhotoSource(previewItem);
+          }
+        }
         setTimeout(() => {
-          setIsVerifyingKey(false);
-          setShowUnlockModal(false);
-          setUnlockSuccess(null);
-        }, 800);
+          setBackgroundUnlockStatus(null);
+        }, 4000);
       }
     } catch (e: any) {
-      setUnlockError(`Verification error: ${e?.message || 'Authentication failed'}`);
-      setIsVerifyingKey(false);
+      setBackgroundUnlockStatus({
+        status: 'error',
+        message: `Verification error: ${e?.message || 'Authentication failed'}. Tap to retry.`,
+      });
     }
   };
 
@@ -618,6 +750,10 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   // Render Cloud Media Thumbnail Item (Thumbnails Only, No Cards)
   const renderCloudGridItem = ({ item }: { item: CloudMediaItem }) => {
     const isItemLocked = (item.isEncrypted || !!item.encryptionEnvelope) && !isUnlocked;
+    const localMatch = scannedItems?.find(
+      s => s.id === item.id || s.displayName === item.originalName,
+    );
+    const thumbnailUri = localMatch?.sourceKey;
 
     return (
       <TouchableOpacity
@@ -633,6 +769,16 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             <Text style={styles.lockedIcon}>🔒</Text>
             <Text style={styles.lockedText}>Locked</Text>
           </View>
+        ) : thumbnailUri && !imageErrorMap[item.id] ? (
+          <Image
+            source={{ uri: thumbnailUri }}
+            style={styles.thumbnailImage}
+            resizeMode="cover"
+            fadeDuration={0}
+            onError={() =>
+              setImageErrorMap(prev => ({ ...prev, [item.id]: true }))
+            }
+          />
         ) : (
           <View style={styles.cloudThumbnailBox}>
             <Text style={styles.thumbnailFallbackIcon}>
@@ -843,6 +989,41 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           )}
         </View>
       </View>
+
+      {/* Background Status Banner for Instant Unlock Feedback */}
+      {backgroundUnlockStatus && (
+        <TouchableOpacity
+          activeOpacity={backgroundUnlockStatus.status === 'error' ? 0.7 : 1}
+          style={[
+            styles.bgStatusBanner,
+            backgroundUnlockStatus.status === 'verifying' && styles.bgStatusBannerVerifying,
+            backgroundUnlockStatus.status === 'success' && styles.bgStatusBannerSuccess,
+            backgroundUnlockStatus.status === 'error' && styles.bgStatusBannerError,
+          ]}
+          onPress={() => {
+            if (backgroundUnlockStatus.status === 'error') {
+              setUnlockError(
+                backgroundUnlockStatus.message.replace('Tap here to retry.', '').trim(),
+              );
+              setShowUnlockModal(true);
+            }
+          }}
+        >
+          {backgroundUnlockStatus.status === 'verifying' && (
+            <ActivityIndicator size="small" color="#60a5fa" style={styles.bgStatusSpinner} />
+          )}
+          <Text
+            style={[
+              styles.bgStatusBannerText,
+              backgroundUnlockStatus.status === 'verifying' && styles.bgStatusTextVerifying,
+              backgroundUnlockStatus.status === 'success' && styles.bgStatusTextSuccess,
+              backgroundUnlockStatus.status === 'error' && styles.bgStatusTextError,
+            ]}
+          >
+            {backgroundUnlockStatus.message}
+          </Text>
+        </TouchableOpacity>
+      )}
 
       {/* 2. Permission Banner (Rendered when Permission Needed) */}
       {hasPermissionIssue && (
@@ -1287,13 +1468,70 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                         style={styles.photoSurface}
                         onPress={() => setShowViewerControls(prev => !prev)}
                       >
-                        {'sourceKey' in item && item.sourceKey ? (
+                        {isCurrent ? (
+                          viewablePhotoUri ? (
+                            <Image
+                              source={{ uri: viewablePhotoUri }}
+                              style={styles.fullImage}
+                              resizeMode="contain"
+                              accessibilityLabel="Full screen image preview"
+                              testID="full-viewer-image"
+                            />
+                          ) : photoLoadingMsg ? (
+                            <View style={styles.videoPreparingContainer}>
+                              <ActivityIndicator size="large" color="#34d399" />
+                              <Text style={styles.videoPreparingText}>
+                                {photoLoadingMsg}
+                              </Text>
+                            </View>
+                          ) : photoError ? (
+                            <View style={styles.viewerPlaceholder}>
+                              <Text style={styles.viewerPlaceholderIcon}>⚠</Text>
+                              <Text style={styles.videoPlayerErrorText}>
+                                {photoError}
+                              </Text>
+                              {isLocked ? (
+                                <TouchableOpacity
+                                  style={styles.unlockInViewerBtn}
+                                  onPress={() => {
+                                    setPassphraseInput('');
+                                    setUnlockError(null);
+                                    setShowUnlockModal(true);
+                                  }}
+                                >
+                                  <Text style={styles.unlockInViewerBtnText}>
+                                    🔓 Unlock Media
+                                  </Text>
+                                </TouchableOpacity>
+                              ) : (
+                                <TouchableOpacity
+                                  style={styles.retryPrepBtn}
+                                  onPress={() => preparePhotoSource(item)}
+                                >
+                                  <Text style={styles.retryPrepBtnText}>↻ Retry</Text>
+                                </TouchableOpacity>
+                              )}
+                            </View>
+                          ) : (
+                            <View style={styles.viewerPlaceholder}>
+                              <Text style={styles.viewerPlaceholderIcon}>
+                                {isLocked ? '🔒' : '🖼'}
+                              </Text>
+                              <Text style={styles.viewerPlaceholderText}>
+                                {isLocked
+                                  ? 'Encrypted Photo (Locked)'
+                                  : 'displayName' in item
+                                  ? item.displayName
+                                  : item.originalName}
+                              </Text>
+                            </View>
+                          )
+                        ) : 'sourceKey' in item && item.sourceKey ? (
                           <Image
                             source={{ uri: item.sourceKey }}
                             style={styles.fullImage}
                             resizeMode="contain"
                             accessibilityLabel="Full screen image preview"
-                            testID={isCurrent ? 'full-viewer-image' : undefined}
                           />
                         ) : (
                           <View style={styles.viewerPlaceholder}>
@@ -1307,20 +1545,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                                 ? item.displayName
                                 : item.originalName}
                             </Text>
-                            {isLocked && (
-                              <TouchableOpacity
-                                style={styles.unlockInViewerBtn}
-                                onPress={() => {
-                                  setPassphraseInput('');
-                                  setUnlockError(null);
-                                  setShowUnlockModal(true);
-                                }}
-                              >
-                                <Text style={styles.unlockInViewerBtnText}>
-                                  🔓 Unlock Media
-                                </Text>
-                              </TouchableOpacity>
-                            )}
                           </View>
                         )}
                       </TouchableOpacity>
@@ -1385,18 +1609,10 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[
-                  styles.modalConfirmBtn,
-                  isVerifyingKey && styles.btnDisabled,
-                ]}
-                disabled={isVerifyingKey}
+                style={styles.modalConfirmBtn}
                 onPress={handleVerifyAndUnlock}
               >
-                {isVerifyingKey ? (
-                  <ActivityIndicator size="small" color="#ffffff" />
-                ) : (
-                  <Text style={styles.modalConfirmBtnText}>Unlock Backups</Text>
-                )}
+                <Text style={styles.modalConfirmBtnText}>Unlock Backups</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -2438,5 +2654,45 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 13,
     fontWeight: '700',
+  },
+  bgStatusBanner: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    marginBottom: 4,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  bgStatusBannerVerifying: {
+    backgroundColor: '#0f1f2e',
+    borderColor: '#1e3a5f',
+  },
+  bgStatusBannerSuccess: {
+    backgroundColor: '#062619',
+    borderColor: '#059669',
+  },
+  bgStatusBannerError: {
+    backgroundColor: '#2d1515',
+    borderColor: '#b91c1c',
+  },
+  bgStatusBannerText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  bgStatusTextVerifying: {
+    color: '#60a5fa',
+  },
+  bgStatusTextSuccess: {
+    color: '#34d399',
+  },
+  bgStatusTextError: {
+    color: '#f87171',
+  },
+  bgStatusSpinner: {
+    marginRight: 8,
   },
 });

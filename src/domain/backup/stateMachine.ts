@@ -195,3 +195,58 @@ export function generateUploadIdempotencyKey(
 ): string {
   return `${mediaId}:v${versionNumber}:${contentHash || 'nohash'}`;
 }
+
+/**
+ * Extracts flood wait seconds from a Telegram rate-limit error message (e.g. 420 FLOOD_WAIT_30).
+ */
+export function parseFloodWaitSeconds(errorMessage?: string | null): number | null {
+  if (!errorMessage) return null;
+  const match =
+    errorMessage.match(/FLOOD_WAIT_(\d+)/i) ||
+    errorMessage.match(/flood wait.*?(\d+)/i) ||
+    errorMessage.match(/retry after (\d+)/i);
+  if (match && match[1]) {
+    const sec = parseInt(match[1], 10);
+    return isNaN(sec) ? null : sec;
+  }
+  return null;
+}
+
+/**
+ * Persists flood wait resume timestamp into database repository.
+ */
+export async function persistFloodWaitState(
+  repo: { setSetting: (key: string, val: string) => Promise<void> },
+  waitSeconds: number,
+): Promise<number> {
+  const resumeAtMs = Date.now() + waitSeconds * 1000;
+  await repo.setSetting('telegram_flood_wait_until', String(resumeAtMs));
+  return resumeAtMs;
+}
+
+/**
+ * Checks whether Telegram flood wait is currently active.
+ */
+export async function isFloodWaitActive(
+  repo: { getSetting: (key: string) => Promise<string | null> },
+): Promise<boolean> {
+  const waitVal = await repo.getSetting('telegram_flood_wait_until');
+  if (!waitVal) return false;
+  const waitUntil = parseInt(waitVal, 10);
+  return !isNaN(waitUntil) && waitUntil > Date.now();
+}
+
+/**
+ * Returns remaining flood wait seconds if active, or 0 if inactive.
+ */
+export async function getPersistedFloodWaitSeconds(
+  repo: { getSetting: (key: string) => Promise<string | null> },
+): Promise<number> {
+  const waitVal = await repo.getSetting('telegram_flood_wait_until');
+  if (!waitVal) return 0;
+  const waitUntil = parseInt(waitVal, 10);
+  if (isNaN(waitUntil) || waitUntil <= Date.now()) return 0;
+  return Math.ceil((waitUntil - Date.now()) / 1000);
+}
+
+

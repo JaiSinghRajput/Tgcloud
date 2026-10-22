@@ -683,6 +683,7 @@ export function verifyPassphraseAgainstItem(
   recoveryKey: string,
   envelope: EncryptedItemEnvelope,
   fallbackSaltHex?: string,
+  iterations: number = PBKDF2_ITERATIONS,
 ): { valid: boolean; masterKey?: Buffer; masterKeyHex?: string; errorMessage?: string } {
   try {
     const saltHex = envelope.salt || fallbackSaltHex;
@@ -693,7 +694,53 @@ export function verifyPassphraseAgainstItem(
       };
     }
 
-    const masterKey = deriveMasterKey(recoveryKey, saltHex, PBKDF2_ITERATIONS);
+    const masterKey = deriveMasterKey(recoveryKey, saltHex, iterations);
+    const dekBuffer = Buffer.from(envelope.encryptedDek, 'base64');
+    const dek = decryptBuffer(dekBuffer, masterKey, envelope.dekIv, envelope.dekTag);
+
+    if (dek && dek.length === KEY_LENGTH_BYTES) {
+      return {
+        valid: true,
+        masterKey,
+        masterKeyHex: masterKey.toString('hex'),
+      };
+    }
+
+    return {
+      valid: false,
+      errorMessage: 'Decrypted key size mismatch.',
+    };
+  } catch (err) {
+    return {
+      valid: false,
+      errorMessage:
+        err instanceof Error && err.message.includes('authenticate')
+          ? 'Incorrect recovery passphrase. Authentication tag mismatch.'
+          : 'Invalid recovery passphrase.',
+    };
+  }
+}
+
+/**
+ * Asynchronous, hardware-accelerated verification of a recovery passphrase against an item's DEK.
+ * Prevents UI freezes on mobile devices during PBKDF2 calculation.
+ */
+export async function verifyPassphraseAgainstItemAsync(
+  recoveryKey: string,
+  envelope: EncryptedItemEnvelope,
+  fallbackSaltHex?: string,
+  iterations: number = PBKDF2_ITERATIONS,
+): Promise<{ valid: boolean; masterKey?: Buffer; masterKeyHex?: string; errorMessage?: string }> {
+  try {
+    const saltHex = envelope.salt || fallbackSaltHex;
+    if (!saltHex) {
+      return {
+        valid: false,
+        errorMessage: 'Salt missing from encrypted envelope. Cannot derive key.',
+      };
+    }
+
+    const masterKey = await deriveMasterKeyAsync(recoveryKey, saltHex, iterations);
     const dekBuffer = Buffer.from(envelope.encryptedDek, 'base64');
     const dek = decryptBuffer(dekBuffer, masterKey, envelope.dekIv, envelope.dekTag);
 
@@ -783,7 +830,7 @@ export async function setupExistingKeyAsync(
 
   // Authenticated test against existing verification token if present
   if (existingConfig && existingConfig.verificationToken) {
-    const testResult = verifyRecoveryKey(normalized, existingConfig);
+    const testResult = await verifyRecoveryKeyAsync(normalized, existingConfig);
     if (!testResult.valid) {
       return {
         valid: false,
@@ -793,7 +840,7 @@ export async function setupExistingKeyAsync(
     }
   } else if (testEnvelope) {
     // Authenticated test against existing encrypted object DEK
-    const testResult = verifyPassphraseAgainstItem(normalized, testEnvelope, saltHex);
+    const testResult = await verifyPassphraseAgainstItemAsync(normalized, testEnvelope, saltHex);
     if (!testResult.valid) {
       return {
         valid: false,

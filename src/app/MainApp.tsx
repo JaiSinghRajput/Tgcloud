@@ -34,12 +34,12 @@ import { TelegramBackupChannels, TelegramHistoryItem } from '../types/telegram';
 import { RestoreManager } from '../domain/restore/restoreManager';
 import {
   SessionKeyStore,
-  deriveMasterKey,
+  deriveMasterKeyAsync,
   normalizeRecoveryKey,
   decryptBuffer,
-  encryptMediaPayload,
 } from '../domain/crypto/encryptionService';
 import { DbUploadJob } from '../domain/database/types';
+import { EncryptionConfig } from '../types/encryption';
 
 export type AppTab = 'gallery' | 'cloud' | 'activity' | 'settings' | 'profile';
 
@@ -200,13 +200,40 @@ export const MainApp: React.FC = () => {
         };
       });
 
+      // Auto-recover client_encryption_config from remote history if local config was cleared (post-data-wipe)
+      if (!SessionKeyStore.getConfig()) {
+        for (const h of allHistory) {
+          if (h.encryptionEnvelope) {
+            const env =
+              typeof h.encryptionEnvelope === 'string'
+                ? JSON.parse(h.encryptionEnvelope)
+                : h.encryptionEnvelope;
+            if (env?.salt && env?.verificationToken) {
+              const restoredCfg: EncryptionConfig = {
+                enabled: true,
+                keyVersion: env.keyVersion || 1,
+                kdfSalt: env.salt,
+                kdfIterations: 100000,
+                verificationToken: env.verificationToken,
+                verifiedAtMs: h.modifiedAtMs || Date.now(),
+              };
+              SessionKeyStore.setConfig(restoredCfg);
+              await repo.setSetting('client_encryption_config', JSON.stringify(restoredCfg));
+              await repo.setSetting('encryption_enabled', 'true');
+              setEncryptionEnabled(true);
+              break;
+            }
+          }
+        }
+      }
+
       setCloudItems(mapped);
     } catch {
       // Handled safely without creating channels
     } finally {
       isSyncingDestinationsRef.current = false;
     }
-  }, [restoreManager]);
+  }, [restoreManager, repo]);
 
   // Restore persisted encryption configuration on startup
   useEffect(() => {
@@ -254,31 +281,25 @@ export const MainApp: React.FC = () => {
           throw new Error(`No destination Telegram channel available for ${item.mediaType}`);
         }
 
-        // Encryption metadata if enabled
-        let encryptionEnvelope: string | undefined;
+        // Encryption check: fail fast if enabled but locked to prevent any plaintext leak
+        if (encryptionEnabled && !SessionKeyStore.isUnlocked()) {
+          throw new Error('Client encryption is enabled but session key is locked. Unlock encryption before uploading.');
+        }
+
         const isEncrypted = encryptionEnabled && SessionKeyStore.isUnlocked();
+        let masterKeyHex = '';
+        let saltHex = '';
+        let verificationToken = '';
+
         if (isEncrypted) {
           const masterKey = SessionKeyStore.getSessionKey();
-          const cfg = SessionKeyStore.getConfig();
-          const saltHex = cfg?.kdfSalt || '0123456789abcdef0123456789abcdef';
-
-          if (masterKey) {
-            const dummyBuf = Buffer.from(item.id, 'utf8');
-            const enc = encryptMediaPayload(
-              dummyBuf,
-              {
-                originalName: item.displayName,
-                relativePath: item.relativePath || '',
-                mimeType: item.mimeType || 'application/octet-stream',
-                sizeBytes: item.sizeBytes,
-                modifiedAtMs: item.modifiedAtMs,
-                contentHash: item.contentHash,
-              },
-              masterKey,
-              saltHex,
-            );
-            encryptionEnvelope = JSON.stringify(enc.envelope);
+          if (!masterKey) {
+            throw new Error('Active master encryption key is unavailable.');
           }
+          masterKeyHex = masterKey.toString('hex');
+          const cfg = SessionKeyStore.getConfig();
+          saltHex = cfg?.kdfSalt || '';
+          verificationToken = cfg?.verificationToken || '';
         }
 
         const metadataPayload = {
@@ -294,7 +315,8 @@ export const MainApp: React.FC = () => {
           sizeBytes: item.sizeBytes,
           modifiedAtMs: item.modifiedAtMs,
           contentHash: item.contentHash || null,
-          encryptionEnvelope: encryptionEnvelope || null,
+          saltHex,
+          verificationToken,
         };
 
         const uploadUri = item.sourceKey || item.id;
@@ -304,6 +326,8 @@ export const MainApp: React.FC = () => {
           uploadUri,
           item.mediaType,
           JSON.stringify(metadataPayload),
+          isEncrypted,
+          masterKeyHex,
         );
 
         return {
@@ -643,7 +667,7 @@ export const MainApp: React.FC = () => {
     }
 
     try {
-      const masterKey = deriveMasterKey(raw, saltHex);
+      const masterKey = await deriveMasterKeyAsync(raw, saltHex);
       SessionKeyStore.setSessionKey(masterKey, raw);
 
       await restoreManager.unlockEncryptedMedia(remoteHistoryItems, masterKey);

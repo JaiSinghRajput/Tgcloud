@@ -74,6 +74,12 @@ interface TelegramBridgeNativeModule {
     envelopeJson: string,
     masterKeyHex: string,
   ): Promise<PreparedVideoResult>;
+  prepareCloudPhoto(
+    fileId: number,
+    isEncrypted: boolean,
+    envelopeJson: string,
+    masterKeyHex: string,
+  ): Promise<PreparedVideoResult>;
   cleanupTempMedia(filePath: string): Promise<boolean>;
 
   // Media upload to Telegram channels
@@ -82,6 +88,8 @@ interface TelegramBridgeNativeModule {
     uriString: string,
     mediaType: string,
     metadataJson: string,
+    isEncrypted?: boolean,
+    masterKeyHex?: string,
   ): Promise<{
     channelId: string;
     messageId: string;
@@ -178,7 +186,19 @@ const fallbackMock: TelegramBridgeNativeModule = {
   }),
   getChannelHistory: async () => [],
   openChatInTelegram: async () => true,
-  uploadMedia: async (chatId: string) => ({
+  prepareCloudPhoto: async (fileId: number) => ({
+    localUri: `file:///data/user/0/mock_photo_${fileId}.jpg`,
+    tempFilePath: `/data/user/0/mock_photo_${fileId}.jpg`,
+    isTemporary: false,
+  }),
+  uploadMedia: async (
+    chatId: string,
+    _uriString: string,
+    _mediaType: string,
+    _metadataJson: string,
+    _isEncrypted?: boolean,
+    _masterKeyHex?: string,
+  ) => ({
     channelId: chatId,
     messageId: Math.floor(Math.random() * 100000 + 1000).toString(),
     fileId: Math.floor(Math.random() * 10000 + 100),
@@ -352,6 +372,18 @@ export const TelegramBridgeService = {
       envelopeJson,
       masterKeyHex,
     ),
+  prepareCloudPhoto: (
+    fileId: number,
+    isEncrypted: boolean,
+    envelopeJson: string,
+    masterKeyHex: string,
+  ) =>
+    nativeModule.prepareCloudPhoto(
+      fileId,
+      isEncrypted,
+      envelopeJson,
+      masterKeyHex,
+    ),
   cleanupTempMedia: (filePath: string) =>
     nativeModule.cleanupTempMedia(filePath),
 
@@ -360,7 +392,17 @@ export const TelegramBridgeService = {
     uriString: string,
     mediaType: string,
     metadataJson: string,
-  ) => nativeModule.uploadMedia(chatId, uriString, mediaType, metadataJson),
+    isEncrypted: boolean = false,
+    masterKeyHex: string = '',
+  ) =>
+    nativeModule.uploadMedia(
+      chatId,
+      uriString,
+      mediaType,
+      metadataJson,
+      isEncrypted,
+      masterKeyHex,
+    ),
 
   subscribeToAuthState: (callback: (state: TelegramAuthState) => void) => {
     if (Platform.OS === 'android' && TelegramBridge) {

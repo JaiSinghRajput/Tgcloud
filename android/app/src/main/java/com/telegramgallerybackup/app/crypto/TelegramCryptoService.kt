@@ -122,6 +122,62 @@ object TelegramCryptoService {
     }
 
     /**
+     * Encrypts a media file using AES-256-GCM under the given DEK.
+     * Writes the ciphertext directly to outputFile and returns the IV and authentication tag.
+     */
+    fun encryptMediaFile(
+        inputFile: File,
+        outputFile: File,
+        dek: ByteArray
+    ): EncryptedPayload {
+        val plaintext = inputFile.readBytes()
+        val enc = encryptAesGcm(plaintext, dek)
+        outputFile.writeBytes(enc.ciphertext)
+        return enc
+    }
+
+    /**
+     * Decrypts a media file using AES-256-GCM under the given DEK.
+     * Writes the decrypted plaintext directly to outputFile.
+     */
+    fun decryptMediaFile(
+        inputFile: File,
+        outputFile: File,
+        dek: ByteArray,
+        ivBase64: String,
+        tagBase64: String
+    ) {
+        val ciphertext = inputFile.readBytes()
+        val decrypted = decryptAesGcm(ciphertext, dek, ivBase64, tagBase64)
+        outputFile.writeBytes(decrypted)
+    }
+
+    /**
+     * Detects if raw byte content contains known unencrypted media file signatures (magic bytes).
+     * Used to prevent false locked state or decryption failures if files were stored as plaintext.
+     */
+    fun isPlaintextMedia(bytes: ByteArray): Boolean {
+        if (bytes.size < 4) return false
+        // JPEG: FF D8 FF
+        if (bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() && bytes[2] == 0xFF.toByte()) return true
+        // PNG: 89 50 4E 47
+        if (bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()) return true
+        // GIF: 47 49 46 38
+        if (bytes[0] == 0x47.toByte() && bytes[1] == 0x49.toByte() && bytes[2] == 0x46.toByte() && bytes[3] == 0x38.toByte()) return true
+        // MP4 / MOV / QuickTime: check for ftyp at offset 4
+        if (bytes.size >= 12 &&
+            bytes[4] == 'f'.code.toByte() && bytes[5] == 't'.code.toByte() &&
+            bytes[6] == 'y'.code.toByte() && bytes[7] == 'p'.code.toByte()) return true
+        // WebP: RIFF ... WEBP
+        if (bytes.size >= 12 &&
+            bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte() &&
+            bytes[2] == 'F'.code.toByte() && bytes[3] == 'F'.code.toByte() &&
+            bytes[8] == 'W'.code.toByte() && bytes[9] == 'E'.code.toByte() &&
+            bytes[10] == 'B'.code.toByte() && bytes[11] == 'P'.code.toByte()) return true
+        return false
+    }
+
+    /**
      * Creates a verification token encrypted under the master key.
      */
     fun createVerificationToken(masterKey: ByteArray): String {
