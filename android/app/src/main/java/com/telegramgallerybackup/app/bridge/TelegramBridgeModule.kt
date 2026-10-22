@@ -12,8 +12,10 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.telegramgallerybackup.app.crypto.TelegramCryptoService
 import com.telegramgallerybackup.app.telegram.TdLibService
 import com.telegramgallerybackup.app.telegram.TelegramAuthState
+import android.util.Log
 import com.telegramgallerybackup.app.telegram.TelegramChannelManager
 import com.telegramgallerybackup.app.telegram.TelegramMediaManager
+import com.telegramgallerybackup.app.telegram.TelegramMetadataEnvelope
 import com.telegramgallerybackup.app.telegram.TelegramPocRunner
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -462,6 +464,97 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                 promise.resolve(true)
             } catch (e: Exception) {
                 promise.resolve(false)
+            }
+        }
+    }
+
+    /**
+     * Uploads media (photo or video) to the specified Telegram channel with versioned metadata caption.
+     */
+    @ReactMethod
+    fun uploadMedia(
+        chatId: String,
+        uriString: String,
+        mediaType: String,
+        metadataJson: String,
+        promise: Promise
+    ) {
+        scope.launch {
+            var tempFileToDelete: File? = null
+            try {
+                val cId = chatId.toLong()
+                val metaObj = JSONObject(metadataJson)
+                val mediaId = metaObj.optString("mediaId", "media_${System.currentTimeMillis()}")
+                val originalName = metaObj.optString("originalName", "media_upload")
+                val relativePath = metaObj.optString("relativePath", "")
+                val mimeType = metaObj.optString("mimeType", if (mediaType == "video") "video/mp4" else "image/jpeg")
+                val sizeBytes = metaObj.optLong("sizeBytes", 0L)
+                val modifiedAtMs = metaObj.optLong("modifiedAtMs", System.currentTimeMillis())
+                val contentHash = if (metaObj.has("contentHash") && !metaObj.isNull("contentHash")) metaObj.getString("contentHash") else null
+                val encryptionEnvelope = if (metaObj.has("encryptionEnvelope") && !metaObj.isNull("encryptionEnvelope")) metaObj.getString("encryptionEnvelope") else null
+
+                val envelope = TelegramMetadataEnvelope(
+                    schemaVersion = TelegramMetadataEnvelope.CURRENT_SCHEMA_VERSION,
+                    app = TelegramMetadataEnvelope.APP_IDENTIFIER,
+                    mediaId = mediaId,
+                    mediaType = mediaType,
+                    originalName = originalName,
+                    relativePath = relativePath,
+                    mimeType = mimeType,
+                    sizeBytes = sizeBytes,
+                    modifiedAtMs = modifiedAtMs,
+                    contentHash = contentHash,
+                    encryptionEnvelope = encryptionEnvelope
+                )
+
+                // Resolve source file to real filesystem path for TDLib
+                val uploadFile: File
+                if (uriString.startsWith("content://")) {
+                    val contentUri = Uri.parse(uriString)
+                    val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_upload")
+                    if (!cacheDir.exists()) cacheDir.mkdirs()
+                    val cleanName = originalName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    val temp = File(cacheDir, "upload_${System.currentTimeMillis()}_$cleanName")
+                    val inputStream = reactApplicationContext.contentResolver.openInputStream(contentUri)
+                        ?: throw IllegalStateException("Could not open content stream for $uriString")
+                    inputStream.use { input ->
+                        FileOutputStream(temp).use { output ->
+                            input.copyTo(output)
+                        }
+                    }
+                    tempFileToDelete = temp
+                    uploadFile = temp
+                } else {
+                    val filePath = if (uriString.startsWith("file://")) Uri.parse(uriString).path ?: "" else uriString
+                    val file = File(filePath)
+                    if (!file.exists()) {
+                        throw IllegalStateException("File does not exist: $filePath")
+                    }
+                    uploadFile = file
+                }
+
+                val result = if (mediaType == "video") {
+                    mediaManager.uploadVideo(cId, uploadFile, envelope)
+                } else {
+                    mediaManager.uploadPhoto(cId, uploadFile, envelope)
+                }
+
+                val map = Arguments.createMap().apply {
+                    putString("messageId", result.messageId.toString())
+                    putString("channelId", result.chatId.toString())
+                    putInt("fileId", result.fileId)
+                    putString("contentHash", result.metadata.contentHash)
+                }
+                promise.resolve(map)
+            } catch (e: Exception) {
+                Log.e("TelegramBridge", "uploadMedia failed: ${e.message}", e)
+                promise.reject("UPLOAD_ERROR", "Failed to upload media to Telegram: ${e.message}", e)
+            } finally {
+                tempFileToDelete?.let {
+                    try {
+                        if (it.exists()) it.delete()
+                    } catch (_: Exception) {}
+                }
             }
         }
     }

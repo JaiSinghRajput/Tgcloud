@@ -230,6 +230,14 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
      * Returns the local File once fully downloaded.
      */
     suspend fun downloadMediaFile(fileId: Int, timeoutMs: Long = 60_000): File? {
+        try {
+            val initialFile: TdApi.File = tdLibService.send(TdApi.GetFile(fileId))
+            if (initialFile.local.isDownloadingCompleted && !initialFile.local.path.isNullOrEmpty()) {
+                val f = File(initialFile.local.path)
+                if (f.exists()) return f
+            }
+        } catch (_: Exception) {}
+
         // Request download
         val downloadReq = TdApi.DownloadFile().apply {
             this.fileId = fileId

@@ -185,8 +185,17 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     setPlayableVideoUri('');
 
     try {
-      if ('sourceKey' in item && item.sourceKey) {
-        setPlayableVideoUri(item.sourceKey);
+      if ('sourceKey' in item && (item as any).sourceKey) {
+        setPlayableVideoUri((item as any).sourceKey);
+        return;
+      }
+
+      // Check if this item is present in local scanned items
+      const localMatch = scannedItems?.find(
+        s => s.id === item.id || ('originalName' in item && s.displayName === (item as any).originalName)
+      );
+      if (localMatch && localMatch.sourceKey) {
+        setPlayableVideoUri(localMatch.sourceKey);
         return;
       }
 
@@ -229,7 +238,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     } catch (err: any) {
       setVideoError(err?.message || 'Video preparation failed.');
     }
-  }, []);
+  }, [scannedItems]);
 
   useEffect(() => {
     if (previewItem && previewItem.mediaType === 'video') {

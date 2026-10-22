@@ -75,6 +75,19 @@ interface TelegramBridgeNativeModule {
     masterKeyHex: string,
   ): Promise<PreparedVideoResult>;
   cleanupTempMedia(filePath: string): Promise<boolean>;
+
+  // Media upload to Telegram channels
+  uploadMedia(
+    chatId: string,
+    uriString: string,
+    mediaType: string,
+    metadataJson: string,
+  ): Promise<{
+    channelId: string;
+    messageId: string;
+    fileId: number;
+    contentHash?: string;
+  }>;
 }
 
 const { TelegramBridge } = NativeModules;
@@ -165,6 +178,12 @@ const fallbackMock: TelegramBridgeNativeModule = {
   }),
   getChannelHistory: async () => [],
   openChatInTelegram: async () => true,
+  uploadMedia: async (chatId: string) => ({
+    channelId: chatId,
+    messageId: Math.floor(Math.random() * 100000 + 1000).toString(),
+    fileId: Math.floor(Math.random() * 10000 + 100),
+    contentHash: 'mock-hash',
+  }),
 
   deriveMasterKey: async (recoveryKey: string, saltHex: string, iterations = 100000) => {
     if (nodeCrypto?.pbkdf2Sync) {
@@ -335,6 +354,13 @@ export const TelegramBridgeService = {
     ),
   cleanupTempMedia: (filePath: string) =>
     nativeModule.cleanupTempMedia(filePath),
+
+  uploadMedia: (
+    chatId: string,
+    uriString: string,
+    mediaType: string,
+    metadataJson: string,
+  ) => nativeModule.uploadMedia(chatId, uriString, mediaType, metadataJson),
 
   subscribeToAuthState: (callback: (state: TelegramAuthState) => void) => {
     if (Platform.OS === 'android' && TelegramBridge) {

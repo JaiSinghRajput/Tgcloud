@@ -233,11 +233,29 @@ export const MainApp: React.FC = () => {
     return new BackupEngine(
       repo,
       async item => {
-        const destChannelId =
+        let destChannelId =
           item.mediaType === 'video'
-            ? channels?.videoChannelId || '-100999002'
-            : channels?.photoChannelId || '-100999001';
+            ? channels?.videoChannelId
+            : channels?.photoChannelId;
 
+        // If channel destination is not established yet, create/setup channels
+        if (!destChannelId || destChannelId === '0') {
+          const fresh = await TelegramBridgeService.setupChannels();
+          if (fresh) {
+            setChannels(fresh);
+            destChannelId =
+              item.mediaType === 'video'
+                ? fresh.videoChannelId
+                : fresh.photoChannelId;
+          }
+        }
+
+        if (!destChannelId || destChannelId === '0') {
+          throw new Error(`No destination Telegram channel available for ${item.mediaType}`);
+        }
+
+        // Encryption metadata if enabled
+        let encryptionEnvelope: string | undefined;
         const isEncrypted = encryptionEnabled && SessionKeyStore.isUnlocked();
         if (isEncrypted) {
           const masterKey = SessionKeyStore.getSessionKey();
@@ -246,7 +264,7 @@ export const MainApp: React.FC = () => {
 
           if (masterKey) {
             const dummyBuf = Buffer.from(item.id, 'utf8');
-            encryptMediaPayload(
+            const enc = encryptMediaPayload(
               dummyBuf,
               {
                 originalName: item.displayName,
@@ -259,18 +277,66 @@ export const MainApp: React.FC = () => {
               masterKey,
               saltHex,
             );
+            encryptionEnvelope = JSON.stringify(enc.envelope);
           }
         }
 
-        const msgId = Math.floor(Math.random() * 100000 + 100).toString();
+        const metadataPayload = {
+          schemaVersion: 1,
+          app: 'telegram-gallery-backup',
+          mediaId: item.id,
+          mediaType: item.mediaType,
+          originalName: item.displayName,
+          relativePath: item.relativePath || '',
+          mimeType:
+            item.mimeType ||
+            (item.mediaType === 'video' ? 'video/mp4' : 'image/jpeg'),
+          sizeBytes: item.sizeBytes,
+          modifiedAtMs: item.modifiedAtMs,
+          contentHash: item.contentHash || null,
+          encryptionEnvelope: encryptionEnvelope || null,
+        };
+
+        const uploadUri = item.sourceKey || item.id;
+
+        const uploadResult = await TelegramBridgeService.uploadMedia(
+          destChannelId,
+          uploadUri,
+          item.mediaType,
+          JSON.stringify(metadataPayload),
+        );
 
         return {
-          channelId: destChannelId,
-          messageId: msgId,
-          contentHash: item.contentHash,
+          channelId: uploadResult.channelId,
+          messageId: uploadResult.messageId,
+          contentHash: uploadResult.contentHash || item.contentHash,
         };
       },
-      async () => null,
+      async item => {
+        try {
+          const destChannelId =
+            item.mediaType === 'video'
+              ? channels?.videoChannelId
+              : channels?.photoChannelId;
+          if (!destChannelId || destChannelId === '0') return null;
+          const history = await TelegramBridgeService.getChannelHistory(
+            destChannelId,
+            50,
+            '0',
+          );
+          const matched = history.find(
+            h =>
+              h.mediaId === item.id ||
+              (item.contentHash && h.contentHash === item.contentHash),
+          );
+          if (matched) {
+            return { channelId: destChannelId, messageId: matched.messageId };
+          }
+        } catch {
+          // Best effort
+        }
+        return null;
+      },
     );
   }, [repo, channels, encryptionEnabled]);
 
@@ -415,7 +481,18 @@ export const MainApp: React.FC = () => {
     if (!isLoggedIn) return;
 
     // Destination validation: check destinations before enqueuing
-    const refreshedChannels = await TelegramBridgeService.refreshDestinations();
+    let refreshedChannels = await TelegramBridgeService.refreshDestinations();
+    if (
+      !refreshedChannels?.photoChannelId ||
+      !refreshedChannels?.videoChannelId ||
+      refreshedChannels.photoChannelId === '0' ||
+      refreshedChannels.videoChannelId === '0'
+    ) {
+      const setupResult = await TelegramBridgeService.setupChannels();
+      if (setupResult) {
+        refreshedChannels = setupResult;
+      }
+    }
     const activeDestinations = refreshedChannels || channels;
     if (refreshedChannels) {
       setChannels(refreshedChannels);
@@ -473,20 +550,30 @@ export const MainApp: React.FC = () => {
     // Run queue subject to network constraints
     engine.runQueue(networkPolicy, true, {
       onProgress: p => setActiveProgress(p),
-      onJobCompleted: (_job, media) => {
-        setCloudItems(prev => [
-          ...prev,
-          {
-            id: media.id,
-            mediaType: media.mediaType,
-            originalName: media.displayName,
-            relativePath: media.relativePath || 'DCIM/Camera',
-            sizeBytes: media.sizeBytes,
-            modifiedAtMs: media.modifiedAtMs,
-            messageId: '101',
-            channelId: channels?.photoChannelId || '-100999001',
-          },
-        ]);
+      onJobCompleted: async (_job, media) => {
+        const tgObj = await repo.getTelegramObjectForMedia(media.id);
+        const destChan =
+          media.mediaType === 'video'
+            ? channels?.videoChannelId || ''
+            : channels?.photoChannelId || '';
+
+        setCloudItems(prev => {
+          if (prev.some(p => p.id === media.id)) return prev;
+          return [
+            ...prev,
+            {
+              id: media.id,
+              sourceKey: media.sourceKey || undefined,
+              mediaType: media.mediaType,
+              originalName: media.displayName,
+              relativePath: media.relativePath || 'DCIM/Camera',
+              sizeBytes: media.sizeBytes,
+              modifiedAtMs: media.modifiedAtMs,
+              messageId: tgObj?.messageId || '1',
+              channelId: tgObj?.channelId || destChan,
+            },
+          ];
+        });
         setActiveProgress(null);
         refreshQueueStats();
       },

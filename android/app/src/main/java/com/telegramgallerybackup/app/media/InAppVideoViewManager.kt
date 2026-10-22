@@ -1,6 +1,8 @@
 package com.telegramgallerybackup.app.media
 
 import android.content.Context
+import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -9,10 +11,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
 import android.widget.FrameLayout
-import android.widget.VideoView
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactContext
 import com.facebook.react.common.MapBuilder
@@ -21,147 +25,235 @@ import com.facebook.react.uimanager.ThemedReactContext
 import com.facebook.react.uimanager.annotations.ReactProp
 import com.facebook.react.uimanager.events.RCTEventEmitter
 import java.io.File
+import java.io.FileInputStream
 
 /**
- * Container view hosting a native Android VideoView for in-app video playback.
- * Handles MediaPlayer lifecycle, progress reporting, seeking, audio focus, layout measurement, and cleanup.
+ * Hardware-accelerated in-app video container using TextureView and MediaPlayer.
+ * Works seamlessly in React Native Modals, FlatLists, and animated view hierarchies.
  */
-class InAppVideoContainerView(private val reactContext: ThemedReactContext) : FrameLayout(reactContext) {
+class InAppVideoContainerView(private val reactContext: ThemedReactContext) :
+    FrameLayout(reactContext), TextureView.SurfaceTextureListener {
 
     private val tag = "InAppVideoView"
-    private val videoView = VideoView(reactContext)
+    private val textureView = TextureView(reactContext)
+    private var mediaPlayer: MediaPlayer? = null
+    private var surface: Surface? = null
+    private var currentPfd: ParcelFileDescriptor? = null
     private val handler = Handler(Looper.getMainLooper())
     private var progressRunnable: Runnable? = null
     private var audioManager: AudioManager? = null
+
     private var isPrepared = false
     private var shouldPlayWhenReady = true
-    private var lastUri: String? = null
+    private var currentSourceUrl: String? = null
+    private var videoWidth = 0
+    private var videoHeight = 0
 
     init {
+        setBackgroundColor(0xFF000000.toInt())
         val params = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply {
             gravity = Gravity.CENTER
         }
-        videoView.layoutParams = params
-        videoView.setZOrderMediaOverlay(true)
-        addView(videoView)
+        textureView.layoutParams = params
+        textureView.surfaceTextureListener = this
+        addView(textureView)
 
         audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    }
 
-        videoView.setOnPreparedListener { mp ->
-            isPrepared = true
-            mp.isLooping = false
-            val duration = mp.duration
-            Log.d(tag, "MediaPlayer prepared: duration=${duration}ms, size=${mp.videoWidth}x${mp.videoHeight}")
-            sendEvent("ready", duration, 0, null)
-            if (shouldPlayWhenReady) {
-                requestAudioFocus()
-                videoView.start()
-                startProgressTracker()
-                sendEvent("playing", duration, videoView.currentPosition, null)
-            }
+    override fun onSurfaceTextureAvailable(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+        Log.d(tag, "onSurfaceTextureAvailable: ${width}x${height}")
+        surface = Surface(surfaceTexture)
+        mediaPlayer?.setSurface(surface)
+        val src = currentSourceUrl
+        if (src != null && !isPrepared) {
+            initMediaPlayer(src)
         }
+    }
 
-        videoView.setOnCompletionListener {
-            Log.d(tag, "MediaPlayer playback completed")
-            stopProgressTracker()
-            sendEvent("ended", videoView.duration, videoView.duration, null)
-        }
+    override fun onSurfaceTextureSizeChanged(surfaceTexture: SurfaceTexture, width: Int, height: Int) {
+        adjustAspectRatio(width, height)
+    }
 
-        videoView.setOnErrorListener { _, what, extra ->
-            Log.e(tag, "MediaPlayer error: what=$what, extra=$extra")
-            stopProgressTracker()
-            isPrepared = false
-            val errorMsg = when (what) {
-                MediaPlayer.MEDIA_ERROR_UNKNOWN -> "Video playback error (Unknown error $extra)"
-                MediaPlayer.MEDIA_ERROR_SERVER_DIED -> "Media server died ($extra)"
-                else -> "Video playback error (code: $what, extra: $extra)"
-            }
-            sendEvent("error", 0, 0, errorMsg)
-            true
-        }
+    override fun onSurfaceTextureDestroyed(surfaceTexture: SurfaceTexture): Boolean {
+        Log.d(tag, "onSurfaceTextureDestroyed")
+        mediaPlayer?.setSurface(null)
+        surface?.release()
+        surface = null
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(surfaceTexture: SurfaceTexture) {
+        // Frame rendered
     }
 
     override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
         super.onLayout(changed, left, top, right, bottom)
         val w = right - left
         val h = bottom - top
-        videoView.measure(
-            MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
-            MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY)
-        )
-        videoView.layout(0, 0, w, h)
+        textureView.layout(0, 0, w, h)
+        adjustAspectRatio(w, h)
     }
 
-    override fun requestLayout() {
-        super.requestLayout()
-        post(measureAndLayoutRunnable)
-    }
+    private fun adjustAspectRatio(viewWidth: Int, viewHeight: Int) {
+        if (viewWidth <= 0 || viewHeight <= 0 || videoWidth <= 0 || videoHeight <= 0) return
 
-    private val measureAndLayoutRunnable = Runnable {
-        measure(
-            MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
-            MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
-        )
-        layout(left, top, right, bottom)
+        val viewRatio = viewWidth.toDouble() / viewHeight
+        val videoRatio = videoWidth.toDouble() / videoHeight
+
+        val scaleX: Float
+        val scaleY: Float
+
+        if (videoRatio > viewRatio) {
+            // Video is wider than view -> fit width, letterbox top/bottom
+            scaleX = 1.0f
+            scaleY = (viewRatio / videoRatio).toFloat()
+        } else {
+            // Video is taller than view -> fit height, pillarbox left/right
+            scaleX = (videoRatio / viewRatio).toFloat()
+            scaleY = 1.0f
+        }
+
+        val matrix = Matrix()
+        val pivotX = viewWidth / 2f
+        val pivotY = viewHeight / 2f
+        matrix.setScale(scaleX, scaleY, pivotX, pivotY)
+        textureView.setTransform(matrix)
     }
 
     fun setSource(uriString: String?) {
         if (uriString.isNullOrEmpty()) {
-            Log.d(tag, "setSource: empty uri, releasing player")
             releasePlayer()
             return
         }
-        if (uriString == lastUri && isPrepared) {
+        if (uriString == currentSourceUrl && isPrepared) {
             return
         }
-        lastUri = uriString
+        currentSourceUrl = uriString
         isPrepared = false
         sendEvent("loading", 0, 0, null)
 
-        try {
-            val uri = if (uriString.startsWith("/") && !uriString.startsWith("content://") && !uriString.startsWith("file://")) {
-                Uri.fromFile(File(uriString))
-            } else {
-                Uri.parse(uriString)
-            }
+        if (surface != null) {
+            initMediaPlayer(uriString)
+        }
+    }
 
-            Log.d(tag, "setSource: uri=$uri, scheme=${uri.scheme}")
-            if (uri.scheme == "file") {
-                val f = File(uri.path ?: "")
-                Log.d(tag, "setSource: file path=${f.absolutePath}, exists=${f.exists()}, sizeBytes=${if (f.exists()) f.length() else -1}")
-                if (!f.exists() || f.length() == 0L) {
-                    sendEvent("error", 0, 0, "Video media file not found or empty (${f.name})")
-                    return
+    private fun initMediaPlayer(uriString: String) {
+        try {
+            releaseMediaPlayerOnly()
+
+            val mp = MediaPlayer()
+            mediaPlayer = mp
+            mp.setSurface(surface)
+
+            val uri = Uri.parse(uriString)
+            Log.d(tag, "initMediaPlayer: uri=$uri, scheme=${uri.scheme}")
+
+            when (uri.scheme) {
+                "content" -> {
+                    val pfd = reactContext.contentResolver.openFileDescriptor(uri, "r")
+                    if (pfd != null) {
+                        currentPfd = pfd
+                        mp.setDataSource(pfd.fileDescriptor)
+                    } else {
+                        throw IllegalStateException("Cannot open FileDescriptor for content URI: $uri")
+                    }
+                }
+                "file" -> {
+                    val path = uri.path ?: uriString.removePrefix("file://")
+                    val file = File(path)
+                    if (!file.exists() || file.length() == 0L) {
+                        sendEvent("error", 0, 0, "Video media file not found or empty (${file.name})")
+                        return
+                    }
+                    mp.setDataSource(file.absolutePath)
+                }
+                else -> {
+                    if (uriString.startsWith("/")) {
+                        val file = File(uriString)
+                        if (!file.exists() || file.length() == 0L) {
+                            sendEvent("error", 0, 0, "Video media file not found or empty (${file.name})")
+                            return
+                        }
+                        mp.setDataSource(file.absolutePath)
+                    } else {
+                        mp.setDataSource(reactContext, uri)
+                    }
                 }
             }
 
-            videoView.setVideoURI(uri)
+            mp.setOnVideoSizeChangedListener { _, w, h ->
+                Log.d(tag, "onVideoSizeChanged: ${w}x${h}")
+                if (w > 0 && h > 0) {
+                    videoWidth = w
+                    videoHeight = h
+                    adjustAspectRatio(width, height)
+                }
+            }
+
+            mp.setOnPreparedListener { player ->
+                Log.d(tag, "MediaPlayer onPrepared: duration=${player.duration}ms")
+                isPrepared = true
+                player.isLooping = false
+                val duration = player.duration
+                sendEvent("ready", duration, 0, null)
+
+                if (shouldPlayWhenReady) {
+                    requestAudioFocus()
+                    player.start()
+                    startProgressTracker()
+                    sendEvent("playing", duration, player.currentPosition, null)
+                }
+            }
+
+            mp.setOnCompletionListener { player ->
+                Log.d(tag, "MediaPlayer onCompletion")
+                stopProgressTracker()
+                sendEvent("ended", player.duration, player.duration, null)
+            }
+
+            mp.setOnErrorListener { _, what, extra ->
+                Log.e(tag, "MediaPlayer onError: what=$what, extra=$extra")
+                stopProgressTracker()
+                isPrepared = false
+                val errorMsg = when (what) {
+                    MediaPlayer.MEDIA_ERROR_UNKNOWN -> "Video playback error (Unknown error $extra)"
+                    MediaPlayer.MEDIA_ERROR_SERVER_DIED -> "Media server died ($extra)"
+                    else -> "Video playback error (code: $what, extra: $extra)"
+                }
+                sendEvent("error", 0, 0, errorMsg)
+                true
+            }
+
+            mp.prepareAsync()
         } catch (e: Exception) {
-            Log.e(tag, "setSource failed: ${e.message}", e)
-            sendEvent("error", 0, 0, "Failed to load video source: ${e.message}")
+            Log.e(tag, "initMediaPlayer failed: ${e.message}", e)
+            sendEvent("error", 0, 0, "Failed to load video: ${e.message}")
         }
     }
 
     fun setPlayWhenReady(play: Boolean) {
         shouldPlayWhenReady = play
+        val mp = mediaPlayer ?: return
         if (!isPrepared) return
 
         if (play) {
             requestAudioFocus()
-            videoView.start()
+            mp.start()
             startProgressTracker()
-            sendEvent("playing", videoView.duration, videoView.currentPosition, null)
+            sendEvent("playing", mp.duration, mp.currentPosition, null)
         } else {
-            videoView.pause()
+            mp.pause()
             stopProgressTracker()
-            sendEvent("paused", videoView.duration, videoView.currentPosition, null)
+            sendEvent("paused", mp.duration, mp.currentPosition, null)
         }
     }
 
     fun seekTo(positionMs: Int) {
-        if (isPrepared) {
-            videoView.seekTo(positionMs)
-            sendEvent("progress", videoView.duration, positionMs, null)
+        val mp = mediaPlayer
+        if (mp != null && isPrepared) {
+            mp.seekTo(positionMs)
+            sendEvent("progress", mp.duration, positionMs, null)
         }
     }
 
@@ -169,9 +261,10 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
         stopProgressTracker()
         progressRunnable = object : Runnable {
             override fun run() {
-                if (videoView.isPlaying) {
-                    val current = videoView.currentPosition
-                    val duration = videoView.duration
+                val mp = mediaPlayer
+                if (mp != null && isPrepared && mp.isPlaying) {
+                    val current = mp.currentPosition
+                    val duration = mp.duration
                     sendEvent("progress", duration, current, null)
                     handler.postDelayed(this, 300)
                 }
@@ -214,16 +307,30 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
         } catch (_: Exception) {}
     }
 
-    fun releasePlayer() {
+    private fun releaseMediaPlayerOnly() {
         stopProgressTracker()
         abandonAudioFocus()
         try {
-            if (videoView.isPlaying) {
-                videoView.stopPlayback()
+            currentPfd?.close()
+        } catch (_: Exception) {}
+        currentPfd = null
+
+        try {
+            mediaPlayer?.let {
+                if (it.isPlaying) {
+                    it.stop()
+                }
+                it.reset()
+                it.release()
             }
         } catch (_: Exception) {}
+        mediaPlayer = null
         isPrepared = false
-        lastUri = null
+    }
+
+    fun releasePlayer() {
+        releaseMediaPlayerOnly()
+        currentSourceUrl = null
     }
 
     private fun sendEvent(eventType: String, durationMs: Int, currentPositionMs: Int, errorMessage: String?) {
@@ -235,8 +342,8 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
                 putString("errorMessage", errorMessage)
             }
         }
-        val reactContext = context as? ReactContext
-        reactContext?.getJSModule(RCTEventEmitter::class.java)
+        val rCtx = context as? ReactContext
+        rCtx?.getJSModule(RCTEventEmitter::class.java)
             ?.receiveEvent(id, "onPlaybackStatus", event)
     }
 }
