@@ -18,6 +18,7 @@
 14. **Toolchain & Framework (Phase 0):** React Native 0.88.0 + TypeScript, Kotlin 2.2.0, Gradle 9.4.1, Min SDK 26, Target SDK 36, Compile SDK 37. Chosen for native Android interoperability (WorkManager, MediaStore, TDLib native bindings) alongside strict type-safe UI and domain state management.
 15. **TDLib Integration (Phase 1):** `io.github.tdlib-android:core:0.1.1` and `io.github.tdlib-android:ktx:0.1.1` (TDLib 1.8.x). Precompiled 4-ABI AAR (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) on Maven Central with 16KB page alignment and Kotlin Flow wrappers, eliminating local NDK compilation while preserving native `org.drinkless.tdlib` types.
 16. **Domain Model & SQLite Architecture (Phase 2):** Defined Schema V1 with 7 tables (`media_items`, `telegram_objects`, `upload_jobs`, `media_versions`, `folder_exclusions`, `backup_settings`, `restore_jobs`). Enforced state transitions centrally through `assertMediaTransition` and idempotency keys (`mediaId:v{version}:{hash}`) to prevent duplicate uploads upon process kill or network recovery.
+17. **Restore & Index Recovery Architecture (Phase 6):** Validated Gate B via `rebuildIndexFromRemoteHistory` by paginating remote Telegram channel messages, parsing `#TGB1:` caption envelopes, and recovering local SQLite state without prior local database state. Established collision resolution policies (`skip`, `keep_both` with automatic numeric suffix, and `replace`) and tracked restore jobs with resume capability and graceful handling of missing or deleted remote objects.
 
 ## Required validation gates
 
