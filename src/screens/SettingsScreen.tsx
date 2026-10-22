@@ -45,6 +45,7 @@ interface SettingsScreenProps {
   onResyncChannels?: () => void;
   onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
   onRecreateDestination?: (type: 'photo' | 'video') => Promise<void>;
+  onSetupDestinations?: () => Promise<void>;
 }
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({
@@ -67,8 +68,30 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onResyncChannels,
   onUnlockPassphrase,
   onRecreateDestination,
+  onSetupDestinations,
 }) => {
   const isWifiOnly = networkPolicy === NetworkPolicy.WIFI_ONLY;
+
+  // Channel Setup State
+  const [isSettingUpDestinations, setIsSettingUpDestinations] = useState(false);
+  const [destinationSetupError, setDestinationSetupError] = useState<string | null>(null);
+
+  const handleSetupChannels = async () => {
+    setIsSettingUpDestinations(true);
+    setDestinationSetupError(null);
+    try {
+      if (onSetupDestinations) {
+        await onSetupDestinations();
+      } else {
+        await TelegramBridgeService.setupChannels();
+        onResyncChannels?.();
+      }
+    } catch (err: any) {
+      setDestinationSetupError(err?.message || 'Failed to set up backup channels in Telegram.');
+    } finally {
+      setIsSettingUpDestinations(false);
+    }
+  };
 
   // Encryption Choice Modal State (Option A vs Option B)
   const [showChoiceModal, setShowChoiceModal] = useState(false);
@@ -381,12 +404,36 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           </View>
 
           {/* Telegram Destination Channels Info */}
-          {channels && (
-            <>
-              <View style={styles.divider} />
-              <View style={styles.channelsContainer}>
-                <Text style={styles.channelsHeader}>Cloud Storage Destinations</Text>
+          <View style={styles.divider} />
+          <View style={styles.channelsContainer}>
+            <Text style={styles.channelsHeader}>Cloud Storage Destinations</Text>
 
+            {(!channels || !channels.verified || channels.photoStatus?.state === 'NEEDS_SETUP' || channels.videoStatus?.state === 'NEEDS_SETUP') && (
+              <View style={styles.setupDestCard} testID="setup-destinations-card">
+                <Text style={styles.setupDestTitle}>Destinations Need Setup</Text>
+                <Text style={styles.setupDestDesc}>
+                  Private Telegram channels are required to back up your photos and videos.
+                </Text>
+                {destinationSetupError ? (
+                  <Text style={styles.errorText}>⚠ {destinationSetupError}</Text>
+                ) : null}
+                <TouchableOpacity
+                  style={styles.setupDestBtn}
+                  disabled={isSettingUpDestinations}
+                  onPress={handleSetupChannels}
+                  testID="setup-channels-btn"
+                >
+                  {isSettingUpDestinations ? (
+                    <ActivityIndicator size="small" color="#ffffff" />
+                  ) : (
+                    <Text style={styles.setupDestBtnText}>Set up Backup Channels</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {channels && (
+              <>
                 {/* Photo Channel Row */}
                 <View style={styles.channelRow}>
                   <View style={styles.channelTextCol}>
@@ -478,22 +525,22 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                     </Text>
                   </View>
                 )}
+              </>
+            )}
 
-                {/* Sync Now Action (Purely Read-Only) */}
-                {onResyncChannels && (
-                  <TouchableOpacity
-                    style={styles.resyncChannelsBtn}
-                    onPress={onResyncChannels}
-                    testID="sync-destinations-btn"
-                  >
-                    <Text style={styles.resyncChannelsBtnText}>
-                      ↻ Sync now (Validate Destinations)
-                    </Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </>
-          )}
+            {/* Sync Now Action (Purely Read-Only) */}
+            {onResyncChannels && (
+              <TouchableOpacity
+                style={styles.resyncChannelsBtn}
+                onPress={onResyncChannels}
+                testID="sync-destinations-btn"
+              >
+                <Text style={styles.resyncChannelsBtnText}>
+                  ↻ Sync now (Validate Destinations)
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
 
           <View style={styles.divider} />
 
@@ -1487,5 +1534,37 @@ const styles = StyleSheet.create({
     color: '#34d399',
     fontSize: 12,
     fontWeight: '600',
+  },
+  setupDestCard: {
+    backgroundColor: '#111814',
+    borderWidth: 1,
+    borderColor: '#243029',
+    borderRadius: 8,
+    padding: 14,
+    marginBottom: 12,
+  },
+  setupDestTitle: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  setupDestDesc: {
+    color: '#9ca3af',
+    fontSize: 12,
+    lineHeight: 16,
+    marginBottom: 12,
+  },
+  setupDestBtn: {
+    backgroundColor: '#10b981',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    alignSelf: 'flex-start',
+  },
+  setupDestBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

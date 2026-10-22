@@ -153,14 +153,10 @@ export const InAppVideoPlayer: React.FC<InAppVideoPlayerProps> = ({
   return (
     <View style={styles.container} testID={testID}>
       {/* 1. Native Video Player View (or Test Surface) */}
-      <TouchableOpacity
-        activeOpacity={1}
-        style={styles.videoSurface}
-        onPress={() => setShowControls(prev => !prev)}
-      >
+      <View style={styles.videoSurface}>
         {NativeInAppVideoView ? (
           <NativeInAppVideoView
-            style={StyleSheet.absoluteFill}
+            style={styles.nativeVideo}
             sourceUrl={sourceUri}
             playWhenReady={isPlaying}
             seekToMs={seekToTarget ?? -1}
@@ -176,7 +172,14 @@ export const InAppVideoPlayer: React.FC<InAppVideoPlayerProps> = ({
             </Text>
           </View>
         )}
-      </TouchableOpacity>
+      </View>
+
+      {/* Tap surface to toggle controls overlay */}
+      <TouchableOpacity
+        activeOpacity={1}
+        style={styles.tapSurface}
+        onPress={() => setShowControls(prev => !prev)}
+      />
 
       {/* 2. Loading Spinner Overlay */}
       {playbackState === 'loading' && (
@@ -288,6 +291,17 @@ const styles = StyleSheet.create({
     height: '100%',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  nativeVideo: {
+    width: '100%',
+    height: '100%',
+  },
+  tapSurface: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
   },
   fallbackSurface: {
     flex: 1,

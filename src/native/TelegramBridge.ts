@@ -109,6 +109,16 @@ const fallbackMock: TelegramBridgeNativeModule = {
     videoChannelId: '-1001234567891',
     videoChannelTitle: 'Backup - Videos',
     verified: true,
+    photoStatus: {
+      channelId: '-1001234567890',
+      title: 'Backup - Photos',
+      state: 'CONNECTED',
+    },
+    videoStatus: {
+      channelId: '-1001234567891',
+      title: 'Backup - Videos',
+      state: 'CONNECTED',
+    },
   }),
   refreshDestinations: async () => ({
     photoChannelId: '-1001234567890',
@@ -116,6 +126,16 @@ const fallbackMock: TelegramBridgeNativeModule = {
     videoChannelId: '-1001234567891',
     videoChannelTitle: 'Backup - Videos',
     verified: true,
+    photoStatus: {
+      channelId: '-1001234567890',
+      title: 'Backup - Photos',
+      state: 'CONNECTED',
+    },
+    videoStatus: {
+      channelId: '-1001234567891',
+      title: 'Backup - Videos',
+      state: 'CONNECTED',
+    },
   }),
   createDestination: async (type: string) => ({
     channelId: type === 'photo' ? '-1001234567890' : '-1001234567891',

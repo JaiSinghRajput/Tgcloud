@@ -98,6 +98,7 @@ export interface CloudGalleryScreenProps {
   onResyncChannels?: () => void;
   onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
   onRecreateDestination?: (type: 'photo' | 'video') => Promise<void>;
+  onSetupDestinations?: () => Promise<void>;
   syncFreshnessState?: 'synced' | 'syncing' | 'offline' | 'error';
 }
 
@@ -123,6 +124,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   onResyncChannels,
   onUnlockPassphrase,
   onRecreateDestination,
+  onSetupDestinations,
   syncFreshnessState = 'synced',
 }) => {
   // Navigation View: 'device' (Local Gallery) or 'cloud' (Telegram Cloud Backups)
@@ -143,6 +145,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [previewItem, setPreviewItem] = useState<
     DiscoveredMediaItem | CloudMediaItem | null
   >(null);
+  const [showViewerControls, setShowViewerControls] = useState<boolean>(true);
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadingMsg, setVideoLoadingMsg] = useState<string>('');
   const [playableVideoUri, setPlayableVideoUri] = useState<string>('');
@@ -284,15 +287,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-  };
-
-  const formatDate = (ms: number): string => {
-    if (!ms) return 'Unknown date';
-    return new Date(ms).toLocaleDateString([], {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
   };
 
   // Backed-up ID set for fast status lookups
@@ -966,14 +960,30 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       ) : filteredCloudItems.length === 0 ? (
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyIcon}>☁️</Text>
-          <Text style={styles.emptyTitle}>No Cloud Backups Found</Text>
-          <Text style={styles.emptySubtitle}>
-            Select photos in Device Media and tap Backup Selected to begin backing up to Telegram.
-          </Text>
-          {onResyncChannels && (
-            <TouchableOpacity style={styles.resyncBtn} onPress={onResyncChannels}>
-              <Text style={styles.resyncBtnText}>↻ Resync Telegram Channels</Text>
-            </TouchableOpacity>
+          {(!channels || !channels.verified || channels.photoStatus?.state === 'NEEDS_SETUP' || channels.videoStatus?.state === 'NEEDS_SETUP') ? (
+            <>
+              <Text style={styles.emptyTitle}>Destinations Need Setup</Text>
+              <Text style={styles.emptySubtitle}>
+                Private Telegram channels are required to store your cloud backups.
+              </Text>
+              {onSetupDestinations && (
+                <TouchableOpacity style={styles.resyncBtn} onPress={onSetupDestinations} testID="gallery-setup-destinations-btn">
+                  <Text style={styles.resyncBtnText}>Set up Backup Channels</Text>
+                </TouchableOpacity>
+              )}
+            </>
+          ) : (
+            <>
+              <Text style={styles.emptyTitle}>No Cloud Backups Found</Text>
+              <Text style={styles.emptySubtitle}>
+                Select photos in Device Media and tap Backup Selected to begin backing up to Telegram.
+              </Text>
+              {onResyncChannels && (
+                <TouchableOpacity style={styles.resyncBtn} onPress={onResyncChannels}>
+                  <Text style={styles.resyncBtnText}>↻ Resync Telegram Channels</Text>
+                </TouchableOpacity>
+              )}
+            </>
           )}
         </View>
       ) : (
@@ -1044,7 +1054,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         </View>
       )}
 
-      {/* 7. Full-Screen Photo / Video Viewer Modal */}
+      {/* 7. Redesigned Immersive Gallery Viewer Modal */}
       {previewItem && (
         <Modal
           visible={true}
@@ -1053,34 +1063,26 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           onRequestClose={handleCloseViewer}
         >
           <View style={styles.viewerContainer}>
-            {/* Viewer Top Bar with Safe Area Padding */}
-            <View
-              style={[
-                styles.viewerTopBar,
-                {
-                  paddingTop: Math.max(insets.top, 16),
-                  paddingLeft: Math.max(insets.left, 16),
-                  paddingRight: Math.max(insets.right, 16),
-                },
-              ]}
-            >
+            {/* Minimal Floating Close Button */}
+            {showViewerControls && (
               <TouchableOpacity
-                style={styles.viewerCloseBtn}
+                style={[
+                  styles.viewerFloatingCloseBtn,
+                  {
+                    top: Math.max(insets.top, 16),
+                    left: Math.max(insets.left, 16),
+                  },
+                ]}
                 onPress={handleCloseViewer}
                 hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                 accessibilityLabel="Close media viewer"
+                testID="viewer-close-btn"
               >
-                <Text style={styles.viewerCloseBtnText}>✕ Close</Text>
+                <Text style={styles.viewerFloatingCloseText}>✕</Text>
               </TouchableOpacity>
-              <Text style={styles.viewerTitle} numberOfLines={1}>
-                {'displayName' in previewItem
-                  ? previewItem.displayName
-                  : previewItem.originalName}
-              </Text>
-              <View style={styles.viewerSpacer} />
-            </View>
+            )}
 
-            {/* Viewer Content Area */}
+            {/* Immersive Viewer Content Area */}
             <View style={styles.viewerImageArea}>
               {previewItem.mediaType === 'video' ? (
                 playableVideoUri ? (
@@ -1095,7 +1097,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                   <View style={styles.videoPreparingContainer}>
                     <ActivityIndicator size="large" color="#34d399" />
                     <Text style={styles.videoPreparingText}>
-                      {videoLoadingMsg || 'Preparing in-app video...'}
+                      {videoLoadingMsg || 'Preparing video...'}
                     </Text>
                     {videoError && (
                       <View style={styles.videoPlayerErrorBox}>
@@ -1107,7 +1109,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                           onPress={handleRetryVideoPreparation}
                         >
                           <Text style={styles.retryPrepBtnText}>
-                            ↻ Retry Preparation
+                            ↻ Retry
                           </Text>
                         </TouchableOpacity>
                       </View>
@@ -1115,80 +1117,51 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                   </View>
                 )
               ) : (
-                'sourceKey' in previewItem && previewItem.sourceKey ? (
-                  <Image
-                    source={{ uri: previewItem.sourceKey }}
-                    style={styles.fullImage}
-                    resizeMode="contain"
-                    accessibilityLabel="Full screen image preview"
-                    testID="full-viewer-image"
-                  />
-                ) : (
-                  <View style={styles.viewerPlaceholder}>
-                    <Text style={styles.viewerPlaceholderIcon}>🖼</Text>
-                    <Text style={styles.viewerPlaceholderText}>
-                      {'displayName' in previewItem
-                        ? previewItem.displayName
-                        : previewItem.originalName}
-                    </Text>
-                  </View>
-                )
+                <TouchableOpacity
+                  activeOpacity={1}
+                  style={styles.photoSurface}
+                  onPress={() => setShowViewerControls(prev => !prev)}
+                >
+                  {'sourceKey' in previewItem && previewItem.sourceKey ? (
+                    <Image
+                      source={{ uri: previewItem.sourceKey }}
+                      style={styles.fullImage}
+                      resizeMode="contain"
+                      accessibilityLabel="Full screen image preview"
+                      testID="full-viewer-image"
+                    />
+                  ) : (
+                    <View style={styles.viewerPlaceholder}>
+                      <Text style={styles.viewerPlaceholderIcon}>
+                        {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked
+                          ? '🔒'
+                          : '🖼'}
+                      </Text>
+                      <Text style={styles.viewerPlaceholderText}>
+                        {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked
+                          ? 'Encrypted Photo (Locked)'
+                          : 'displayName' in previewItem
+                          ? previewItem.displayName
+                          : previewItem.originalName}
+                      </Text>
+                      {'isEncrypted' in previewItem && previewItem.isEncrypted && !isUnlocked && (
+                        <TouchableOpacity
+                          style={styles.unlockInViewerBtn}
+                          onPress={() => {
+                            setPassphraseInput('');
+                            setUnlockError(null);
+                            setShowUnlockModal(true);
+                          }}
+                        >
+                          <Text style={styles.unlockInViewerBtnText}>
+                            🔓 Unlock Media
+                          </Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  )}
+                </TouchableOpacity>
               )}
-            </View>
-
-            {/* Viewer Details & Bottom Actions with Safe Area Insets */}
-            <View
-              style={[
-                styles.viewerBottomBar,
-                {
-                  paddingBottom: Math.max(insets.bottom, 16),
-                  paddingLeft: Math.max(insets.left, 16),
-                  paddingRight: Math.max(insets.right, 16),
-                },
-              ]}
-            >
-              <View style={styles.viewerMetaRow}>
-                <Text style={styles.viewerMetaText}>
-                  {formatBytes(previewItem.sizeBytes)} ·{' '}
-                  {formatDate(previewItem.modifiedAtMs)}
-                </Text>
-                <Text style={styles.viewerStatusHighlight}>
-                  {backedUpIdSet.has(previewItem.id)
-                    ? '✓ Backed Up'
-                    : 'Local Device Media'}
-                </Text>
-              </View>
-
-              <View style={styles.viewerActionsRow}>
-                {!backedUpIdSet.has(previewItem.id) && onConfirmBackup && (
-                  <TouchableOpacity
-                    style={styles.viewerPrimaryBtn}
-                    onPress={() => {
-                      const id = previewItem.id;
-                      handleCloseViewer();
-                      onConfirmBackup([id]);
-                    }}
-                  >
-                    <Text style={styles.viewerPrimaryBtnText}>
-                      Backup to Telegram
-                    </Text>
-                  </TouchableOpacity>
-                )}
-
-                {'messageId' in previewItem && (
-                  <TouchableOpacity
-                    style={styles.viewerRestoreBtn}
-                    onPress={() => {
-                      setRestoreModalItem(previewItem as CloudMediaItem);
-                      handleCloseViewer();
-                    }}
-                  >
-                    <Text style={styles.viewerRestoreBtnText}>
-                      Restore to Photos
-                    </Text>
-                  </TouchableOpacity>
-                )}
-              </View>
             </View>
           </View>
         </Modal>
@@ -1874,16 +1847,22 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000000',
   },
-  viewerTopBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 16,
-    paddingBottom: 10,
-  },
-  viewerSpacer: {
+  viewerFloatingCloseBtn: {
+    position: 'absolute',
+    zIndex: 50,
+    backgroundColor: 'rgba(20, 20, 20, 0.75)',
     width: 40,
+    height: 40,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  viewerFloatingCloseText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
   },
   viewerCloseBtn: {
     padding: 6,
@@ -1893,19 +1872,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '700',
   },
-  viewerTitle: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-    flex: 1,
-    textAlign: 'center',
-    marginHorizontal: 10,
-  },
   viewerImageArea: {
     flex: 1,
+    backgroundColor: '#000000',
     alignItems: 'center',
     justifyContent: 'center',
-    position: 'relative',
+  },
+  photoSurface: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   fullImage: {
     width: '100%',
@@ -1925,58 +1903,48 @@ const styles = StyleSheet.create({
     maxWidth: '80%',
     textAlign: 'center',
   },
-  videoControlsOverlay: {
-    position: 'absolute',
-    bottom: 24,
-    left: 20,
-    right: 20,
-    alignItems: 'center',
+  unlockInViewerBtn: {
+    marginTop: 16,
+    backgroundColor: '#10b981',
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 8,
   },
-  videoPlayOverlayBtn: {
-    backgroundColor: 'rgba(16, 185, 129, 0.95)',
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    borderRadius: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  videoPlayingBtn: {
-    backgroundColor: 'rgba(239, 68, 68, 0.9)',
-  },
-  videoLoadingBtn: {
-    backgroundColor: 'rgba(55, 65, 81, 0.85)',
-  },
-  videoPlayOverlayText: {
+  unlockInViewerBtnText: {
     color: '#ffffff',
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '700',
   },
-  videoPlayerStatusBox: {
-    flexDirection: 'row',
+  videoPreparingContainer: {
     alignItems: 'center',
-    gap: 8,
-    backgroundColor: 'rgba(18, 26, 21, 0.9)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 16,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#34d399',
+    justifyContent: 'center',
+    padding: 24,
   },
-  videoPlayerStatusText: {
+  videoPreparingText: {
     color: '#34d399',
     fontSize: 13,
     fontWeight: '600',
+    marginTop: 12,
+  },
+  retryPrepBtn: {
+    backgroundColor: '#374151',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 6,
+    marginTop: 10,
+    alignSelf: 'center',
+  },
+  retryPrepBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
   },
   videoPlayerErrorBox: {
     backgroundColor: 'rgba(127, 29, 29, 0.9)',
     paddingHorizontal: 16,
     paddingVertical: 8,
     borderRadius: 16,
-    marginBottom: 12,
+    marginTop: 12,
     borderWidth: 1,
     borderColor: '#ef4444',
   },
@@ -1985,56 +1953,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
     textAlign: 'center',
-  },
-  viewerBottomBar: {
-    backgroundColor: '#0e1411',
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-    borderTopWidth: 1,
-    borderTopColor: '#1e2923',
-  },
-  viewerMetaRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  viewerMetaText: {
-    color: '#9ca3af',
-    fontSize: 13,
-  },
-  viewerStatusHighlight: {
-    color: '#34d399',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  viewerActionsRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  viewerPrimaryBtn: {
-    flex: 1,
-    backgroundColor: '#10b981',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  viewerPrimaryBtnText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  viewerRestoreBtn: {
-    flex: 1,
-    backgroundColor: '#2563eb',
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  viewerRestoreBtnText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
   },
   modalBackdrop: {
     flex: 1,
@@ -2253,30 +2171,6 @@ const styles = StyleSheet.create({
   recreateDestBtnText: {
     color: '#ffffff',
     fontSize: 11,
-    fontWeight: '700',
-  },
-  videoPreparingContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-  },
-  videoPreparingText: {
-    color: '#34d399',
-    fontSize: 13,
-    fontWeight: '600',
-    marginTop: 12,
-  },
-  retryPrepBtn: {
-    backgroundColor: '#374151',
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 6,
-    marginTop: 10,
-    alignSelf: 'center',
-  },
-  retryPrepBtnText: {
-    color: '#ffffff',
-    fontSize: 12,
     fontWeight: '700',
   },
   recreateModalCard: {

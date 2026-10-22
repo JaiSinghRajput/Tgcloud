@@ -250,7 +250,12 @@ class TelegramChannelManager(
      * Protected by mutex to prevent concurrent duplicate creation.
      */
     suspend fun getOrCreateBackupChannels(userId: Long = 0): TelegramBackupChannels = channelMutex.withLock {
-        // 1. Try to discover existing channels without creating
+        val authState = tdLibService.authState.value
+        if (authState !is TelegramAuthState.Ready) {
+            throw IllegalStateException("Telegram authentication required before channel setup.")
+        }
+
+        // 1. Try to discover existing channels without creating duplicates
         val savedPhotoId = getPersistedChannelId("photo_channel_id", userId)
         val savedVideoId = getPersistedChannelId("video_channel_id", userId)
 
@@ -279,14 +284,19 @@ class TelegramChannelManager(
             persistChannelId("video_channel_id", videoChannel.id, userId)
         }
 
-        val verified = verifyChannelAccess(photoChannel.id) && verifyChannelAccess(videoChannel.id)
+        val photoStatus = checkDestinationStatus(photoChannel.id, photoChannel.title)
+        val videoStatus = checkDestinationStatus(videoChannel.id, videoChannel.title)
+        val verified = photoStatus.state == DestinationLifecycleState.CONNECTED &&
+                       videoStatus.state == DestinationLifecycleState.CONNECTED
 
         return@withLock TelegramBackupChannels(
             photoChannelId = photoChannel.id,
             photoChannelTitle = photoChannel.title,
             videoChannelId = videoChannel.id,
             videoChannelTitle = videoChannel.title,
-            verified = verified
+            verified = verified,
+            photoStatus = photoStatus,
+            videoStatus = videoStatus
         )
     }
 

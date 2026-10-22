@@ -266,6 +266,26 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     putString("videoChannelId", channels.videoChannelId.toString())
                     putString("videoChannelTitle", channels.videoChannelTitle)
                     putBoolean("verified", channels.verified)
+
+                    if (channels.photoStatus != null) {
+                        val pMap = Arguments.createMap().apply {
+                            putString("channelId", channels.photoStatus.channelId.toString())
+                            putString("title", channels.photoStatus.title)
+                            putString("state", channels.photoStatus.state.name)
+                            putString("errorMessage", channels.photoStatus.errorMessage)
+                        }
+                        putMap("photoStatus", pMap)
+                    }
+
+                    if (channels.videoStatus != null) {
+                        val vMap = Arguments.createMap().apply {
+                            putString("channelId", channels.videoStatus.channelId.toString())
+                            putString("title", channels.videoStatus.title)
+                            putString("state", channels.videoStatus.state.name)
+                            putString("errorMessage", channels.videoStatus.errorMessage)
+                        }
+                        putMap("videoStatus", vMap)
+                    }
                 }
                 promise.resolve(map)
             } catch (e: Exception) {

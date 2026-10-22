@@ -126,16 +126,40 @@ export const MainApp: React.FC = () => {
   // Concurrency guard to prevent parallel channel synchronizations
   const isSyncingDestinationsRef = useRef(false);
 
-  // Synchronize Telegram Backup Channels (Read-Only) and Remote Cloud History
-  // CRITICAL: MUST NEVER CREATE A CHANNEL UNDER ANY CIRCUMSTANCES ON REFRESH!
+  // Synchronize Telegram Backup Channels and Remote Cloud History
+  // Refresh remains read-only; initial setup runs only when destinations are unconfigured
   const syncChannelsAndCloudHistory = useCallback(async () => {
     if (isSyncingDestinationsRef.current) return;
     isSyncingDestinationsRef.current = true;
     try {
-      const ch = await TelegramBridgeService.refreshDestinations();
+      let ch = await TelegramBridgeService.refreshDestinations();
       if (!ch) {
-        // Read-only discovery: zero channels created!
-        return;
+        // Read-only discovery returned no existing destinations.
+        // Run initial setup to discover existing destinations or create them without duplicates!
+        try {
+          ch = await TelegramBridgeService.setupChannels();
+        } catch (setupErr: any) {
+          setChannels({
+            photoChannelId: '0',
+            photoChannelTitle: 'Backup - Photos',
+            videoChannelId: '0',
+            videoChannelTitle: 'Backup - Videos',
+            verified: false,
+            photoStatus: {
+              channelId: '0',
+              title: 'Backup - Photos',
+              state: 'NEEDS_SETUP',
+              errorMessage: setupErr?.message || 'Destinations need setup',
+            },
+            videoStatus: {
+              channelId: '0',
+              title: 'Backup - Videos',
+              state: 'NEEDS_SETUP',
+              errorMessage: setupErr?.message || 'Destinations need setup',
+            },
+          });
+          return;
+        }
       }
       setChannels(ch);
 
@@ -380,6 +404,12 @@ export const MainApp: React.FC = () => {
     await TelegramBridgeService.recreateDestination(type);
     await syncChannelsAndCloudHistory();
   };
+
+  const handleSetupDestinations = useCallback(async () => {
+    const ch = await TelegramBridgeService.setupChannels();
+    setChannels(ch);
+    await syncChannelsAndCloudHistory();
+  }, [syncChannelsAndCloudHistory]);
 
   const handleConfirmBackup = async (selectedIds?: string[]) => {
     if (!isLoggedIn) return;
@@ -681,6 +711,7 @@ export const MainApp: React.FC = () => {
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
             onRecreateDestination={handleRecreateDestination}
+            onSetupDestinations={handleSetupDestinations}
           />
         )}
 
@@ -730,6 +761,7 @@ export const MainApp: React.FC = () => {
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
             onRecreateDestination={handleRecreateDestination}
+            onSetupDestinations={handleSetupDestinations}
           />
         )}
 

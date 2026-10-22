@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Gravity
 import android.widget.FrameLayout
 import android.widget.VideoView
@@ -19,19 +20,21 @@ import com.facebook.react.uimanager.SimpleViewManager
 import com.facebook.react.uimanager.ThemedReactContext
 import com.facebook.react.uimanager.annotations.ReactProp
 import com.facebook.react.uimanager.events.RCTEventEmitter
+import java.io.File
 
 /**
  * Container view hosting a native Android VideoView for in-app video playback.
- * Handles MediaPlayer lifecycle, progress reporting, seeking, audio focus, and cleanup.
+ * Handles MediaPlayer lifecycle, progress reporting, seeking, audio focus, layout measurement, and cleanup.
  */
 class InAppVideoContainerView(private val reactContext: ThemedReactContext) : FrameLayout(reactContext) {
 
+    private val tag = "InAppVideoView"
     private val videoView = VideoView(reactContext)
     private val handler = Handler(Looper.getMainLooper())
     private var progressRunnable: Runnable? = null
     private var audioManager: AudioManager? = null
     private var isPrepared = false
-    private var shouldPlayWhenReady = false
+    private var shouldPlayWhenReady = true
     private var lastUri: String? = null
 
     init {
@@ -39,6 +42,7 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
             gravity = Gravity.CENTER
         }
         videoView.layoutParams = params
+        videoView.setZOrderMediaOverlay(true)
         addView(videoView)
 
         audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -47,6 +51,7 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
             isPrepared = true
             mp.isLooping = false
             val duration = mp.duration
+            Log.d(tag, "MediaPlayer prepared: duration=${duration}ms, size=${mp.videoWidth}x${mp.videoHeight}")
             sendEvent("ready", duration, 0, null)
             if (shouldPlayWhenReady) {
                 requestAudioFocus()
@@ -57,20 +62,52 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
         }
 
         videoView.setOnCompletionListener {
+            Log.d(tag, "MediaPlayer playback completed")
             stopProgressTracker()
             sendEvent("ended", videoView.duration, videoView.duration, null)
         }
 
         videoView.setOnErrorListener { _, what, extra ->
+            Log.e(tag, "MediaPlayer error: what=$what, extra=$extra")
             stopProgressTracker()
             isPrepared = false
-            sendEvent("error", 0, 0, "Video playback error (code: $what, extra: $extra)")
+            val errorMsg = when (what) {
+                MediaPlayer.MEDIA_ERROR_UNKNOWN -> "Video playback error (Unknown error $extra)"
+                MediaPlayer.MEDIA_ERROR_SERVER_DIED -> "Media server died ($extra)"
+                else -> "Video playback error (code: $what, extra: $extra)"
+            }
+            sendEvent("error", 0, 0, errorMsg)
             true
         }
     }
 
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        val w = right - left
+        val h = bottom - top
+        videoView.measure(
+            MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY)
+        )
+        videoView.layout(0, 0, w, h)
+    }
+
+    override fun requestLayout() {
+        super.requestLayout()
+        post(measureAndLayoutRunnable)
+    }
+
+    private val measureAndLayoutRunnable = Runnable {
+        measure(
+            MeasureSpec.makeMeasureSpec(width, MeasureSpec.EXACTLY),
+            MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY)
+        )
+        layout(left, top, right, bottom)
+    }
+
     fun setSource(uriString: String?) {
         if (uriString.isNullOrEmpty()) {
+            Log.d(tag, "setSource: empty uri, releasing player")
             releasePlayer()
             return
         }
@@ -82,9 +119,25 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) : Fr
         sendEvent("loading", 0, 0, null)
 
         try {
-            val uri = Uri.parse(uriString)
+            val uri = if (uriString.startsWith("/") && !uriString.startsWith("content://") && !uriString.startsWith("file://")) {
+                Uri.fromFile(File(uriString))
+            } else {
+                Uri.parse(uriString)
+            }
+
+            Log.d(tag, "setSource: uri=$uri, scheme=${uri.scheme}")
+            if (uri.scheme == "file") {
+                val f = File(uri.path ?: "")
+                Log.d(tag, "setSource: file path=${f.absolutePath}, exists=${f.exists()}, sizeBytes=${if (f.exists()) f.length() else -1}")
+                if (!f.exists() || f.length() == 0L) {
+                    sendEvent("error", 0, 0, "Video media file not found or empty (${f.name})")
+                    return
+                }
+            }
+
             videoView.setVideoURI(uri)
         } catch (e: Exception) {
+            Log.e(tag, "setSource failed: ${e.message}", e)
             sendEvent("error", 0, 0, "Failed to load video source: ${e.message}")
         }
     }
