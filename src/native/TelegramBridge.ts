@@ -33,6 +33,7 @@ interface TelegramBridgeNativeModule {
   setupChannels(): Promise<TelegramBackupChannels>;
   refreshDestinations(): Promise<TelegramBackupChannels | null>;
   createDestination(destinationType: string): Promise<{ channelId: string; title: string }>;
+  recreateDestination(destinationType: string): Promise<{ channelId: string; title: string }>;
   reconnectDestination(channelId: string): Promise<boolean>;
   runPocTest(): Promise<PocSuiteResult>;
   getChannelHistory(
@@ -118,6 +119,10 @@ const fallbackMock: TelegramBridgeNativeModule = {
   }),
   createDestination: async (type: string) => ({
     channelId: type === 'photo' ? '-1001234567890' : '-1001234567891',
+    title: type === 'photo' ? 'Backup - Photos' : 'Backup - Videos',
+  }),
+  recreateDestination: async (type: string) => ({
+    channelId: type === 'photo' ? '-1001234567898' : '-1001234567899',
     title: type === 'photo' ? 'Backup - Photos' : 'Backup - Videos',
   }),
   reconnectDestination: async () => true,
@@ -262,6 +267,8 @@ export const TelegramBridgeService = {
   refreshDestinations: () => nativeModule.refreshDestinations(),
   createDestination: (type: 'photo' | 'video') =>
     nativeModule.createDestination(type),
+  recreateDestination: (type: 'photo' | 'video') =>
+    nativeModule.recreateDestination(type),
   reconnectDestination: (channelId: string) =>
     nativeModule.reconnectDestination(channelId),
   runPocTest: () => nativeModule.runPocTest(),

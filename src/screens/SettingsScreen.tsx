@@ -16,12 +16,14 @@ import {
   initializeEncryptionSetupAsync,
   SessionKeyStore,
   verifyRecoveryKeyAsync,
+  setupExistingKeyAsync,
 } from '../domain/crypto/encryptionService';
 import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
 import { MediaPermissionStatus } from '../domain/permissions/permissionService';
 import { TelegramBackupChannels } from '../types/telegram';
-import { RecoveryKeySetup } from '../types/encryption';
+import { EncryptionSetupState, RecoveryKeySetup } from '../types/encryption';
+import { TelegramBridgeService } from '../native/TelegramBridge';
 
 interface SettingsScreenProps {
   networkPolicy: NetworkPolicy;
@@ -42,6 +44,7 @@ interface SettingsScreenProps {
   onOpenChannelInTelegram?: (channelId: string) => void;
   onResyncChannels?: () => void;
   onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
+  onRecreateDestination?: (type: 'photo' | 'video') => Promise<void>;
 }
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({
@@ -63,10 +66,21 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onOpenChannelInTelegram,
   onResyncChannels,
   onUnlockPassphrase,
+  onRecreateDestination,
 }) => {
   const isWifiOnly = networkPolicy === NetworkPolicy.WIFI_ONLY;
 
-  // Encryption setup modal state
+  // Encryption Choice Modal State (Option A vs Option B)
+  const [showChoiceModal, setShowChoiceModal] = useState(false);
+
+  // Option A: Import Existing Key State
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importKeyInput, setImportKeyInput] = useState('');
+  const [importKeyError, setImportKeyError] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [_keySetupState, setKeySetupState] = useState<EncryptionSetupState>('DISABLED');
+
+  // Option B: Generate New Key State
   const [showSetupModal, setShowSetupModal] = useState(false);
   const [generatedKey, setGeneratedKey] = useState('');
   const [activeSetup, setActiveSetup] = useState<RecoveryKeySetup | null>(null);
@@ -81,11 +95,17 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [isVerifying, setIsVerifying] = useState(false);
 
+  // Deleted Channel Recreation State
+  const [showRecreateModal, setShowRecreateModal] = useState(false);
+  const [recreateTarget, setRecreateTarget] = useState<'photo' | 'video' | null>(null);
+  const [isRecreating, setIsRecreating] = useState(false);
+  const [recreateError, setRecreateError] = useState<string | null>(null);
+
   const isUnlocked = SessionKeyStore.isUnlocked();
 
   const handleToggleEncryption = async (newValue: boolean) => {
     if (newValue && !encryptionEnabled) {
-      // Rule 4 & 5: Never replace an existing encryption key automatically!
+      // If already configured, prompt to unlock rather than replace
       const existingConfig = SessionKeyStore.getConfig();
       if (existingConfig && existingConfig.verificationToken) {
         if (SessionKeyStore.isUnlocked()) {
@@ -96,25 +116,101 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         return;
       }
 
-      setSetupError(null);
-      setCopySuccess('');
-      setSavePhotoSuccess('');
-      setHasConfirmedSaved(false);
-
-      try {
-        const setup = await initializeEncryptionSetupAsync();
-        setActiveSetup(setup);
-        setGeneratedKey(setup.recoveryKey);
-        setShowSetupModal(true);
-      } catch (err: any) {
-        const userMsg = err?.message?.includes('Buffer')
-          ? 'Memory buffer initialization error. Please update app.'
-          : err?.message || 'Failed to initialize client-side encryption. Please try again.';
-        setSetupError(userMsg);
-      }
+      // Present Option A ("I already have a key") or Option B ("I don't have a key")
+      setShowChoiceModal(true);
     } else {
       SessionKeyStore.clear();
       onToggleEncryption(false);
+    }
+  };
+
+  const handleSelectOptionA = () => {
+    setShowChoiceModal(false);
+    setImportKeyInput('');
+    setImportKeyError(null);
+    setKeySetupState('DISABLED');
+    setShowImportModal(true);
+  };
+
+  const handleSelectOptionB = async () => {
+    setShowChoiceModal(false);
+    setSetupError(null);
+    setCopySuccess('');
+    setSavePhotoSuccess('');
+    setHasConfirmedSaved(false);
+
+    try {
+      const setup = await initializeEncryptionSetupAsync();
+      setActiveSetup(setup);
+      setGeneratedKey(setup.recoveryKey);
+      setKeySetupState('ENABLED_LOCKED');
+      setShowSetupModal(true);
+    } catch (err: any) {
+      const userMsg = err?.message?.includes('Buffer')
+        ? 'Memory buffer initialization error. Please update app.'
+        : err?.message || 'Failed to initialize client-side encryption. Please try again.';
+      setSetupError(userMsg);
+    }
+  };
+
+  const handleImportKeySubmit = async () => {
+    const raw = importKeyInput.trim();
+    if (!raw) {
+      setImportKeyError('Please enter your recovery passphrase or 64-character hex key.');
+      return;
+    }
+
+    setKeySetupState('VALIDATING');
+    setIsImporting(true);
+    setImportKeyError(null);
+
+    try {
+      const existingConfig = SessionKeyStore.getConfig();
+      const result = await setupExistingKeyAsync(raw, existingConfig);
+
+      if (!result.valid || !result.setup) {
+        setKeySetupState(result.state);
+        setImportKeyError(result.errorMessage || 'Key verification failed.');
+        return;
+      }
+
+      const masterKey = Buffer.from(result.setup.masterKeyHex, 'hex');
+      SessionKeyStore.setSessionKey(masterKey, result.setup.recoveryKey, result.setup.config);
+      onToggleEncryption(true, result.setup);
+      setKeySetupState('ENABLED_UNLOCKED');
+      setShowImportModal(false);
+    } catch (err: any) {
+      setKeySetupState('INVALID_KEY');
+      setImportKeyError(err?.message || 'Failed to validate key.');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handlePromptRecreate = (type: 'photo' | 'video') => {
+    setRecreateTarget(type);
+    setRecreateError(null);
+    setShowRecreateModal(true);
+  };
+
+  const handleConfirmRecreate = async () => {
+    if (!recreateTarget) return;
+    setIsRecreating(true);
+    setRecreateError(null);
+
+    try {
+      if (onRecreateDestination) {
+        await onRecreateDestination(recreateTarget);
+      } else {
+        await TelegramBridgeService.recreateDestination(recreateTarget);
+        onResyncChannels?.();
+      }
+      setShowRecreateModal(false);
+      setRecreateTarget(null);
+    } catch (err: any) {
+      setRecreateError(err?.message || 'Failed to recreate destination channel.');
+    } finally {
+      setIsRecreating(false);
     }
   };
 
@@ -291,47 +387,107 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               <View style={styles.channelsContainer}>
                 <Text style={styles.channelsHeader}>Cloud Storage Destinations</Text>
 
+                {/* Photo Channel Row */}
                 <View style={styles.channelRow}>
                   <View style={styles.channelTextCol}>
                     <Text style={styles.channelName}>
                       📷 {channels.photoChannelTitle || 'Backup - Photos'}
                     </Text>
-                    <Text style={styles.channelStatus}>
-                      Channel ID: {channels.photoChannelId} · {channels.verified ? '✓ Verified' : 'Connecting'}
+                    <Text
+                      style={[
+                        styles.channelStatus,
+                        channels.photoStatus?.state === 'DELETED' && styles.statusDeleted,
+                        channels.photoStatus?.state === 'ACCESS_REVOKED' && styles.statusRevoked,
+                      ]}
+                      testID="photo-channel-status"
+                    >
+                      {channels.photoStatus?.state === 'DELETED'
+                        ? '⚠ Channel Deleted in Telegram'
+                        : channels.photoStatus?.state === 'ACCESS_REVOKED'
+                        ? '⚠ Access Revoked / Missing Permissions'
+                        : channels.photoStatus?.state === 'UNREACHABLE'
+                        ? '⚡ Temporarily Unreachable'
+                        : `Channel ID: ${channels.photoChannelId} · ${channels.verified ? '✓ Verified' : 'Connecting'}`}
                     </Text>
                   </View>
-                  <TouchableOpacity
-                    style={styles.channelTgBtn}
-                    onPress={() => onOpenChannelInTelegram?.(channels.photoChannelId)}
-                  >
-                    <Text style={styles.channelTgBtnText}>Open ↗</Text>
-                  </TouchableOpacity>
+                  {channels.photoStatus?.state === 'DELETED' ? (
+                    <TouchableOpacity
+                      style={styles.recreateChannelBtn}
+                      onPress={() => handlePromptRecreate('photo')}
+                      testID="recreate-photo-btn"
+                    >
+                      <Text style={styles.recreateChannelBtnText}>Recreate</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity
+                      style={styles.channelTgBtn}
+                      onPress={() => onOpenChannelInTelegram?.(channels.photoChannelId)}
+                    >
+                      <Text style={styles.channelTgBtnText}>Open ↗</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
 
+                {/* Video Channel Row */}
                 <View style={styles.channelRow}>
                   <View style={styles.channelTextCol}>
                     <Text style={styles.channelName}>
                       🎬 {channels.videoChannelTitle || 'Backup - Videos'}
                     </Text>
-                    <Text style={styles.channelStatus}>
-                      Channel ID: {channels.videoChannelId} · {channels.verified ? '✓ Verified' : 'Connecting'}
+                    <Text
+                      style={[
+                        styles.channelStatus,
+                        channels.videoStatus?.state === 'DELETED' && styles.statusDeleted,
+                        channels.videoStatus?.state === 'ACCESS_REVOKED' && styles.statusRevoked,
+                      ]}
+                      testID="video-channel-status"
+                    >
+                      {channels.videoStatus?.state === 'DELETED'
+                        ? '⚠ Channel Deleted in Telegram'
+                        : channels.videoStatus?.state === 'ACCESS_REVOKED'
+                        ? '⚠ Access Revoked / Missing Permissions'
+                        : channels.videoStatus?.state === 'UNREACHABLE'
+                        ? '⚡ Temporarily Unreachable'
+                        : `Channel ID: ${channels.videoChannelId} · ${channels.verified ? '✓ Verified' : 'Connecting'}`}
                     </Text>
                   </View>
-                  <TouchableOpacity
-                    style={styles.channelTgBtn}
-                    onPress={() => onOpenChannelInTelegram?.(channels.videoChannelId)}
-                  >
-                    <Text style={styles.channelTgBtnText}>Open ↗</Text>
-                  </TouchableOpacity>
+                  {channels.videoStatus?.state === 'DELETED' ? (
+                    <TouchableOpacity
+                      style={styles.recreateChannelBtn}
+                      onPress={() => handlePromptRecreate('video')}
+                      testID="recreate-video-btn"
+                    >
+                      <Text style={styles.recreateChannelBtnText}>Recreate</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity
+                      style={styles.channelTgBtn}
+                      onPress={() => onOpenChannelInTelegram?.(channels.videoChannelId)}
+                    >
+                      <Text style={styles.channelTgBtnText}>Open ↗</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
 
+                {/* Deleted channel recovery notice if either channel is deleted */}
+                {(channels.photoStatus?.state === 'DELETED' || channels.videoStatus?.state === 'DELETED') && (
+                  <View style={styles.deletedChannelAlert}>
+                    <Text style={styles.deletedChannelAlertTitle}>⚠ Destination Channel Deleted</Text>
+                    <Text style={styles.deletedChannelAlertText}>
+                      A backup channel was deleted from Telegram. Tap Recreate to establish a new private channel for future backups. Recreating does not restore media from the deleted channel.
+                    </Text>
+                  </View>
+                )}
+
+                {/* Sync Now Action (Purely Read-Only) */}
                 {onResyncChannels && (
                   <TouchableOpacity
                     style={styles.resyncChannelsBtn}
                     onPress={onResyncChannels}
+                    testID="sync-destinations-btn"
                   >
                     <Text style={styles.resyncChannelsBtnText}>
-                      ↻ Reconnect / Rediscover Destinations
+                      ↻ Sync now (Validate Destinations)
                     </Text>
                   </TouchableOpacity>
                 )}
@@ -411,6 +567,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               onValueChange={handleToggleEncryption}
               trackColor={{ false: '#243029', true: '#047857' }}
               thumbColor={encryptionEnabled ? '#34d399' : '#9ca3af'}
+              testID="encryption-switch"
             />
           </View>
 
@@ -498,7 +655,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <Text style={styles.keyLabel}>Your 12-Word Recovery Passphrase:</Text>
             <View style={styles.wordChipsGrid}>
               {generatedKey.split(' ').map((word, i) => (
-                <View key={i} style={styles.wordChip}>
+                <View key={i} style={styles.wordChip} testID={`word-chip-${i}`}>
                   <Text style={styles.wordChipIndex}>{i + 1}.</Text>
                   <Text style={styles.wordChipText} selectable={true}>{word}</Text>
                 </View>
@@ -527,6 +684,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <TouchableOpacity
               style={styles.checkboxRow}
               onPress={() => setHasConfirmedSaved(!hasConfirmedSaved)}
+              testID="save-acknowledgment-toggle"
             >
               <View style={[styles.checkbox, hasConfirmedSaved && styles.checkboxActive]}>
                 {hasConfirmedSaved && <Text style={styles.checkmark}>✓</Text>}
@@ -553,6 +711,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 ]}
                 disabled={!hasConfirmedSaved}
                 onPress={handleConfirmVerification}
+                testID="confirm-setup-btn"
               >
                 <Text style={styles.confirmBtnText}>Enable Encryption</Text>
               </TouchableOpacity>
@@ -606,6 +765,180 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                   <ActivityIndicator size="small" color="#ffffff" />
                 ) : (
                   <Text style={styles.confirmBtnText}>Unlock</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Choice Modal: Option A vs Option B */}
+      <Modal
+        visible={showChoiceModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowChoiceModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Enable Client-Side Encryption</Text>
+            <Text style={styles.modalDesc}>
+              Choose how you would like to set up your encryption key:
+            </Text>
+
+            {/* Option A: I already have a key */}
+            <TouchableOpacity
+              style={styles.optionCard}
+              onPress={handleSelectOptionA}
+              testID="option-have-key-btn"
+            >
+              <Text style={styles.optionCardIcon}>🔑</Text>
+              <View style={styles.optionCardTextCol}>
+                <Text style={styles.optionCardTitle}>Option A: I already have a key</Text>
+                <Text style={styles.optionCardSubtitle}>
+                  Enter or paste a 12-word recovery passphrase or 64-character hex key from another device.
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* Option B: Generate new key */}
+            <TouchableOpacity
+              style={styles.optionCard}
+              onPress={handleSelectOptionB}
+              testID="option-generate-key-btn"
+            >
+              <Text style={styles.optionCardIcon}>✨</Text>
+              <View style={styles.optionCardTextCol}>
+                <Text style={styles.optionCardTitle}>Option B: Generate a new key</Text>
+                <Text style={styles.optionCardSubtitle}>
+                  Create a new 12-word recovery passphrase on this device.
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => setShowChoiceModal(false)}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Option A: Import Existing Key Modal */}
+      <Modal
+        visible={showImportModal}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setShowImportModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Enter Existing Key</Text>
+            <Text style={styles.modalDesc}>
+              Enter or paste your 12-word recovery passphrase or 64-character hexadecimal key.
+            </Text>
+
+            <View style={styles.inputContainer}>
+              <TextInput
+                style={styles.unlockInput}
+                placeholder="Enter 12 words or 64-char hex key..."
+                placeholderTextColor="#6b7280"
+                value={importKeyInput}
+                onChangeText={setImportKeyInput}
+                multiline
+                numberOfLines={3}
+                autoCapitalize="none"
+                autoCorrect={false}
+                testID="import-key-input"
+              />
+              <TouchableOpacity
+                style={styles.pasteBtn}
+                onPress={async () => {
+                  const clip = await MediaScannerService.pasteFromClipboard();
+                  if (clip) setImportKeyInput(clip);
+                }}
+                testID="import-paste-btn"
+              >
+                <Text style={styles.pasteBtnText}>📋 Paste</Text>
+              </TouchableOpacity>
+            </View>
+
+            {importKeyError && (
+              <Text style={styles.errorText} testID="import-error-text">
+                {importKeyError}
+              </Text>
+            )}
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => setShowImportModal(false)}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmBtn}
+                disabled={isImporting}
+                onPress={handleImportKeySubmit}
+                testID="import-submit-btn"
+              >
+                {isImporting ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.confirmBtnText}>Import and Unlock</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Recreate Deleted Channel Confirmation Modal */}
+      <Modal
+        visible={showRecreateModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowRecreateModal(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>
+              Recreate {recreateTarget === 'photo' ? 'Photo' : 'Video'} Channel?
+            </Text>
+            <View style={styles.warningBox}>
+              <Text style={styles.warningTitle}>PERMANENT DATA NOTICE</Text>
+              <Text style={styles.warningText}>
+                The original backup channel was deleted from Telegram. Recreating it will create a new private channel in your Telegram account for future backups.
+                {'\n\n'}
+                Media previously stored in the deleted channel cannot be recovered from Telegram and may be permanently lost unless stored on your device.
+              </Text>
+            </View>
+
+            {recreateError && <Text style={styles.errorText}>{recreateError}</Text>}
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => setShowRecreateModal(false)}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.confirmDangerBtn}
+                disabled={isRecreating}
+                onPress={handleConfirmRecreate}
+                testID="confirm-recreate-channel-btn"
+              >
+                {isRecreating ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.confirmBtnText}>Confirm Recreate</Text>
                 )}
               </TouchableOpacity>
             </View>
@@ -1044,6 +1377,14 @@ const styles = StyleSheet.create({
   confirmBtnDisabled: {
     opacity: 0.5,
   },
+  confirmDangerBtn: {
+    backgroundColor: '#ef4444',
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   confirmBtnText: {
     color: '#ffffff',
     fontSize: 13,
@@ -1059,5 +1400,92 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlignVertical: 'top',
     marginBottom: 12,
+  },
+  statusDeleted: {
+    color: '#ef4444',
+    fontWeight: '700',
+  },
+  statusRevoked: {
+    color: '#f59e0b',
+    fontWeight: '700',
+  },
+  recreateChannelBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    alignSelf: 'center',
+  },
+  recreateChannelBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  deletedChannelAlert: {
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    borderColor: '#ef4444',
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  deletedChannelAlertTitle: {
+    color: '#ef4444',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  deletedChannelAlertText: {
+    color: '#fca5a5',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  optionCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#0a0f0d',
+    borderWidth: 1,
+    borderColor: '#243029',
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 12,
+  },
+  optionCardIcon: {
+    fontSize: 26,
+    marginRight: 12,
+  },
+  optionCardTextCol: {
+    flex: 1,
+  },
+  optionCardTitle: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  optionCardSubtitle: {
+    color: '#9ca3af',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  inputContainer: {
+    marginBottom: 12,
+  },
+  pasteBtn: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#16221c',
+    borderColor: '#34d399',
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    marginTop: -4,
+    marginBottom: 8,
+  },
+  pasteBtnText: {
+    color: '#34d399',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

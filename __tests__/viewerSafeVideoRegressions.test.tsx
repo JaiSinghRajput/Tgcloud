@@ -123,8 +123,6 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
 
   describe('Bug 3: Video Playback States, Real Execution, and Temporary Decryption Cleanup', () => {
     test('invokes genuine player with playVideo when tapping play on local video', async () => {
-      const playVideoSpy = jest.spyOn(TelegramBridgeService, 'playVideo');
-
       let root: renderer.ReactTestRenderer;
       await act(async () => {
         root = renderer.create(
@@ -143,18 +141,10 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
         renderedItem.props.onPress();
       });
 
-      // Find toggle video playback button
-      const playBtn = root!.root.findByProps({ accessibilityLabel: 'Toggle video playback' });
-      expect(playBtn).toBeDefined();
-
-      // Tap Play
-      await act(async () => {
-        await playBtn.props.onPress();
-      });
-
-      // Verify genuine player invocation
-      expect(playVideoSpy).toHaveBeenCalledWith(mockLocalVideo.sourceKey);
-      playVideoSpy.mockRestore();
+      // Verify in-app video player is embedded with local sourceKey
+      const videoPlayer = root!.root.findByProps({ testID: 'in-app-video-player' });
+      expect(videoPlayer).toBeDefined();
+      expect(videoPlayer.props.sourceUri).toBe(mockLocalVideo.sourceKey);
     });
 
     test('decrypts cloud encrypted video before playback and cleans up temporary media on viewer close', async () => {
@@ -163,7 +153,6 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
         tempFilePath: '/data/user/0/cache/tgcloud_video_playback/decrypted_test.mp4',
         isTemporary: true,
       });
-      const playVideoSpy = jest.spyOn(TelegramBridgeService, 'playVideo');
       const cleanupSpy = jest.spyOn(TelegramBridgeService, 'cleanupTempMedia');
 
       // Set unlocked master key in session
@@ -189,22 +178,18 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
         renderedItem.props.onPress();
       });
 
-      // Tap Play
-      const playBtn = root!.root.findByProps({ accessibilityLabel: 'Toggle video playback' });
-      await act(async () => {
-        await playBtn.props.onPress();
-      });
-
-      // Verify ciphertext was never passed to normal player
+      // Verify ciphertext was never passed to normal player and prepared with masterKey
       expect(prepareCloudVideoSpy).toHaveBeenCalledWith(
         mockCloudEncryptedVideo.fileId,
         true,
         expect.any(String),
         masterKey.toString('hex'),
       );
-      expect(playVideoSpy).toHaveBeenCalledWith(
-        'file:///data/user/0/cache/tgcloud_video_playback/decrypted_test.mp4',
-      );
+
+      // Verify in-app video player is rendered with decrypted source URI
+      const videoPlayer = root!.root.findByProps({ testID: 'in-app-video-player' });
+      expect(videoPlayer).toBeDefined();
+      expect(videoPlayer.props.sourceUri).toBe('file:///data/user/0/cache/tgcloud_video_playback/decrypted_test.mp4');
 
       // Close viewer
       const closeBtn = root!.root.findByProps({ accessibilityLabel: 'Close media viewer' });
@@ -218,7 +203,6 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
       );
 
       prepareCloudVideoSpy.mockRestore();
-      playVideoSpy.mockRestore();
       cleanupSpy.mockRestore();
     });
 
@@ -246,11 +230,6 @@ describe('Bug Fix Regressions: Safe Area Viewer & Real Video Playback (Bugs 2 & 
       const renderedItem = flatList.props.renderItem({ item: mockCloudEncryptedVideo, index: 0 });
       await act(async () => {
         renderedItem.props.onPress();
-      });
-
-      const playBtn = root!.root.findByProps({ accessibilityLabel: 'Toggle video playback' });
-      await act(async () => {
-        await playBtn.props.onPress();
       });
 
       // Verify error banner is rendered

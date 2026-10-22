@@ -172,38 +172,56 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
 
     /**
      * Paginates through channel history and parses all messages with Telegram Gallery Backup metadata.
+     * Supports bounded multi-batch pagination up to requested limit.
      */
     suspend fun getChannelHistory(
         chatId: Long,
         fromMessageId: Long = 0,
-        limit: Int = 50
+        limit: Int = 100
     ): List<TelegramMediaResult> {
-        val req = TdApi.GetChatHistory().apply {
-            this.chatId = chatId
-            this.fromMessageId = fromMessageId
-            this.offset = 0
-            this.limit = limit
-            this.onlyLocal = false
-        }
-        val messages: TdApi.Messages = tdLibService.send(req)
-
         val results = mutableListOf<TelegramMediaResult>()
-        for (message in messages.messages) {
-            val caption = extractCaptionFromMessage(message)
-            val metadata = TelegramMetadataEnvelope.parseFromCaption(caption) ?: continue
-            val file = extractFileFromMessage(message)
+        var currentFromMsgId = fromMessageId
+        var remaining = limit
 
-            results.add(
-                TelegramMediaResult(
-                    messageId = message.id,
-                    chatId = message.chatId,
-                    fileId = file?.id ?: 0,
-                    remoteFileId = file?.remote?.id,
-                    metadata = metadata,
-                    date = message.date
+        while (remaining > 0) {
+            val batchSize = Math.min(remaining, 100)
+            val req = TdApi.GetChatHistory().apply {
+                this.chatId = chatId
+                this.fromMessageId = currentFromMsgId
+                this.offset = 0
+                this.limit = batchSize
+                this.onlyLocal = false
+            }
+            val messages: TdApi.Messages = try {
+                tdLibService.send(req)
+            } catch (e: Exception) {
+                break
+            }
+
+            if (messages.messages.isEmpty()) break
+
+            for (message in messages.messages) {
+                val caption = extractCaptionFromMessage(message)
+                val metadata = TelegramMetadataEnvelope.parseFromCaption(caption) ?: continue
+                val file = extractFileFromMessage(message)
+
+                results.add(
+                    TelegramMediaResult(
+                        messageId = message.id,
+                        chatId = message.chatId,
+                        fileId = file?.id ?: 0,
+                        remoteFileId = file?.remote?.id,
+                        metadata = metadata,
+                        date = message.date
+                    )
                 )
-            )
+            }
+
+            remaining -= messages.messages.size
+            currentFromMsgId = messages.messages.last().id
+            if (messages.messages.size < batchSize) break
         }
+
         return results
     }
 

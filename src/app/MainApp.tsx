@@ -376,7 +376,21 @@ export const MainApp: React.FC = () => {
     refreshScan(currentExcluded);
   };
 
+  const handleRecreateDestination = async (type: 'photo' | 'video') => {
+    await TelegramBridgeService.recreateDestination(type);
+    await syncChannelsAndCloudHistory();
+  };
+
   const handleConfirmBackup = async (selectedIds?: string[]) => {
+    if (!isLoggedIn) return;
+
+    // Destination validation: check destinations before enqueuing
+    const refreshedChannels = await TelegramBridgeService.refreshDestinations();
+    const activeDestinations = refreshedChannels || channels;
+    if (refreshedChannels) {
+      setChannels(refreshedChannels);
+    }
+
     let eligibleIds: string[];
     if (selectedIds && selectedIds.length > 0) {
       eligibleIds = selectedIds;
@@ -384,6 +398,20 @@ export const MainApp: React.FC = () => {
       const { confirmed, eligibleItemIds } = confirmInitialScan(scanReview);
       if (!confirmed || eligibleItemIds.length === 0) return;
       eligibleIds = eligibleItemIds;
+    }
+
+    // Check if any selected items target a deleted destination
+    const itemsToBackup = scanReview.items.filter(i => eligibleIds.includes(i.id));
+    const hasPhotos = itemsToBackup.some(i => i.mediaType === 'photo');
+    const hasVideos = itemsToBackup.some(i => i.mediaType === 'video');
+
+    if (hasPhotos && activeDestinations?.photoStatus?.state === 'DELETED') {
+      setActiveTab('settings');
+      return;
+    }
+    if (hasVideos && activeDestinations?.videoStatus?.state === 'DELETED') {
+      setActiveTab('settings');
+      return;
     }
 
     // Persist discovered eligible items to repository
@@ -626,6 +654,7 @@ export const MainApp: React.FC = () => {
             onOpenChannelInTelegram={handleOpenChannelInTelegram}
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
+            onRecreateDestination={handleRecreateDestination}
           />
         )}
 
@@ -651,6 +680,7 @@ export const MainApp: React.FC = () => {
             onOpenChannelInTelegram={handleOpenChannelInTelegram}
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
+            onRecreateDestination={handleRecreateDestination}
           />
         )}
 
@@ -699,6 +729,7 @@ export const MainApp: React.FC = () => {
             onOpenChannelInTelegram={handleOpenChannelInTelegram}
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
+            onRecreateDestination={handleRecreateDestination}
           />
         )}
 

@@ -23,12 +23,30 @@ export interface TelegramAuthState {
   message?: string;
 }
 
+export type DestinationLifecycleState =
+  | 'CONNECTED'
+  | 'CHECKING'
+  | 'UNREACHABLE'
+  | 'ACCESS_REVOKED'
+  | 'DELETED'
+  | 'NEEDS_SETUP'
+  | 'RECREATED';
+
+export interface DestinationStatus {
+  channelId: string;
+  title: string;
+  state: DestinationLifecycleState;
+  errorMessage?: string;
+}
+
 export interface TelegramBackupChannels {
   photoChannelId: string;
   photoChannelTitle: string;
   videoChannelId: string;
   videoChannelTitle: string;
   verified: boolean;
+  photoStatus?: DestinationStatus;
+  videoStatus?: DestinationStatus;
 }
 
 export interface TelegramMetadataEnvelope {

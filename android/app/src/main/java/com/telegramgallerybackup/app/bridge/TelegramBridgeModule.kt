@@ -167,6 +167,26 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                         putString("videoChannelId", channels.videoChannelId.toString())
                         putString("videoChannelTitle", channels.videoChannelTitle)
                         putBoolean("verified", channels.verified)
+
+                        if (channels.photoStatus != null) {
+                            val pMap = Arguments.createMap().apply {
+                                putString("channelId", channels.photoStatus.channelId.toString())
+                                putString("title", channels.photoStatus.title)
+                                putString("state", channels.photoStatus.state.name)
+                                putString("errorMessage", channels.photoStatus.errorMessage)
+                            }
+                            putMap("photoStatus", pMap)
+                        }
+
+                        if (channels.videoStatus != null) {
+                            val vMap = Arguments.createMap().apply {
+                                putString("channelId", channels.videoStatus.channelId.toString())
+                                putString("title", channels.videoStatus.title)
+                                putString("state", channels.videoStatus.state.name)
+                                putString("errorMessage", channels.videoStatus.errorMessage)
+                            }
+                            putMap("videoStatus", vMap)
+                        }
                     }
                     promise.resolve(map)
                 } else {
@@ -193,6 +213,25 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                 promise.resolve(map)
             } catch (e: Exception) {
                 promise.reject("DESTINATION_CREATE_ERROR", e.message, e)
+            }
+        }
+    }
+
+    /**
+     * Explicit recreation of a deleted backup destination.
+     */
+    @ReactMethod
+    fun recreateDestination(destinationType: String, promise: Promise) {
+        scope.launch {
+            try {
+                val chat = channelManager.recreateDestination(destinationType, getCurrentUserId())
+                val map = Arguments.createMap().apply {
+                    putString("channelId", chat.id.toString())
+                    putString("title", chat.title)
+                }
+                promise.resolve(map)
+            } catch (e: Exception) {
+                promise.reject("DESTINATION_RECREATE_ERROR", e.message, e)
             }
         }
     }

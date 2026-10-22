@@ -43,6 +43,87 @@ class TelegramChannelManager(
     }
 
     /**
+     * Checks the precise lifecycle status of a destination channel.
+     * Distinguishes confirmed DELETED from temporary UNREACHABLE or ACCESS_REVOKED.
+     */
+    suspend fun checkDestinationStatus(chatId: Long, defaultTitle: String): DestinationStatus {
+        if (chatId == 0L) {
+            return DestinationStatus(
+                channelId = 0L,
+                title = defaultTitle,
+                state = DestinationLifecycleState.NEEDS_SETUP,
+                errorMessage = "Destination channel not configured yet."
+            )
+        }
+
+        return try {
+            val chat: TdApi.Chat = tdLibService.send(TdApi.GetChat(chatId))
+            val isSupergroup = chat.type is TdApi.ChatTypeSupergroup
+            val canPost = isSupergroup || chat.permissions != null
+            if (canPost) {
+                DestinationStatus(
+                    channelId = chat.id,
+                    title = chat.title.ifEmpty { defaultTitle },
+                    state = DestinationLifecycleState.CONNECTED
+                )
+            } else {
+                DestinationStatus(
+                    channelId = chat.id,
+                    title = chat.title.ifEmpty { defaultTitle },
+                    state = DestinationLifecycleState.ACCESS_REVOKED,
+                    errorMessage = "Access revoked or user does not have permission to post."
+                )
+            }
+        } catch (e: Exception) {
+            val msg = e.message ?: ""
+            Log.w(tag, "Destination check failed for $chatId: $msg")
+            when {
+                msg.contains("Chat not found", ignoreCase = true) ||
+                msg.contains("deleted", ignoreCase = true) ||
+                msg.contains("deactivated", ignoreCase = true) ||
+                msg.contains("400", ignoreCase = true) -> {
+                    DestinationStatus(
+                        channelId = chatId,
+                        title = defaultTitle,
+                        state = DestinationLifecycleState.DELETED,
+                        errorMessage = "Channel was deleted in Telegram."
+                    )
+                }
+                msg.contains("ACCESS_DENIED", ignoreCase = true) ||
+                msg.contains("CHAT_ADMIN_REQUIRED", ignoreCase = true) ||
+                msg.contains("not a member", ignoreCase = true) ||
+                msg.contains("403", ignoreCase = true) -> {
+                    DestinationStatus(
+                        channelId = chatId,
+                        title = defaultTitle,
+                        state = DestinationLifecycleState.ACCESS_REVOKED,
+                        errorMessage = "Access revoked or insufficient permissions."
+                    )
+                }
+                msg.contains("FLOOD_WAIT", ignoreCase = true) ||
+                msg.contains("timeout", ignoreCase = true) ||
+                msg.contains("connection", ignoreCase = true) ||
+                msg.contains("network", ignoreCase = true) -> {
+                    DestinationStatus(
+                        channelId = chatId,
+                        title = defaultTitle,
+                        state = DestinationLifecycleState.UNREACHABLE,
+                        errorMessage = "Destination temporarily unreachable."
+                    )
+                }
+                else -> {
+                    DestinationStatus(
+                        channelId = chatId,
+                        title = defaultTitle,
+                        state = DestinationLifecycleState.UNREACHABLE,
+                        errorMessage = "Destination status check error: $msg"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
      * Read-only discovery and validation of existing backup channels.
      * CRITICAL: MUST NEVER CREATE A CHANNEL UNDER ANY CIRCUMSTANCES.
      */
@@ -50,49 +131,52 @@ class TelegramChannelManager(
         Log.d(tag, "refreshDestinations called (read-only) for user: $userId")
 
         // 1. Check persisted channel IDs first
-        val savedPhotoId = getPersistedChannelId("photo_channel_id", userId)
-        val savedVideoId = getPersistedChannelId("video_channel_id", userId)
-
-        var photoChat: TdApi.Chat? = null
-        var videoChat: TdApi.Chat? = null
-
-        if (savedPhotoId != null) {
-            photoChat = tryGetChat(savedPhotoId)
-        }
-        if (savedVideoId != null) {
-            videoChat = tryGetChat(savedVideoId)
-        }
+        var savedPhotoId = getPersistedChannelId("photo_channel_id", userId)
+        var savedVideoId = getPersistedChannelId("video_channel_id", userId)
 
         // 2. Discover missing channels via search if not found from persisted IDs
-        if (photoChat == null) {
-            photoChat = findChannelByTitle(TelegramBackupChannels.PHOTO_CHANNEL_DEFAULT_TITLE)
+        if (savedPhotoId == null) {
+            val photoChat = findChannelByTitle(TelegramBackupChannels.PHOTO_CHANNEL_DEFAULT_TITLE)
             if (photoChat != null) {
                 persistChannelId("photo_channel_id", photoChat.id, userId)
+                savedPhotoId = photoChat.id
             }
         }
 
-        if (videoChat == null) {
-            videoChat = findChannelByTitle(TelegramBackupChannels.VIDEO_CHANNEL_DEFAULT_TITLE)
+        if (savedVideoId == null) {
+            val videoChat = findChannelByTitle(TelegramBackupChannels.VIDEO_CHANNEL_DEFAULT_TITLE)
             if (videoChat != null) {
                 persistChannelId("video_channel_id", videoChat.id, userId)
+                savedVideoId = videoChat.id
             }
         }
 
-        // Return channels found, or null if neither exists yet
-        if (photoChat == null && videoChat == null) {
+        // Return null if neither channel was ever configured or found
+        if (savedPhotoId == null && savedVideoId == null) {
             Log.d(tag, "refreshDestinations: No existing backup channels found.")
             return@withLock null
         }
 
-        val photoVerified = photoChat?.let { verifyChannelAccess(it.id) } ?: false
-        val videoVerified = videoChat?.let { verifyChannelAccess(it.id) } ?: false
+        val photoStatus = checkDestinationStatus(
+            savedPhotoId ?: 0L,
+            TelegramBackupChannels.PHOTO_CHANNEL_DEFAULT_TITLE
+        )
+        val videoStatus = checkDestinationStatus(
+            savedVideoId ?: 0L,
+            TelegramBackupChannels.VIDEO_CHANNEL_DEFAULT_TITLE
+        )
+
+        val photoVerified = photoStatus.state == DestinationLifecycleState.CONNECTED
+        val videoVerified = videoStatus.state == DestinationLifecycleState.CONNECTED
 
         return@withLock TelegramBackupChannels(
-            photoChannelId = photoChat?.id ?: 0L,
-            photoChannelTitle = photoChat?.title ?: TelegramBackupChannels.PHOTO_CHANNEL_DEFAULT_TITLE,
-            videoChannelId = videoChat?.id ?: 0L,
-            videoChannelTitle = videoChat?.title ?: TelegramBackupChannels.VIDEO_CHANNEL_DEFAULT_TITLE,
-            verified = photoVerified && videoVerified
+            photoChannelId = photoStatus.channelId,
+            photoChannelTitle = photoStatus.title,
+            videoChannelId = videoStatus.channelId,
+            videoChannelTitle = videoStatus.title,
+            verified = photoVerified && videoVerified,
+            photoStatus = photoStatus,
+            videoStatus = videoStatus
         )
     }
 
@@ -112,10 +196,13 @@ class TelegramChannelManager(
         // Check if destination already exists before creating
         val existingSavedId = getPersistedChannelId(prefKey, userId)
         if (existingSavedId != null) {
-            val existingChat = tryGetChat(existingSavedId)
-            if (existingChat != null) {
-                Log.d(tag, "Destination $destinationType already exists with id: ${existingChat.id}. Returning existing.")
-                return@withLock existingChat
+            val status = checkDestinationStatus(existingSavedId, title)
+            if (status.state == DestinationLifecycleState.CONNECTED) {
+                val existingChat = tryGetChat(existingSavedId)
+                if (existingChat != null) {
+                    Log.d(tag, "Destination $destinationType already exists with id: ${existingChat.id}. Returning existing.")
+                    return@withLock existingChat
+                }
             }
         }
 
@@ -127,6 +214,25 @@ class TelegramChannelManager(
         }
 
         Log.i(tag, "Explicitly creating new private backup channel for $destinationType: '$title'")
+        val newChat = createPrivateChannel(title, TelegramBackupChannels.BACKUP_CHANNEL_DESCRIPTION)
+        persistChannelId(prefKey, newChat.id, userId)
+        return@withLock newChat
+    }
+
+    /**
+     * Explicit recreation of a deleted or permanently lost channel.
+     * Overwrites persisted ID for the requested destination type while preserving the other!
+     */
+    suspend fun recreateDestination(destinationType: String, userId: Long = 0): TdApi.Chat = channelMutex.withLock {
+        val isPhoto = destinationType.equals("photo", ignoreCase = true)
+        val title = if (isPhoto) {
+            TelegramBackupChannels.PHOTO_CHANNEL_DEFAULT_TITLE
+        } else {
+            TelegramBackupChannels.VIDEO_CHANNEL_DEFAULT_TITLE
+        }
+        val prefKey = if (isPhoto) "photo_channel_id" else "video_channel_id"
+
+        Log.i(tag, "Explicitly recreating destination channel for $destinationType: '$title'")
         val newChat = createPrivateChannel(title, TelegramBackupChannels.BACKUP_CHANNEL_DESCRIPTION)
         persistChannelId(prefKey, newChat.id, userId)
         return@withLock newChat

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -25,6 +25,7 @@ import {
   normalizeRecoveryKey,
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
+import { InAppVideoPlayer } from '../components/InAppVideoPlayer';
 
 const defaultInsets = { top: 16, bottom: 16, left: 0, right: 0 };
 function useSafeInsetsFallback() {
@@ -96,6 +97,8 @@ export interface CloudGalleryScreenProps {
   onOpenChannelInTelegram?: (channelId: string) => void;
   onResyncChannels?: () => void;
   onUnlockPassphrase?: (passphrase: string) => Promise<boolean>;
+  onRecreateDestination?: (type: 'photo' | 'video') => Promise<void>;
+  syncFreshnessState?: 'synced' | 'syncing' | 'offline' | 'error';
 }
 
 export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
@@ -119,6 +122,8 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   onOpenChannelInTelegram,
   onResyncChannels,
   onUnlockPassphrase,
+  onRecreateDestination,
+  syncFreshnessState = 'synced',
 }) => {
   // Navigation View: 'device' (Local Gallery) or 'cloud' (Telegram Cloud Backups)
   const [activeView, setActiveView] = useState<'device' | 'cloud'>(initialView);
@@ -138,16 +143,20 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   const [previewItem, setPreviewItem] = useState<
     DiscoveredMediaItem | CloudMediaItem | null
   >(null);
-  const [videoState, setVideoState] = useState<
-    'idle' | 'loading' | 'playing' | 'paused' | 'ended' | 'error'
-  >('idle');
   const [videoError, setVideoError] = useState<string | null>(null);
   const [videoLoadingMsg, setVideoLoadingMsg] = useState<string>('');
+  const [playableVideoUri, setPlayableVideoUri] = useState<string>('');
   const [activeTempVideoPath, setActiveTempVideoPath] = useState<string | null>(null);
+
+  // Destination Recreation Modal State
+  const [showRecreateModal, setShowRecreateModal] = useState<boolean>(false);
+  const [recreateTarget, setRecreateTarget] = useState<'photo' | 'video' | null>(null);
+  const [isRecreating, setIsRecreating] = useState<boolean>(false);
+  const [recreateError, setRecreateError] = useState<string | null>(null);
 
   const handleCloseViewer = async () => {
     setPreviewItem(null);
-    setVideoState('idle');
+    setPlayableVideoUri('');
     setVideoError(null);
     setVideoLoadingMsg('');
     if (activeTempVideoPath) {
@@ -157,36 +166,26 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     }
   };
 
-  const handlePlayVideo = async () => {
-    if (!previewItem || previewItem.mediaType !== 'video') return;
-
-    if (videoState === 'playing') {
-      setVideoState('paused');
-      return;
-    }
-    if (videoState === 'paused') {
-      setVideoState('playing');
-      return;
-    }
-
-    setVideoState('loading');
+  const prepareVideoSource = useCallback(async (item: DiscoveredMediaItem | CloudMediaItem) => {
+    setVideoLoadingMsg('Preparing in-app video...');
     setVideoError(null);
-    setVideoLoadingMsg('Preparing video...');
+    setPlayableVideoUri('');
 
     try {
-      let playableUri = '';
+      if ('sourceKey' in item && item.sourceKey) {
+        setPlayableVideoUri(item.sourceKey);
+        return;
+      }
 
-      if ('sourceKey' in previewItem && previewItem.sourceKey) {
-        playableUri = previewItem.sourceKey;
-      } else if ('fileId' in previewItem && previewItem.fileId) {
-        const isEncrypted = !!previewItem.isEncrypted;
+      if ('fileId' in item && item.fileId) {
+        const isEncrypted = !!item.isEncrypted;
         let masterKeyHex = '';
 
         if (isEncrypted) {
           const key = SessionKeyStore.getSessionKey();
           if (!key) {
-            setVideoState('idle');
             setShowUnlockModal(true);
+            setVideoError('Encryption key required to decrypt video.');
             return;
           }
           masterKeyHex = key.toString('hex');
@@ -196,31 +195,68 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         }
 
         const envelopeStr =
-          typeof previewItem.encryptionEnvelope === 'object'
-            ? JSON.stringify(previewItem.encryptionEnvelope)
-            : previewItem.encryptionEnvelope || '{}';
+          typeof item.encryptionEnvelope === 'object'
+            ? JSON.stringify(item.encryptionEnvelope)
+            : item.encryptionEnvelope || '{}';
 
         const prepared = await TelegramBridgeService.prepareCloudVideo(
-          previewItem.fileId,
+          item.fileId,
           isEncrypted,
           envelopeStr,
           masterKeyHex,
         );
 
-        playableUri = prepared.localUri;
+        setPlayableVideoUri(prepared.localUri);
         if (prepared.isTemporary && prepared.tempFilePath) {
           setActiveTempVideoPath(prepared.tempFilePath);
         }
       } else {
         throw new Error('Video source reference is unavailable.');
       }
-
-      setVideoLoadingMsg('Starting video player...');
-      await TelegramBridgeService.playVideo(playableUri);
-      setVideoState('playing');
     } catch (err: any) {
-      setVideoState('error');
-      setVideoError(err?.message || 'Video playback failed.');
+      setVideoError(err?.message || 'Video preparation failed.');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (previewItem && previewItem.mediaType === 'video') {
+      prepareVideoSource(previewItem);
+    } else {
+      setPlayableVideoUri('');
+      setVideoError(null);
+      setVideoLoadingMsg('');
+    }
+  }, [previewItem, prepareVideoSource]);
+
+  const handleRetryVideoPreparation = () => {
+    if (previewItem && previewItem.mediaType === 'video') {
+      prepareVideoSource(previewItem);
+    }
+  };
+
+  const handlePromptRecreate = (type: 'photo' | 'video') => {
+    setRecreateTarget(type);
+    setRecreateError(null);
+    setShowRecreateModal(true);
+  };
+
+  const handleConfirmRecreate = async () => {
+    if (!recreateTarget) return;
+    setIsRecreating(true);
+    setRecreateError(null);
+    try {
+      if (onRecreateDestination) {
+        await onRecreateDestination(recreateTarget);
+      } else {
+        await TelegramBridgeService.recreateDestination(recreateTarget);
+        onResyncChannels?.();
+      }
+      setShowRecreateModal(false);
+      setRecreateTarget(null);
+    } catch (err: any) {
+      setRecreateError(err?.message || 'Failed to recreate destination.');
+    } finally {
+      setIsRecreating(false);
     }
   };
 
@@ -308,7 +344,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setSelectedItemIds(next);
     } else {
       setPreviewItem(item);
-      setVideoState('idle');
       setVideoError(null);
     }
   };
@@ -322,7 +357,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       setShowUnlockModal(true);
     } else {
       setPreviewItem(item);
-      setVideoState('idle');
       setVideoError(null);
     }
   };
@@ -587,43 +621,73 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       <View style={styles.topHeader}>
         <View style={styles.titleRow}>
           <Text style={styles.headerTitle}>Gallery</Text>
-          <View style={styles.layoutToggleRow}>
-            {/* 1-Column / 2-Column Layout Toggle Button */}
-            <TouchableOpacity
-              style={[
-                styles.layoutBtn,
-                columnCount === 1 && styles.layoutBtnActive,
-              ]}
-              onPress={() => setColumnCount(1)}
-              accessibilityLabel="One-column layout"
-            >
-              <Text
+          <View style={styles.topRightControls}>
+            {/* Selection Mode Toggle Button */}
+            {activeView === 'device' && (
+              <TouchableOpacity
                 style={[
-                  styles.layoutBtnText,
-                  columnCount === 1 && styles.layoutBtnTextActive,
+                  styles.selectModeBtn,
+                  isSelectionMode && styles.selectModeBtnActive,
                 ]}
+                onPress={() => {
+                  if (isSelectionMode) {
+                    setIsSelectionMode(false);
+                    setSelectedItemIds(new Set());
+                  } else {
+                    setIsSelectionMode(true);
+                  }
+                }}
+                accessibilityLabel="Toggle selection mode"
               >
-                1 Col
-              </Text>
-            </TouchableOpacity>
+                <Text
+                  style={[
+                    styles.selectModeBtnText,
+                    isSelectionMode && styles.selectModeBtnTextActive,
+                  ]}
+                >
+                  {isSelectionMode ? 'Done' : 'Select'}
+                </Text>
+              </TouchableOpacity>
+            )}
 
-            <TouchableOpacity
-              style={[
-                styles.layoutBtn,
-                columnCount === 2 && styles.layoutBtnActive,
-              ]}
-              onPress={() => setColumnCount(2)}
-              accessibilityLabel="Two-column layout"
-            >
-              <Text
+            <View style={styles.layoutToggleRow}>
+              {/* 1-Column / 2-Column Layout Toggle Button */}
+              <TouchableOpacity
                 style={[
-                  styles.layoutBtnText,
-                  columnCount === 2 && styles.layoutBtnTextActive,
+                  styles.layoutBtn,
+                  columnCount === 1 && styles.layoutBtnActive,
                 ]}
+                onPress={() => setColumnCount(1)}
+                accessibilityLabel="One-column layout"
               >
-                2 Col
-              </Text>
-            </TouchableOpacity>
+                <Text
+                  style={[
+                    styles.layoutBtnText,
+                    columnCount === 1 && styles.layoutBtnTextActive,
+                  ]}
+                >
+                  1 Col
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.layoutBtn,
+                  columnCount === 2 && styles.layoutBtnActive,
+                ]}
+                onPress={() => setColumnCount(2)}
+                accessibilityLabel="Two-column layout"
+              >
+                <Text
+                  style={[
+                    styles.layoutBtnText,
+                    columnCount === 2 && styles.layoutBtnTextActive,
+                  ]}
+                >
+                  2 Col
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
 
@@ -756,22 +820,92 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       )}
 
       {/* 3. Cloud Destination & Channel Info Bar (In Cloud View) */}
-      {activeView === 'cloud' && channels && (
-        <View style={styles.destinationBar}>
-          <View style={styles.destinationInfo}>
-            <Text style={styles.destinationLabel}>BACKUP DESTINATION</Text>
-            <Text style={styles.destinationTitle}>
-              {channels.photoChannelTitle || 'Backup - Photos'} & Videos
-            </Text>
+      {activeView === 'cloud' && (
+        <View style={styles.cloudDestinationsContainer}>
+          {/* Freshness Status & Resync Action */}
+          <View style={styles.freshnessRow}>
+            <View
+              style={[
+                styles.freshnessPill,
+                syncFreshnessState === 'synced' && styles.freshnessSynced,
+                syncFreshnessState === 'syncing' && styles.freshnessSyncing,
+                syncFreshnessState === 'offline' && styles.freshnessOffline,
+              ]}
+            >
+              <Text style={styles.freshnessPillText}>
+                {syncFreshnessState === 'syncing'
+                  ? '⟳ Syncing with Telegram...'
+                  : syncFreshnessState === 'offline'
+                  ? '⚡ Offline / Disconnected'
+                  : '● Authoritative Telegram Sync'}
+              </Text>
+            </View>
+            {onResyncChannels && (
+              <TouchableOpacity
+                style={styles.syncNowBtn}
+                onPress={onResyncChannels}
+                testID="gallery-sync-now-btn"
+              >
+                <Text style={styles.syncNowBtnText}>↻ Sync now</Text>
+              </TouchableOpacity>
+            )}
           </View>
-          <TouchableOpacity
-            style={styles.openTgBtn}
-            onPress={() =>
-              onOpenChannelInTelegram?.(channels.photoChannelId)
-            }
-          >
-            <Text style={styles.openTgBtnText}>Open Telegram ↗</Text>
-          </TouchableOpacity>
+
+          {/* Deleted Channel Alert & Recovery Action */}
+          {(channels?.photoStatus?.state === 'DELETED' ||
+            channels?.videoStatus?.state === 'DELETED') && (
+            <View style={styles.deletedChannelCard} testID="deleted-channel-banner">
+              <Text style={styles.deletedChannelCardTitle}>
+                ⚠ Destination Channel Deleted
+              </Text>
+              <Text style={styles.deletedChannelCardDesc}>
+                A configured backup channel was deleted from Telegram. Recreating creates a fresh private channel for future backups. It does not restore media from the deleted channel.
+              </Text>
+              <View style={styles.deletedChannelActionsRow}>
+                {channels?.photoStatus?.state === 'DELETED' && (
+                  <TouchableOpacity
+                    style={styles.recreateDestBtn}
+                    onPress={() => handlePromptRecreate('photo')}
+                    testID="recreate-photo-channel-btn"
+                  >
+                    <Text style={styles.recreateDestBtnText}>
+                      Recreate Photo Channel
+                    </Text>
+                  </TouchableOpacity>
+                )}
+                {channels?.videoStatus?.state === 'DELETED' && (
+                  <TouchableOpacity
+                    style={styles.recreateDestBtn}
+                    onPress={() => handlePromptRecreate('video')}
+                    testID="recreate-video-channel-btn"
+                  >
+                    <Text style={styles.recreateDestBtnText}>
+                      Recreate Video Channel
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          )}
+
+          {channels && (
+            <View style={styles.destinationBar}>
+              <View style={styles.destinationInfo}>
+                <Text style={styles.destinationLabel}>BACKUP DESTINATION</Text>
+                <Text style={styles.destinationTitle}>
+                  {channels.photoChannelTitle || 'Backup - Photos'} & Videos
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.openTgBtn}
+                onPress={() =>
+                  onOpenChannelInTelegram?.(channels.photoChannelId)
+                }
+              >
+                <Text style={styles.openTgBtnText}>Open Telegram ↗</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </View>
       )}
 
@@ -873,6 +1007,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             <TouchableOpacity
               style={styles.selectToggleBtn}
               onPress={handleToggleSelectAll}
+              testID="select-all-toggle-btn"
             >
               <Text style={styles.selectToggleBtnText}>
                 {selectedItemIds.size === filteredDeviceItems.length
@@ -887,6 +1022,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                 setIsSelectionMode(false);
                 setSelectedItemIds(new Set());
               }}
+              testID="cancel-select-btn"
             >
               <Text style={styles.cancelSelectBtnText}>Cancel</Text>
             </TouchableOpacity>
@@ -898,6 +1034,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               ]}
               disabled={selectedItemIds.size === 0}
               onPress={handleBackupSelected}
+              testID="backup-selected-btn"
             >
               <Text style={styles.backupSelectedBtnText}>
                 Backup ({selectedItemIds.size})
@@ -945,70 +1082,57 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
             {/* Viewer Content Area */}
             <View style={styles.viewerImageArea}>
-              {'sourceKey' in previewItem && previewItem.sourceKey ? (
-                <Image
-                  source={{ uri: previewItem.sourceKey }}
-                  style={styles.fullImage}
-                  resizeMode="contain"
-                  accessibilityLabel="Full screen image preview"
-                  testID="full-viewer-image"
-                />
-              ) : (
-                <View style={styles.viewerPlaceholder}>
-                  <Text style={styles.viewerPlaceholderIcon}>
-                    {previewItem.mediaType === 'video' ? '▶' : '🖼'}
-                  </Text>
-                  <Text style={styles.viewerPlaceholderText}>
-                    {'displayName' in previewItem
-                      ? previewItem.displayName
-                      : previewItem.originalName}
-                  </Text>
-                </View>
-              )}
-
-              {/* Video Playback overlay with Real Lifecycle States */}
-              {previewItem.mediaType === 'video' && (
-                <View style={styles.videoControlsOverlay}>
-                  {videoState === 'loading' && (
-                    <View style={styles.videoPlayerStatusBox}>
-                      <ActivityIndicator size="small" color="#34d399" />
-                      <Text style={styles.videoPlayerStatusText}>
-                        {videoLoadingMsg}
-                      </Text>
-                    </View>
-                  )}
-
-                  {videoState === 'error' && (
-                    <View style={styles.videoPlayerErrorBox}>
-                      <Text style={styles.videoPlayerErrorText}>
-                        ⚠ {videoError}
-                      </Text>
-                    </View>
-                  )}
-
-                  <TouchableOpacity
-                    style={[
-                      styles.videoPlayOverlayBtn,
-                      videoState === 'playing' && styles.videoPlayingBtn,
-                      videoState === 'loading' && styles.videoLoadingBtn,
-                    ]}
-                    onPress={handlePlayVideo}
-                    disabled={videoState === 'loading'}
-                    accessibilityLabel="Toggle video playback"
-                  >
-                    <Text style={styles.videoPlayOverlayText}>
-                      {videoState === 'playing'
-                        ? '⏸ Pause'
-                        : videoState === 'paused'
-                        ? '▶ Resume Video'
-                        : videoState === 'loading'
-                        ? '⏳ Preparing...'
-                        : videoState === 'error'
-                        ? '↻ Retry Playback'
-                        : '▶ Play Video'}
+              {previewItem.mediaType === 'video' ? (
+                playableVideoUri ? (
+                  <InAppVideoPlayer
+                    sourceUri={playableVideoUri}
+                    isEncrypted={!!('isEncrypted' in previewItem && previewItem.isEncrypted)}
+                    onClose={handleCloseViewer}
+                    onError={err => setVideoError(err)}
+                    testID="in-app-video-player"
+                  />
+                ) : (
+                  <View style={styles.videoPreparingContainer}>
+                    <ActivityIndicator size="large" color="#34d399" />
+                    <Text style={styles.videoPreparingText}>
+                      {videoLoadingMsg || 'Preparing in-app video...'}
                     </Text>
-                  </TouchableOpacity>
-                </View>
+                    {videoError && (
+                      <View style={styles.videoPlayerErrorBox}>
+                        <Text style={styles.videoPlayerErrorText}>
+                          ⚠ {videoError}
+                        </Text>
+                        <TouchableOpacity
+                          style={styles.retryPrepBtn}
+                          onPress={handleRetryVideoPreparation}
+                        >
+                          <Text style={styles.retryPrepBtnText}>
+                            ↻ Retry Preparation
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
+                )
+              ) : (
+                'sourceKey' in previewItem && previewItem.sourceKey ? (
+                  <Image
+                    source={{ uri: previewItem.sourceKey }}
+                    style={styles.fullImage}
+                    resizeMode="contain"
+                    accessibilityLabel="Full screen image preview"
+                    testID="full-viewer-image"
+                  />
+                ) : (
+                  <View style={styles.viewerPlaceholder}>
+                    <Text style={styles.viewerPlaceholderIcon}>🖼</Text>
+                    <Text style={styles.viewerPlaceholderText}>
+                      {'displayName' in previewItem
+                        ? previewItem.displayName
+                        : previewItem.originalName}
+                    </Text>
+                  </View>
+                )
               )}
             </View>
 
@@ -1206,6 +1330,70 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           </View>
         </Modal>
       )}
+
+      {/* 10. Recreate Deleted Destination Confirmation Modal */}
+      <Modal
+        visible={showRecreateModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => {
+          if (!isRecreating) {
+            setShowRecreateModal(false);
+            setRecreateTarget(null);
+          }
+        }}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.recreateModalCard}>
+            <Text style={styles.recreateModalTitle}>
+              Recreate {recreateTarget === 'photo' ? 'Photo' : 'Video'} Channel
+            </Text>
+            <Text style={styles.recreateModalWarning}>
+              ⚠ Important Recovery Notice:
+            </Text>
+            <Text style={styles.recreateModalDesc}>
+              The previous backup channel was permanently deleted from Telegram.
+              {'\n\n'}
+              Recreating creates a brand new, private destination for future backups. It does NOT restore photos or videos from the deleted channel.
+            </Text>
+
+            {recreateError && (
+              <Text style={styles.modalErrorText}>⚠ {recreateError}</Text>
+            )}
+
+            <View style={styles.modalActionsRow}>
+              <TouchableOpacity
+                style={styles.modalCancelBtn}
+                disabled={isRecreating}
+                onPress={() => {
+                  setShowRecreateModal(false);
+                  setRecreateTarget(null);
+                }}
+              >
+                <Text style={styles.modalCancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.recreateConfirmBtn,
+                  isRecreating && styles.btnDisabled,
+                ]}
+                disabled={isRecreating}
+                onPress={handleConfirmRecreate}
+                testID="confirm-recreate-channel-btn"
+              >
+                {isRecreating ? (
+                  <ActivityIndicator size="small" color="#ffffff" />
+                ) : (
+                  <Text style={styles.recreateConfirmBtnText}>
+                    Confirm & Recreate
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -1958,5 +2146,177 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 12,
     fontWeight: '600',
+  },
+  topRightControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  selectModeBtn: {
+    backgroundColor: '#111814',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#243029',
+  },
+  selectModeBtnActive: {
+    backgroundColor: '#10b981',
+    borderColor: '#10b981',
+  },
+  selectModeBtnText: {
+    color: '#9ca3af',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  selectModeBtnTextActive: {
+    color: '#ffffff',
+  },
+  cloudDestinationsContainer: {
+    marginHorizontal: 16,
+    marginTop: 8,
+  },
+  freshnessRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  freshnessPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    backgroundColor: '#111814',
+    borderWidth: 1,
+    borderColor: '#1e2923',
+  },
+  freshnessSynced: {
+    borderColor: 'rgba(16, 185, 129, 0.4)',
+    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+  },
+  freshnessSyncing: {
+    borderColor: 'rgba(59, 130, 246, 0.4)',
+    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+  },
+  freshnessOffline: {
+    borderColor: 'rgba(239, 68, 68, 0.4)',
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+  },
+  freshnessPillText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#e5e7eb',
+  },
+  syncNowBtn: {
+    backgroundColor: '#16221c',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#243029',
+  },
+  syncNowBtnText: {
+    color: '#34d399',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  deletedChannelCard: {
+    backgroundColor: '#2b1414',
+    borderWidth: 1,
+    borderColor: '#7f1d1d',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 8,
+  },
+  deletedChannelCardTitle: {
+    color: '#f87171',
+    fontWeight: '800',
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  deletedChannelCardDesc: {
+    color: '#fca5a5',
+    fontSize: 11,
+    lineHeight: 16,
+    marginBottom: 10,
+  },
+  deletedChannelActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  recreateDestBtn: {
+    backgroundColor: '#ef4444',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+  },
+  recreateDestBtnText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  videoPreparingContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  videoPreparingText: {
+    color: '#34d399',
+    fontSize: 13,
+    fontWeight: '600',
+    marginTop: 12,
+  },
+  retryPrepBtn: {
+    backgroundColor: '#374151',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 6,
+    marginTop: 10,
+    alignSelf: 'center',
+  },
+  retryPrepBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  recreateModalCard: {
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#111814',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#7f1d1d',
+    padding: 20,
+  },
+  recreateModalTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#ffffff',
+    marginBottom: 8,
+  },
+  recreateModalWarning: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#f87171',
+    marginBottom: 4,
+  },
+  recreateModalDesc: {
+    fontSize: 12,
+    color: '#d1d5db',
+    lineHeight: 18,
+    marginBottom: 16,
+  },
+  recreateConfirmBtn: {
+    flex: 1,
+    backgroundColor: '#dc2626',
+    paddingVertical: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  recreateConfirmBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

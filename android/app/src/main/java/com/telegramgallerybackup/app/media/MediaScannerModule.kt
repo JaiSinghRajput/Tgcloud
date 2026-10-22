@@ -96,6 +96,22 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun pasteFromClipboard(promise: Promise) {
+        try {
+            val clipboard = reactContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = clipboard.primaryClip
+            if (clip != null && clip.itemCount > 0) {
+                val text = clip.getItemAt(0).text?.toString() ?: ""
+                promise.resolve(text)
+            } else {
+                promise.resolve("")
+            }
+        } catch (e: Exception) {
+            promise.resolve("")
+        }
+    }
+
+    @ReactMethod
     fun savePassphraseImage(passphrase: String, promise: Promise) {
         scope.launch {
             try {

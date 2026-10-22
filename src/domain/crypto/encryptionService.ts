@@ -3,6 +3,7 @@ import { Buffer } from 'buffer';
 import {
   EncryptedItemEnvelope,
   EncryptionConfig,
+  EncryptionSetupState,
   RecoveryKeySetup,
   SensitiveMediaMetadata,
   VerifyKeyResult,
@@ -668,6 +669,7 @@ class SessionKeyStoreManager {
       this.inMemoryMasterKey = null;
     }
     this.inMemoryRecoveryKey = null;
+    this.encryptionConfig = null;
   }
 }
 
@@ -717,3 +719,113 @@ export function verifyPassphraseAgainstItem(
     };
   }
 }
+
+/**
+ * Detects whether key input is a 12/24-word recovery passphrase, a 64-char hex key, or unknown.
+ */
+export function detectKeyFormat(keyInput: string): 'passphrase' | 'hex' | 'unknown' {
+  const trimmed = keyInput.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    return 'hex';
+  }
+  const words = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 12 || words.length === 24) {
+    return 'passphrase';
+  }
+  return 'unknown';
+}
+
+/**
+ * Validates and sets up an existing encryption key (Option A).
+ * Supports 12/24-word passphrases and 64-character hex master keys.
+ * Tests key against existing verification tokens or encrypted item envelopes.
+ */
+export async function setupExistingKeyAsync(
+  keyInput: string,
+  existingConfig?: EncryptionConfig | null,
+  testEnvelope?: EncryptedItemEnvelope | null,
+): Promise<{
+  valid: boolean;
+  state: EncryptionSetupState;
+  setup?: RecoveryKeySetup;
+  errorMessage?: string;
+}> {
+  const format = detectKeyFormat(keyInput);
+  if (format === 'unknown') {
+    return {
+      valid: false,
+      state: 'UNSUPPORTED_FORMAT',
+      errorMessage:
+        'Unrecognized key format. Accepted formats: 12-word recovery passphrase or 64-character hexadecimal key.',
+    };
+  }
+
+  const normalized = normalizeRecoveryKey(keyInput);
+  let masterKey: Buffer;
+  let saltHex =
+    existingConfig?.kdfSalt ||
+    testEnvelope?.salt ||
+    Buffer.from(getRandomBytes(SALT_LENGTH_BYTES)).toString('hex');
+
+  try {
+    if (format === 'hex') {
+      masterKey = Buffer.from(keyInput.trim(), 'hex');
+    } else {
+      masterKey = await deriveMasterKeyAsync(normalized, saltHex, PBKDF2_ITERATIONS);
+    }
+  } catch (err: any) {
+    return {
+      valid: false,
+      state: 'INVALID_KEY',
+      errorMessage: `Key derivation failed: ${err?.message || 'Unknown error'}`,
+    };
+  }
+
+  // Authenticated test against existing verification token if present
+  if (existingConfig && existingConfig.verificationToken) {
+    const testResult = verifyRecoveryKey(normalized, existingConfig);
+    if (!testResult.valid) {
+      return {
+        valid: false,
+        state: 'INVALID_KEY',
+        errorMessage: 'Incorrect recovery key. Does not match existing backup verification token.',
+      };
+    }
+  } else if (testEnvelope) {
+    // Authenticated test against existing encrypted object DEK
+    const testResult = verifyPassphraseAgainstItem(normalized, testEnvelope, saltHex);
+    if (!testResult.valid) {
+      return {
+        valid: false,
+        state: 'INVALID_KEY',
+        errorMessage: 'Incorrect recovery key. Failed to decrypt existing backup media.',
+      };
+    }
+  }
+
+  // Create verification token if none exists yet
+  let verificationToken = existingConfig?.verificationToken;
+  if (!verificationToken) {
+    verificationToken = await createVerificationTokenAsync(masterKey);
+  }
+
+  const config: EncryptionConfig = {
+    enabled: true,
+    kdfSalt: saltHex,
+    kdfIterations: PBKDF2_ITERATIONS,
+    verificationToken,
+    keyVersion: CURRENT_ENCRYPTION_KEY_VERSION,
+    verifiedAtMs: Date.now(),
+  };
+
+  return {
+    valid: true,
+    state: 'ENABLED_UNLOCKED',
+    setup: {
+      recoveryKey: normalized,
+      config,
+      masterKeyHex: masterKey.toString('hex'),
+    },
+  };
+}
+

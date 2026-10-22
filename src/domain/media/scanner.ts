@@ -37,6 +37,7 @@ interface MediaScannerNativeModule {
   getPermissionStatus(): Promise<'granted' | 'partial' | 'denied'>;
   scanMediaStore(excludedFolders: string[]): Promise<ScanReviewResult>;
   copyToClipboard?(text: string): Promise<boolean>;
+  pasteFromClipboard?(): Promise<string>;
   savePassphraseImage?(passphrase: string): Promise<string>;
 }
 
@@ -47,6 +48,7 @@ const fallbackScannerMock: MediaScannerNativeModule = {
   checkPermissions: async () => true,
   getPermissionStatus: async () => 'granted',
   copyToClipboard: async () => true,
+  pasteFromClipboard: async () => '',
   savePassphraseImage: async () => 'file://mock/TGCloud_Recovery.png',
   scanMediaStore: async (excludedFolders: string[]) => {
     const excludedSet = new Set(excludedFolders);
@@ -222,6 +224,10 @@ export const MediaScannerService = {
     nativeModule.copyToClipboard
       ? nativeModule.copyToClipboard(text)
       : Promise.resolve(true),
+  pasteFromClipboard: () =>
+    nativeModule.pasteFromClipboard
+      ? nativeModule.pasteFromClipboard()
+      : Promise.resolve(''),
   savePassphraseImage: (passphrase: string) =>
     nativeModule.savePassphraseImage
       ? nativeModule.savePassphraseImage(passphrase)

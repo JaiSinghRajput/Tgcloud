@@ -1,6 +1,14 @@
 export type EncryptionAlgorithm = 'AES-256-GCM';
 export type KdfAlgorithm = 'PBKDF2-HMAC-SHA256';
 
+export type EncryptionSetupState =
+  | 'DISABLED'
+  | 'ENABLED_UNLOCKED'
+  | 'ENABLED_LOCKED'
+  | 'VALIDATING'
+  | 'INVALID_KEY'
+  | 'UNSUPPORTED_FORMAT';
+
 export interface EncryptionConfig {
   enabled: boolean;
   kdfSalt: string;
