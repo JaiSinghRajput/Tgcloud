@@ -32,6 +32,7 @@ export interface DatabaseRepository {
     state: UploadJobState,
     errorCode?: string,
     errorSummary?: string,
+    nextAttemptAtMs?: number | null,
   ): Promise<void>;
 
   // Remote references
@@ -187,6 +188,7 @@ export class InMemoryDatabaseRepository implements DatabaseRepository {
     state: UploadJobState,
     errorCode?: string,
     errorSummary?: string,
+    nextAttemptAtMs?: number | null,
   ): Promise<void> {
     const job = this.uploadJobs.get(jobId);
     if (!job) throw new Error(`Upload job not found: ${jobId}`);
@@ -196,6 +198,8 @@ export class InMemoryDatabaseRepository implements DatabaseRepository {
       state,
       lastErrorCode: errorCode ?? job.lastErrorCode,
       lastErrorSummary: errorSummary ?? job.lastErrorSummary,
+      nextAttemptAtMs:
+        nextAttemptAtMs !== undefined ? nextAttemptAtMs : job.nextAttemptAtMs,
       updatedAtMs: Date.now(),
     });
   }

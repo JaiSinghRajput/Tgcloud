@@ -80,6 +80,8 @@ const VALID_MEDIA_TRANSITIONS: Record<MediaState, ReadonlySet<MediaState>> = {
   ]),
   [MediaState.UPLOADING]: new Set([
     MediaState.VERIFYING,
+    MediaState.BACKED_UP, // Post-crash reconciliation when upload was confirmed remotely
+    MediaState.QUEUED, // Post-crash reconciliation when resetting stale upload
     MediaState.RETRY_PENDING,
     MediaState.PERMISSION_REQUIRED,
     MediaState.SOURCE_UNAVAILABLE,
@@ -88,6 +90,7 @@ const VALID_MEDIA_TRANSITIONS: Record<MediaState, ReadonlySet<MediaState>> = {
   ]),
   [MediaState.VERIFYING]: new Set([
     MediaState.BACKED_UP,
+    MediaState.QUEUED, // Post-crash reconciliation when resetting stale verification
     MediaState.RETRY_PENDING,
     MediaState.PERMANENT_FAILURE,
   ]),
