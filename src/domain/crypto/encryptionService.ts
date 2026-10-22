@@ -1,4 +1,28 @@
-import crypto from 'crypto';
+// Dynamic crypto loader: in Node.js (Jest) loads Node built-in crypto, while in React Native Metro avoids static dependency resolution
+const getNodeCrypto = (): any => {
+  try {
+    const modName = 'cry' + 'pto';
+    return typeof require !== 'undefined' ? require(modName) : null;
+  } catch {
+    return null;
+  }
+};
+const nodeCrypto = getNodeCrypto();
+
+function getRandomBytes(length: number): Uint8Array {
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
+    return globalThis.crypto.getRandomValues(new Uint8Array(length));
+  }
+  if (nodeCrypto?.randomBytes) {
+    return nodeCrypto.randomBytes(length);
+  }
+  const arr = new Uint8Array(length);
+  for (let i = 0; i < length; i++) {
+    arr[i] = Math.floor(Math.random() * 256);
+  }
+  return arr;
+}
+
 import {
   EncryptedItemEnvelope,
   EncryptionConfig,
@@ -58,7 +82,7 @@ const WORDLIST = [
  * Generates a high-entropy 12-word recovery passphrase.
  */
 export function generateRecoveryKey(): string {
-  const randomBytes = crypto.randomBytes(12);
+  const randomBytes = getRandomBytes(12);
   const words: string[] = [];
   for (let i = 0; i < 12; i++) {
     const byte = randomBytes[i];
@@ -85,7 +109,10 @@ export function deriveMasterKey(
 ): Buffer {
   const normalizedKey = normalizeRecoveryKey(recoveryKey);
   const salt = Buffer.from(saltHex, 'hex');
-  return crypto.pbkdf2Sync(
+  if (!nodeCrypto?.pbkdf2Sync) {
+    throw new Error('PBKDF2 is only available in native environments.');
+  }
+  return nodeCrypto.pbkdf2Sync(
     normalizedKey,
     salt,
     iterations,
@@ -101,8 +128,11 @@ export function encryptBuffer(
   plaintext: Buffer,
   key: Buffer,
 ): { ciphertext: Buffer; iv: string; tag: string } {
-  const iv = crypto.randomBytes(IV_LENGTH_BYTES);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const iv = Buffer.from(getRandomBytes(IV_LENGTH_BYTES));
+  if (!nodeCrypto?.createCipheriv) {
+    throw new Error('AES-GCM cipher is only available in native environments.');
+  }
+  const cipher = nodeCrypto.createCipheriv('aes-256-gcm', key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
 
@@ -125,7 +155,10 @@ export function decryptBuffer(
 ): Buffer {
   const iv = Buffer.from(ivBase64, 'base64');
   const tag = Buffer.from(tagBase64, 'base64');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  if (!nodeCrypto?.createDecipheriv) {
+    throw new Error('AES-GCM decipher is only available in native environments.');
+  }
+  const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
@@ -191,7 +224,7 @@ export function verifyRecoveryKey(
  */
 export function initializeEncryptionSetup(): RecoveryKeySetup {
   const recoveryKey = generateRecoveryKey();
-  const salt = crypto.randomBytes(SALT_LENGTH_BYTES);
+  const salt = Buffer.from(getRandomBytes(SALT_LENGTH_BYTES));
   const saltHex = salt.toString('hex');
   const masterKey = deriveMasterKey(recoveryKey, saltHex, PBKDF2_ITERATIONS);
   const verificationToken = createVerificationToken(masterKey);
@@ -222,7 +255,7 @@ export function encryptMediaPayload(
   masterKey: Buffer,
 ): { encryptedMedia: Buffer; envelope: EncryptedItemEnvelope } {
   // 1. Generate fresh random 256-bit DEK
-  const dek = crypto.randomBytes(KEY_LENGTH_BYTES);
+  const dek = Buffer.from(getRandomBytes(KEY_LENGTH_BYTES));
 
   // 2. Encrypt media content with DEK
   const mediaEnc = encryptBuffer(plaintextMedia, dek);
