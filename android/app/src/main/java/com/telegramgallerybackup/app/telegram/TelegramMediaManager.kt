@@ -180,7 +180,9 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
                     }
                     is TdApi.UpdateMessageSendFailed -> {
                         if (update.message.id == message.id || update.oldMessageId == message.id) {
-                            throw IllegalStateException("Telegram message upload failed: [${update.errorCode}] ${update.errorMessage}")
+                            val errCode = update.error?.code ?: -1
+                            val errMsg = update.error?.message ?: "Unknown TDLib error"
+                            throw IllegalStateException("Telegram message upload failed: [$errCode] $errMsg")
                         }
                         false
                     }
