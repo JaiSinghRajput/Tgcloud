@@ -9,6 +9,33 @@ export type EncryptionSetupState =
   | 'INVALID_KEY'
   | 'UNSUPPORTED_FORMAT';
 
+export type EncryptionStatus =
+  | 'INITIALIZING'
+  | 'UNLOCKED'
+  | 'LOCKED'
+  | 'VALIDATING'
+  | 'RECOVERY_REQUIRED'
+  | 'ERROR';
+
+export type UnlockErrorCode =
+  | 'INVALID_PASSPHRASE'
+  | 'MISSING_OBJECT'
+  | 'UNSUPPORTED_VERSION'
+  | 'CORRUPTED_CIPHERTEXT'
+  | 'NETWORK_FAILURE'
+  | 'UNAVAILABLE_METADATA'
+  | 'STORAGE_ERROR';
+
+export interface UnlockResult {
+  success: boolean;
+  masterKey?: any; // Buffer
+  masterKeyHex?: string;
+  config?: EncryptionConfig;
+  status: EncryptionStatus;
+  errorCode?: UnlockErrorCode;
+  errorMessage?: string;
+}
+
 export interface EncryptionConfig {
   enabled: boolean;
   kdfSalt: string;

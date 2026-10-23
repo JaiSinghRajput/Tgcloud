@@ -45,6 +45,7 @@ import {
   persistMasterKeySecurely,
   clearPersistedMasterKey,
   verifyMasterKeyAgainstConfig,
+  UnifiedEncryptionService,
 } from '../domain/crypto/encryptionService';
 import { DbUploadJob } from '../domain/database/types';
 import { EncryptionConfig } from '../types/encryption';
@@ -290,33 +291,19 @@ export const MainApp: React.FC = () => {
   useEffect(() => {
     const loadPersistedSettings = async () => {
       try {
-        const savedConfigStr = await repo.getSetting('client_encryption_config');
-        let cfg: EncryptionConfig | null = null;
-        if (savedConfigStr) {
-          cfg = JSON.parse(savedConfigStr);
-          SessionKeyStore.setConfig(cfg!);
-        }
-        const savedEnc = await repo.getSetting('encryption_enabled');
-        if (savedEnc === 'true') {
+        const startupStatus = await UnifiedEncryptionService.restoreEncryptionOnStartup();
+        if (startupStatus === 'UNLOCKED') {
           setEncryptionEnabled(true);
-          // Attempt to restore master key from Keystore-backed secure storage
-          try {
-            const persistedKey = await loadPersistedMasterKey();
-            if (persistedKey && cfg) {
-              const isValid = verifyMasterKeyAgainstConfig(persistedKey, cfg);
-              if (isValid) {
-                SessionKeyStore.setSessionKey(persistedKey, undefined, cfg);
-              } else {
-                await clearPersistedMasterKey();
-                setKeyRecoveryNotice(
-                  'Persisted encryption key verification failed. Please enter your recovery passphrase.',
-                );
-              }
-            }
-          } catch (keystoreErr: any) {
-            setKeyRecoveryNotice(
-              `Device secure storage was reset or invalidated (${keystoreErr?.message || 'Keystore error'}). Please enter your 12-word recovery passphrase to re-enable secure unlock.`,
-            );
+          setKeyRecoveryNotice(null);
+        } else if (startupStatus === 'RECOVERY_REQUIRED') {
+          setEncryptionEnabled(true);
+          setKeyRecoveryNotice(
+            'Persisted encryption key verification failed. Please enter your recovery passphrase.',
+          );
+        } else {
+          const existingCfg = SessionKeyStore.getConfig();
+          if (existingCfg?.enabled) {
+            setEncryptionEnabled(true);
           }
         }
 
@@ -332,8 +319,10 @@ export const MainApp: React.FC = () => {
         if (autoVideosStr !== null && autoVideosStr !== '') {
           setAutoBackupIncludeVideos(autoVideosStr === 'true');
         }
-      } catch {
-        // Ignored
+      } catch (err: any) {
+        setKeyRecoveryNotice(
+          `Device secure storage was reset or invalidated (${err?.message || 'Keystore error'}). Please enter your 12-word recovery passphrase to re-enable secure unlock.`,
+        );
       }
     };
     loadPersistedSettings();
@@ -660,7 +649,7 @@ export const MainApp: React.FC = () => {
   );
 
   const handleLockEncryption = useCallback(async () => {
-    await SessionKeyStore.lockEncryption();
+    await UnifiedEncryptionService.lockEncryption();
     setCloudItems(prev =>
       prev.map(item => ({
         ...item,
@@ -945,32 +934,27 @@ export const MainApp: React.FC = () => {
   };
 
   const handleUnlockPassphrase = async (passphrase: string): Promise<boolean> => {
-    const raw = normalizeRecoveryKey(passphrase);
-    let saltHex: string | undefined;
-
-    for (const h of remoteHistoryItems) {
-      if (h.encryptionEnvelope) {
-        const env =
-          typeof h.encryptionEnvelope === 'string'
-            ? JSON.parse(h.encryptionEnvelope)
-            : h.encryptionEnvelope;
-        if (env?.salt) {
-          saltHex = env.salt;
-          break;
-        }
-      }
-    }
-
-    if (!saltHex) {
-      const cfg = SessionKeyStore.getConfig();
-      saltHex = cfg?.kdfSalt || '0123456789abcdef0123456789abcdef';
-    }
-
     try {
-      const masterKey = await deriveMasterKeyAsync(raw, saltHex);
-      SessionKeyStore.setSessionKey(masterKey, raw);
-      await persistMasterKeySecurely(masterKey.toString('hex'));
+      const candidateEnvelopes = remoteHistoryItems
+        .map(h => h.encryptionEnvelope)
+        .filter(Boolean);
+
+      const result = await UnifiedEncryptionService.unlockWithPassphrase(
+        passphrase,
+        candidateEnvelopes,
+      );
+
+      if (!result.success || !result.masterKey) {
+        return false;
+      }
+
+      const masterKey = result.masterKey;
       setKeyRecoveryNotice(null);
+      setEncryptionEnabled(true);
+      if (result.config) {
+        await repo.setSetting('client_encryption_config', JSON.stringify(result.config));
+        await repo.setSetting('encryption_enabled', 'true');
+      }
 
       await restoreManager.unlockEncryptedMedia(remoteHistoryItems, masterKey);
 
@@ -1035,7 +1019,8 @@ export const MainApp: React.FC = () => {
     } catch {
       // Handled
     }
-    await SessionKeyStore.lockEncryption();
+    // Clear in-memory session key while preserving Keystore key across login sessions
+    SessionKeyStore.clear();
     setIsLoggedIn(false);
     setCurrentUser(null);
     setChannels(null);

@@ -19,6 +19,7 @@ import {
   setupExistingKeyAsync,
   persistMasterKeySecurely,
   clearPersistedMasterKey,
+  UnifiedEncryptionService,
 } from '../domain/crypto/encryptionService';
 import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
@@ -218,7 +219,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
       const masterKey = Buffer.from(result.setup.masterKeyHex, 'hex');
       SessionKeyStore.setSessionKey(masterKey, result.setup.recoveryKey, result.setup.config);
-      await persistMasterKeySecurely(result.setup.masterKeyHex);
+      await UnifiedEncryptionService.persistProtectedKey(result.setup.masterKeyHex, result.setup.config);
       onToggleEncryption(true, result.setup);
       setKeySetupState('ENABLED_UNLOCKED');
       setShowImportModal(false);
@@ -285,7 +286,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     if (activeSetup) {
       const masterKey = Buffer.from(activeSetup.masterKeyHex, 'hex');
       SessionKeyStore.setSessionKey(masterKey, activeSetup.recoveryKey, activeSetup.config);
-      persistMasterKeySecurely(activeSetup.masterKeyHex);
+      UnifiedEncryptionService.persistProtectedKey(activeSetup.masterKeyHex, activeSetup.config);
       onToggleEncryption(true, activeSetup);
     } else {
       onToggleEncryption(true);
@@ -310,25 +311,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     });
 
     try {
-      let valid = false;
-      const cfg = SessionKeyStore.getConfig();
-      if (cfg) {
-        const res = await verifyRecoveryKeyAsync(raw, cfg);
-        if (res.valid && res.masterKeyHex) {
-          valid = true;
-          const masterKey = Buffer.from(res.masterKeyHex, 'hex');
-          SessionKeyStore.setSessionKey(masterKey, raw, cfg);
-          await persistMasterKeySecurely(res.masterKeyHex);
-          onToggleEncryption(true);
+      const result = await UnifiedEncryptionService.unlockWithPassphrase(raw);
+
+      if (result.success) {
+        if (onUnlockPassphrase) {
+          await onUnlockPassphrase(raw);
         }
-      }
-
-      if (onUnlockPassphrase) {
-        const success = await onUnlockPassphrase(raw);
-        if (success) valid = true;
-      }
-
-      if (valid) {
+        onToggleEncryption(true);
         setBackgroundUnlockStatus({
           status: 'success',
           message: '✓ Recovery passphrase verified! Encryption unlocked.',
@@ -337,7 +326,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       } else {
         setBackgroundUnlockStatus({
           status: 'error',
-          message: '⚠ Incorrect recovery passphrase. Tap here to retry.',
+          message:
+            result.errorMessage ||
+            '⚠ Incorrect recovery passphrase. Tap here to retry.',
         });
       }
     } catch (e: any) {
@@ -772,7 +763,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 <TouchableOpacity
                   style={styles.lockKeyBtn}
                   onPress={async () => {
-                    await SessionKeyStore.lockEncryption();
+                    await UnifiedEncryptionService.lockEncryption();
                     onLockEncryption?.();
                   }}
                   testID="lock-encryption-btn"

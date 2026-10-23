@@ -58,6 +58,7 @@ object TelegramCryptoService {
     private const val PREF_KEY_CIPHERTEXT = "enc_master_key"
     private const val PREF_KEY_IV = "master_key_iv"
     private const val PREF_KEY_TAG = "master_key_tag"
+    private const val PREF_KEY_CONFIG = "enc_config_json"
 
     private val secureRandom = SecureRandom()
 
@@ -398,11 +399,54 @@ object TelegramCryptoService {
 
     /**
      * Removes persisted Master Key material upon user lock or logout.
+     * Preserves non-secret config metadata (salt, verification token) for future unlock.
      */
     fun clearMasterKeyProtected(context: Context): Boolean {
         return try {
             val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
-            prefs.edit().clear().commit()
+            prefs.edit()
+                .remove(PREF_KEY_CIPHERTEXT)
+                .remove(PREF_KEY_IV)
+                .remove(PREF_KEY_TAG)
+                .commit()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Persists non-secret encryption metadata (salt, iterations, verification token) in private SharedPreferences.
+     */
+    fun storeEncryptionConfig(context: Context, configJson: String): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            prefs.edit().putString(PREF_KEY_CONFIG, configJson).commit()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Loads non-secret encryption metadata from private SharedPreferences.
+     */
+    fun loadEncryptionConfig(context: Context): String? {
+        return try {
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            prefs.getString(PREF_KEY_CONFIG, null)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Clears non-secret encryption metadata upon full data wipe.
+     */
+    fun clearEncryptionConfig(context: Context): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            prefs.edit().remove(PREF_KEY_CONFIG).commit()
             true
         } catch (_: Exception) {
             false

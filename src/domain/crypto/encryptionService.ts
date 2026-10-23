@@ -4,8 +4,11 @@ import {
   EncryptedItemEnvelope,
   EncryptionConfig,
   EncryptionSetupState,
+  EncryptionStatus,
   RecoveryKeySetup,
   SensitiveMediaMetadata,
+  UnlockErrorCode,
+  UnlockResult,
   VerifyKeyResult,
 } from '../../types/encryption';
 import { TelegramMetadataEnvelope } from '../../types/telegram';
@@ -692,6 +695,10 @@ class SessionKeyStoreManager {
     await clearPersistedMasterKey();
   }
 
+  clearConfig() {
+    this.encryptionConfig = null;
+  }
+
   clear() {
     if (this.inMemoryMasterKey) {
       this.inMemoryMasterKey.fill(0);
@@ -749,6 +756,47 @@ export async function isSecureKeyPersistenceAvailable(): Promise<boolean> {
   try {
     return await TelegramBridgeService.isSecureStorageAvailable();
   } catch {
+    return false;
+  }
+}
+
+/**
+ * Securely persists the non-secret encryption configuration metadata (salt, iterations, verification token)
+ * so it survives app closures, process death, and restarts alongside the protected key.
+ */
+export async function persistEncryptionConfigSecurely(config: EncryptionConfig): Promise<boolean> {
+  try {
+    return await TelegramBridgeService.storeSecureEncryptionConfig(JSON.stringify(config));
+  } catch (err) {
+    console.warn('Failed to securely persist encryption config:', err);
+    return false;
+  }
+}
+
+/**
+ * Loads the persisted non-secret encryption configuration from secure storage.
+ */
+export async function loadPersistedEncryptionConfig(): Promise<EncryptionConfig | null> {
+  try {
+    const jsonStr = await TelegramBridgeService.loadSecureEncryptionConfig();
+    if (jsonStr) {
+      return JSON.parse(jsonStr) as EncryptionConfig;
+    }
+    return null;
+  } catch (err) {
+    console.warn('Failed to load persisted encryption config:', err);
+    return null;
+  }
+}
+
+/**
+ * Clears the persisted encryption configuration upon explicit data wipe.
+ */
+export async function clearPersistedEncryptionConfig(): Promise<boolean> {
+  try {
+    SessionKeyStore.clearConfig();
+    return await TelegramBridgeService.clearSecureEncryptionConfig();
+  } catch (err) {
     return false;
   }
 }
@@ -953,4 +1001,433 @@ export async function setupExistingKeyAsync(
     },
   };
 }
+
+/**
+ * Validates whether a candidate 256-bit Master Key can authenticate and decrypt an encrypted object.
+ * Uses AES-256-GCM authenticated decryption on verificationToken or encryptedDek.
+ * If authentication tag fails or data is corrupted, returns false.
+ */
+export function validateKeyAgainstEncryptedObject(
+  masterKey: Buffer,
+  object: EncryptedItemEnvelope | string,
+): boolean {
+  try {
+    if (!masterKey || masterKey.length !== KEY_LENGTH_BYTES) {
+      return false;
+    }
+    const envelope: EncryptedItemEnvelope =
+      typeof object === 'string' ? JSON.parse(object) : object;
+
+    if (!envelope || typeof envelope !== 'object') {
+      return false;
+    }
+
+    if (envelope.alg && envelope.alg !== 'AES-256-GCM') {
+      return false;
+    }
+
+    // 1. If envelope carries verificationToken, test against that first
+    if (envelope.verificationToken) {
+      try {
+        const tokenObj =
+          typeof envelope.verificationToken === 'string'
+            ? JSON.parse(envelope.verificationToken)
+            : envelope.verificationToken;
+        const ct = Buffer.from(tokenObj.ct, 'base64');
+        const decrypted = decryptBuffer(ct, masterKey, tokenObj.iv, tokenObj.tag);
+        if (decrypted.toString('utf8') === VERIFY_PAYLOAD_CONSTANT) {
+          return true;
+        }
+      } catch {
+        // Verification token auth tag mismatch
+      }
+    }
+
+    // 2. If envelope carries an encrypted DEK, decrypt DEK with authenticated tag check
+    if (envelope.encryptedDek && envelope.dekIv && envelope.dekTag) {
+      const dekCiphertext = Buffer.from(envelope.encryptedDek, 'base64');
+      const dek = decryptBuffer(dekCiphertext, masterKey, envelope.dekIv, envelope.dekTag);
+      if (dek && dek.length === KEY_LENGTH_BYTES) {
+        return true;
+      }
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Single source of truth for Encryption & Key Management across the entire application.
+ * Manages the encryption state machine:
+ * INITIALIZING -> UNLOCKED | LOCKED | RECOVERY_REQUIRED | ERROR
+ * Transitions to VALIDATING during passphrase checks.
+ */
+class UnifiedEncryptionServiceManager {
+  private status: EncryptionStatus = 'INITIALIZING';
+  private listeners: Set<(status: EncryptionStatus) => void> = new Set();
+  private lastError: string | null = null;
+
+  constructor() {
+    if (SessionKeyStore.isUnlocked()) {
+      this.status = 'UNLOCKED';
+    }
+  }
+
+  getEncryptionStatus(): EncryptionStatus {
+    if (SessionKeyStore.isUnlocked()) {
+      return 'UNLOCKED';
+    }
+    return this.status;
+  }
+
+  getLastError(): string | null {
+    return this.lastError;
+  }
+
+  subscribe(listener: (status: EncryptionStatus) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private setStatus(newStatus: EncryptionStatus, error?: string | null) {
+    this.status = newStatus;
+    if (error !== undefined) {
+      this.lastError = error;
+    }
+    this.listeners.forEach(fn => {
+      try {
+        fn(newStatus);
+      } catch (err) {
+        console.warn('Listener error on encryption status change:', err);
+      }
+    });
+  }
+
+  async getPersistedKey(): Promise<Buffer | null> {
+    return await loadPersistedMasterKey();
+  }
+
+  validateKeyAgainstEncryptedObject(
+    masterKey: Buffer,
+    object: EncryptedItemEnvelope | string,
+  ): boolean {
+    return validateKeyAgainstEncryptedObject(masterKey, object);
+  }
+
+  async persistProtectedKey(
+    masterKey: Buffer | string,
+    config?: EncryptionConfig,
+  ): Promise<boolean> {
+    const hex = typeof masterKey === 'string' ? masterKey : masterKey.toString('hex');
+    const keySuccess = await persistMasterKeySecurely(hex);
+    if (config) {
+      await persistEncryptionConfigSecurely(config);
+      SessionKeyStore.setConfig(config);
+    }
+    return keySuccess;
+  }
+
+  async lockEncryption(): Promise<void> {
+    await SessionKeyStore.lockEncryption();
+    this.setStatus('LOCKED', null);
+  }
+
+  async resetAll(): Promise<void> {
+    await this.lockEncryption();
+    await clearPersistedEncryptionConfig();
+    this.setStatus('LOCKED', null);
+  }
+
+  /**
+   * Restores encryption state securely on app startup.
+   * 1. Initialize secure storage / verify Keystore availability.
+   * 2. Load persisted encryption config metadata.
+   * 3. Restore the protected master key.
+   * 4. Authenticate the key against verification token.
+   * 5. If valid, set session key and transition to UNLOCKED.
+   * 6. If invalid or corrupted, transition to RECOVERY_REQUIRED.
+   * 7. If no key, transition to LOCKED.
+   */
+  async restoreEncryptionOnStartup(): Promise<EncryptionStatus> {
+    this.setStatus('INITIALIZING');
+    try {
+      const isStorageAvailable = await isSecureKeyPersistenceAvailable();
+      if (!isStorageAvailable) {
+        this.setStatus('ERROR', 'Secure Keystore storage is unavailable on this device.');
+        return 'ERROR';
+      }
+
+      const persistedConfig = await loadPersistedEncryptionConfig();
+      if (persistedConfig) {
+        SessionKeyStore.setConfig(persistedConfig);
+      }
+
+      let persistedKey: Buffer | null = null;
+      try {
+        persistedKey = await loadPersistedMasterKey();
+      } catch (err: any) {
+        this.setStatus('ERROR', `Secure storage read failure: ${err?.message || 'Keystore error'}`);
+        return 'ERROR';
+      }
+
+      if (persistedKey && persistedKey.length === KEY_LENGTH_BYTES) {
+        if (persistedConfig && persistedConfig.verificationToken) {
+          const isValid = verifyMasterKeyAgainstConfig(persistedKey, persistedConfig);
+          if (isValid) {
+            SessionKeyStore.setSessionKey(persistedKey, undefined, persistedConfig);
+            this.setStatus('UNLOCKED', null);
+            return 'UNLOCKED';
+          } else {
+            // Key mismatch or corrupted storage: clear invalidated key
+            await clearPersistedMasterKey();
+            this.setStatus(
+              'RECOVERY_REQUIRED',
+              'Persisted key failed cryptographic verification against backup token.',
+            );
+            return 'RECOVERY_REQUIRED';
+          }
+        } else {
+          SessionKeyStore.setSessionKey(persistedKey, undefined, persistedConfig || undefined);
+          this.setStatus('UNLOCKED', null);
+          return 'UNLOCKED';
+        }
+      }
+
+      this.setStatus('LOCKED', null);
+      return 'LOCKED';
+    } catch (err: any) {
+      this.setStatus('ERROR', err?.message || 'Failed to initialize secure encryption storage.');
+      return 'ERROR';
+    }
+  }
+
+  /**
+   * Canonical unlock implementation shared across the app.
+   * Used by Settings, Cloud, backup upload queue, and media viewer.
+   */
+  async unlockWithPassphrase(
+    passphraseInput: string,
+    candidateEnvelopes?: (EncryptedItemEnvelope | string | null | undefined)[],
+  ): Promise<UnlockResult> {
+    if (!passphraseInput || typeof passphraseInput !== 'string') {
+      return {
+        success: false,
+        status: this.getEncryptionStatus(),
+        errorCode: 'INVALID_PASSPHRASE',
+        errorMessage: 'Passphrase cannot be empty.',
+      };
+    }
+
+    const trimmed = passphraseInput.trim();
+    if (!trimmed) {
+      return {
+        success: false,
+        status: this.getEncryptionStatus(),
+        errorCode: 'INVALID_PASSPHRASE',
+        errorMessage: 'Passphrase cannot be blank.',
+      };
+    }
+
+    const format = detectKeyFormat(trimmed);
+    if (format === 'unknown') {
+      return {
+        success: false,
+        status: this.getEncryptionStatus(),
+        errorCode: 'INVALID_PASSPHRASE',
+        errorMessage:
+          'Invalid passphrase format. Please enter your 12-word recovery passphrase or 64-character hex key.',
+      };
+    }
+
+    this.setStatus('VALIDATING');
+
+    try {
+      const normalized = normalizeRecoveryKey(trimmed);
+      let activeConfig = SessionKeyStore.getConfig();
+      if (!activeConfig) {
+        activeConfig = await loadPersistedEncryptionConfig();
+        if (activeConfig) {
+          SessionKeyStore.setConfig(activeConfig);
+        }
+      }
+
+      // Parse candidate envelopes
+      const parsedEnvelopes: EncryptedItemEnvelope[] = [];
+      if (candidateEnvelopes && candidateEnvelopes.length > 0) {
+        for (const item of candidateEnvelopes) {
+          if (!item) continue;
+          try {
+            const parsed: EncryptedItemEnvelope =
+              typeof item === 'string' ? JSON.parse(item) : item;
+            if (parsed && typeof parsed === 'object') {
+              parsedEnvelopes.push(parsed);
+            }
+          } catch {
+            // Malformed JSON envelope
+          }
+        }
+      }
+
+      // 1. Try unlocking with activeConfig if available
+      if (activeConfig && activeConfig.kdfSalt) {
+        let masterKey: Buffer;
+        if (format === 'hex') {
+          masterKey = Buffer.from(trimmed, 'hex');
+        } else {
+          masterKey = await deriveMasterKeyAsync(
+            normalized,
+            activeConfig.kdfSalt,
+            activeConfig.kdfIterations || PBKDF2_ITERATIONS,
+          );
+        }
+
+        if (activeConfig.verificationToken) {
+          const isValid = verifyMasterKeyAgainstConfig(masterKey, activeConfig);
+          if (isValid) {
+            SessionKeyStore.setSessionKey(masterKey, normalized, activeConfig);
+            await this.persistProtectedKey(masterKey, activeConfig);
+            this.setStatus('UNLOCKED', null);
+            return {
+              success: true,
+              masterKey,
+              masterKeyHex: masterKey.toString('hex'),
+              config: activeConfig,
+              status: 'UNLOCKED',
+            };
+          }
+        }
+      }
+
+      // 2. Try candidate envelopes
+      let hadAuthFailure = false;
+
+      for (const env of parsedEnvelopes) {
+        const candidateSalt = env.salt || activeConfig?.kdfSalt;
+        if (!candidateSalt) continue;
+
+        let candidateKey: Buffer;
+        try {
+          if (format === 'hex') {
+            candidateKey = Buffer.from(trimmed, 'hex');
+          } else {
+            candidateKey = await deriveMasterKeyAsync(
+              normalized,
+              candidateSalt,
+              PBKDF2_ITERATIONS,
+            );
+          }
+        } catch {
+          continue;
+        }
+
+        const isValid = validateKeyAgainstEncryptedObject(candidateKey, env);
+        if (isValid) {
+          let token = env.verificationToken;
+          if (!token) {
+            try {
+              token = await createVerificationTokenAsync(candidateKey);
+            } catch {
+              token = createVerificationToken(candidateKey);
+            }
+          }
+
+          const verifiedConfig: EncryptionConfig = {
+            enabled: true,
+            kdfSalt: candidateSalt,
+            kdfIterations: PBKDF2_ITERATIONS,
+            verificationToken: token,
+            keyVersion: env.keyVersion || CURRENT_ENCRYPTION_KEY_VERSION,
+            verifiedAtMs: Date.now(),
+          };
+
+          SessionKeyStore.setSessionKey(candidateKey, normalized, verifiedConfig);
+          await this.persistProtectedKey(candidateKey, verifiedConfig);
+          this.setStatus('UNLOCKED', null);
+          return {
+            success: true,
+            masterKey: candidateKey,
+            masterKeyHex: candidateKey.toString('hex'),
+            config: verifiedConfig,
+            status: 'UNLOCKED',
+          };
+        } else {
+          if (env.encryptedDek) {
+            hadAuthFailure = true;
+          }
+        }
+      }
+
+      // 3. Fallback: if no envelopes and no config with verification token (new/clean state)
+      if (parsedEnvelopes.length === 0 && (!activeConfig || !activeConfig.verificationToken)) {
+        const saltHex =
+          activeConfig?.kdfSalt ||
+          Buffer.from(getRandomBytes(SALT_LENGTH_BYTES)).toString('hex');
+        let masterKey: Buffer;
+        if (format === 'hex') {
+          masterKey = Buffer.from(trimmed, 'hex');
+        } else {
+          masterKey = await deriveMasterKeyAsync(normalized, saltHex, PBKDF2_ITERATIONS);
+        }
+        let verificationToken: string;
+        try {
+          verificationToken = await createVerificationTokenAsync(masterKey);
+        } catch {
+          verificationToken = createVerificationToken(masterKey);
+        }
+        const newConfig: EncryptionConfig = {
+          enabled: true,
+          kdfSalt: saltHex,
+          kdfIterations: PBKDF2_ITERATIONS,
+          verificationToken,
+          keyVersion: CURRENT_ENCRYPTION_KEY_VERSION,
+          verifiedAtMs: Date.now(),
+        };
+
+        SessionKeyStore.setSessionKey(masterKey, normalized, newConfig);
+        await this.persistProtectedKey(masterKey, newConfig);
+        this.setStatus('UNLOCKED', null);
+        return {
+          success: true,
+          masterKey,
+          masterKeyHex: masterKey.toString('hex'),
+          config: newConfig,
+          status: 'UNLOCKED',
+        };
+      }
+
+      this.setStatus('LOCKED', 'Authentication failed');
+
+      if (hadAuthFailure || activeConfig?.verificationToken) {
+        return {
+          success: false,
+          status: 'LOCKED',
+          errorCode: 'INVALID_PASSPHRASE',
+          errorMessage: 'Incorrect recovery passphrase. Authentication tag mismatch.',
+        };
+      }
+
+      return {
+        success: false,
+        status: 'LOCKED',
+        errorCode: 'INVALID_PASSPHRASE',
+        errorMessage: 'Incorrect recovery passphrase. Verification failed.',
+      };
+    } catch (err: any) {
+      this.setStatus('LOCKED', err?.message);
+      return {
+        success: false,
+        status: 'LOCKED',
+        errorCode: 'STORAGE_ERROR',
+        errorMessage: `Unlock failed: ${err?.message || 'Unknown error'}`,
+      };
+    }
+  }
+}
+
+export const UnifiedEncryptionService = new UnifiedEncryptionServiceManager();
+
 

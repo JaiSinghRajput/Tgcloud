@@ -425,6 +425,42 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun storeSecureEncryptionConfig(configJson: String, promise: Promise) {
+        scope.launch {
+            try {
+                val success = TelegramCryptoService.storeEncryptionConfig(reactApplicationContext, configJson)
+                promise.resolve(success)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun loadSecureEncryptionConfig(promise: Promise) {
+        scope.launch {
+            try {
+                val cfg = TelegramCryptoService.loadEncryptionConfig(reactApplicationContext)
+                promise.resolve(cfg)
+            } catch (e: Exception) {
+                promise.resolve(null)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun clearSecureEncryptionConfig(promise: Promise) {
+        scope.launch {
+            try {
+                val success = TelegramCryptoService.clearEncryptionConfig(reactApplicationContext)
+                promise.resolve(success)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
     // ==========================================
     // Media Playback and Decryption Pipeline (Bug 3)
     // ==========================================

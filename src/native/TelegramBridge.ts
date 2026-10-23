@@ -102,6 +102,9 @@ interface TelegramBridgeNativeModule {
   loadSecureMasterKey(): Promise<string | null>;
   clearSecureMasterKey(): Promise<boolean>;
   isSecureStorageAvailable(): Promise<boolean>;
+  storeSecureEncryptionConfig(configJson: string): Promise<boolean>;
+  loadSecureEncryptionConfig(): Promise<string | null>;
+  clearSecureEncryptionConfig(): Promise<boolean>;
 
   // Cloud deletion
   deleteMessages(chatId: string, messageIds: string[]): Promise<boolean>;
@@ -326,6 +329,18 @@ const fallbackMock: TelegramBridgeNativeModule = {
   },
   isSecureStorageAvailable: async () => true,
 
+  storeSecureEncryptionConfig: async (configJson: string) => {
+    (fallbackMock as any)._secureVaultConfig = configJson;
+    return true;
+  },
+  loadSecureEncryptionConfig: async () => {
+    return (fallbackMock as any)._secureVaultConfig || null;
+  },
+  clearSecureEncryptionConfig: async () => {
+    (fallbackMock as any)._secureVaultConfig = null;
+    return true;
+  },
+
   deleteMessages: async () => true,
 };
 
@@ -388,6 +403,10 @@ export const TelegramBridgeService = {
   loadSecureMasterKey: () => nativeModule.loadSecureMasterKey(),
   clearSecureMasterKey: () => nativeModule.clearSecureMasterKey(),
   isSecureStorageAvailable: () => nativeModule.isSecureStorageAvailable(),
+  storeSecureEncryptionConfig: (configJson: string) =>
+    nativeModule.storeSecureEncryptionConfig(configJson),
+  loadSecureEncryptionConfig: () => nativeModule.loadSecureEncryptionConfig(),
+  clearSecureEncryptionConfig: () => nativeModule.clearSecureEncryptionConfig(),
 
   // Cloud deletion
   deleteMessages: (chatId: string, messageIds: string[]) =>

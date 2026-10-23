@@ -25,6 +25,7 @@ import {
   verifyRecoveryKeyAsync,
   normalizeRecoveryKey,
   persistMasterKeySecurely,
+  UnifiedEncryptionService,
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
 import { InAppVideoPlayer } from '../components/InAppVideoPlayer';
@@ -604,12 +605,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
       return;
     }
 
-    const words = normalizeRecoveryKey(raw).split(' ');
-    if (words.length < 12) {
-      setUnlockError('Recovery passphrase must contain all 12 words separated by spaces.');
-      return;
-    }
-
     // Instantly close modal as requested so the popup never hangs!
     setShowUnlockModal(false);
     setBackgroundUnlockStatus({
@@ -618,64 +613,16 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     });
 
     try {
-      // Attempt verification against the first locked encrypted item or config
-      const sampleLockedItem = items.find(
-        i => (i.isEncrypted || !!i.encryptionEnvelope) && i.encryptionEnvelope,
+      const candidateEnvelopes = items
+        .map(i => i.encryptionEnvelope)
+        .filter(Boolean) as (string | EncryptedItemEnvelope)[];
+
+      const result = await UnifiedEncryptionService.unlockWithPassphrase(
+        raw,
+        candidateEnvelopes,
       );
 
-      let isValid = false;
-
-      if (sampleLockedItem && sampleLockedItem.encryptionEnvelope) {
-        const encObj: EncryptedItemEnvelope =
-          typeof sampleLockedItem.encryptionEnvelope === 'string'
-            ? JSON.parse(sampleLockedItem.encryptionEnvelope)
-            : sampleLockedItem.encryptionEnvelope;
-
-        const verifyResult = await verifyPassphraseAgainstItemAsync(raw, encObj);
-        if (verifyResult.valid && verifyResult.masterKey) {
-          isValid = true;
-          SessionKeyStore.setSessionKey(verifyResult.masterKey, raw);
-          await persistMasterKeySecurely(
-            verifyResult.masterKeyHex || verifyResult.masterKey.toString('hex'),
-          );
-        } else {
-          setBackgroundUnlockStatus({
-            status: 'error',
-            message:
-              verifyResult.errorMessage ||
-              'Incorrect recovery passphrase. Tap here to retry.',
-          });
-          return;
-        }
-      } else {
-        // Fallback: check config if available
-        const cfg = SessionKeyStore.getConfig();
-        if (cfg) {
-          const verifyResult = await verifyRecoveryKeyAsync(raw, cfg);
-          if (verifyResult.valid && verifyResult.masterKeyHex) {
-            isValid = true;
-            const masterKey = Buffer.from(verifyResult.masterKeyHex, 'hex');
-            SessionKeyStore.setSessionKey(masterKey, raw, cfg);
-            await persistMasterKeySecurely(verifyResult.masterKeyHex);
-          } else {
-            setBackgroundUnlockStatus({
-              status: 'error',
-              message:
-                verifyResult.errorMessage ||
-                'Incorrect recovery passphrase. Tap here to retry.',
-            });
-            return;
-          }
-        } else {
-          setBackgroundUnlockStatus({
-            status: 'error',
-            message: 'No encrypted backups found to verify passphrase against.',
-          });
-          return;
-        }
-      }
-
-      if (isValid) {
+      if (result.success) {
         setBackgroundUnlockStatus({
           status: 'success',
           message: '✓ Recovery passphrase verified! Unlocked cloud backups.',
@@ -694,6 +641,13 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         setTimeout(() => {
           setBackgroundUnlockStatus(null);
         }, 4000);
+      } else {
+        setBackgroundUnlockStatus({
+          status: 'error',
+          message:
+            result.errorMessage ||
+            'Incorrect recovery passphrase. Tap here to retry.',
+        });
       }
     } catch (e: any) {
       setBackgroundUnlockStatus({
@@ -704,7 +658,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   };
 
   const handleLockAgain = async () => {
-    await SessionKeyStore.lockEncryption();
+    await UnifiedEncryptionService.lockEncryption();
   };
 
   // Deletion Confirmation Modal State (Gate: Local vs Remote Cloud)
