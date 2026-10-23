@@ -99,6 +99,7 @@ const VALID_MEDIA_TRANSITIONS: Record<MediaState, ReadonlySet<MediaState>> = {
     MediaState.CHANGED,
     MediaState.CLOUD_MISSING,
     MediaState.EXCLUDED,
+    MediaState.DISCOVERED,
   ]),
   [MediaState.RETRY_PENDING]: new Set([
     MediaState.QUEUED,

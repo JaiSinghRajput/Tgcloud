@@ -374,6 +374,58 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
     }
 
     // ==========================================
+    // Keystore-Backed Secure Key Persistence (Bug 1)
+    // ==========================================
+
+    @ReactMethod
+    fun storeSecureMasterKey(masterKeyHex: String, promise: Promise) {
+        scope.launch {
+            try {
+                if (masterKeyHex.isBlank() || masterKeyHex.length != 64) {
+                    promise.reject("INVALID_KEY", "Invalid 256-bit master key hex.")
+                    return@launch
+                }
+                val success = TelegramCryptoService.storeMasterKeyProtected(reactApplicationContext, masterKeyHex)
+                promise.resolve(success)
+            } catch (e: Exception) {
+                promise.reject("KEYSTORE_ERROR", "Failed to store master key securely: ${e.message}", e)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun loadSecureMasterKey(promise: Promise) {
+        scope.launch {
+            try {
+                val keyHex = TelegramCryptoService.loadMasterKeyProtected(reactApplicationContext)
+                promise.resolve(keyHex)
+            } catch (e: Exception) {
+                promise.resolve(null)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun clearSecureMasterKey(promise: Promise) {
+        scope.launch {
+            try {
+                val success = TelegramCryptoService.clearMasterKeyProtected(reactApplicationContext)
+                promise.resolve(success)
+            } catch (e: Exception) {
+                promise.resolve(false)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun isSecureStorageAvailable(promise: Promise) {
+        scope.launch {
+            val available = TelegramCryptoService.isKeystoreAvailable()
+            promise.resolve(available)
+        }
+    }
+
+    // ==========================================
     // Media Playback and Decryption Pipeline (Bug 3)
     // ==========================================
 
@@ -419,10 +471,17 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
 
-                val ciphertext = downloadedFile.readBytes()
+                // Disk space check before decrypting to temp file
+                val requiredSpace = downloadedFile.length() + 50 * 1024 * 1024L
+                if (reactApplicationContext.cacheDir.usableSpace < requiredSpace) {
+                    promise.reject("INSUFFICIENT_STORAGE", "Device storage is low. Please free up space.")
+                    return@launch
+                }
 
-                // If file payload is actually unencrypted media, play directly without failing
-                if (TelegramCryptoService.isPlaintextMedia(ciphertext)) {
+                // Read first 16 bytes to detect if file is already unencrypted without reading full payload
+                val header = ByteArray(16)
+                java.io.FileInputStream(downloadedFile).use { it.read(header) }
+                if (TelegramCryptoService.isPlaintextMedia(header)) {
                     val map = Arguments.createMap().apply {
                         putString("localUri", Uri.fromFile(downloadedFile).toString())
                         putString("tempFilePath", downloadedFile.absolutePath)
@@ -433,7 +492,7 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
 
-                // Decrypt encrypted video payload
+                // Decrypt encrypted video payload using streaming 64KB bounded buffer
                 val envelopeObj = JSONObject(envelopeJson)
                 val ivBase64 = envelopeObj.getString("iv")
                 val tagBase64 = envelopeObj.getString("tag")
@@ -445,12 +504,11 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                 val dekCiphertext = Base64.decode(encryptedDek, Base64.NO_WRAP)
                 val dek = TelegramCryptoService.decryptAesGcm(dekCiphertext, masterKey, dekIv, dekTag)
 
-                val decrypted = TelegramCryptoService.decryptAesGcm(ciphertext, dek, ivBase64, tagBase64)
-
                 val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_video_playback")
                 if (!cacheDir.exists()) cacheDir.mkdirs()
                 val tempDecryptedFile = File(cacheDir, "decrypted_${System.currentTimeMillis()}.mp4")
-                FileOutputStream(tempDecryptedFile).use { it.write(decrypted) }
+
+                TelegramCryptoService.decryptMediaFile(downloadedFile, tempDecryptedFile, dek, ivBase64, tagBase64)
 
                 val map = Arguments.createMap().apply {
                     putString("localUri", Uri.fromFile(tempDecryptedFile).toString())
@@ -485,10 +543,17 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
 
-                val ciphertext = downloadedFile.readBytes()
+                // Disk space check before decrypting to temp file
+                val requiredSpace = downloadedFile.length() + 20 * 1024 * 1024L
+                if (reactApplicationContext.cacheDir.usableSpace < requiredSpace) {
+                    promise.reject("INSUFFICIENT_STORAGE", "Device storage is low. Please free up space.")
+                    return@launch
+                }
 
-                // If file payload is actually unencrypted media, display directly without failing
-                if (TelegramCryptoService.isPlaintextMedia(ciphertext)) {
+                // Read first 16 bytes to detect if file is already unencrypted
+                val header = ByteArray(16)
+                java.io.FileInputStream(downloadedFile).use { it.read(header) }
+                if (TelegramCryptoService.isPlaintextMedia(header)) {
                     val map = Arguments.createMap().apply {
                         putString("localUri", Uri.fromFile(downloadedFile).toString())
                         putString("tempFilePath", downloadedFile.absolutePath)
@@ -499,7 +564,7 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     return@launch
                 }
 
-                // Decrypt encrypted photo payload
+                // Decrypt encrypted photo payload using streaming 64KB bounded buffer
                 val envelopeObj = JSONObject(envelopeJson)
                 val ivBase64 = envelopeObj.getString("iv")
                 val tagBase64 = envelopeObj.getString("tag")
@@ -511,12 +576,11 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                 val dekCiphertext = Base64.decode(encryptedDek, Base64.NO_WRAP)
                 val dek = TelegramCryptoService.decryptAesGcm(dekCiphertext, masterKey, dekIv, dekTag)
 
-                val decrypted = TelegramCryptoService.decryptAesGcm(ciphertext, dek, ivBase64, tagBase64)
-
                 val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_photo_playback")
                 if (!cacheDir.exists()) cacheDir.mkdirs()
                 val tempDecryptedFile = File(cacheDir, "decrypted_${System.currentTimeMillis()}.jpg")
-                FileOutputStream(tempDecryptedFile).use { it.write(decrypted) }
+
+                TelegramCryptoService.decryptMediaFile(downloadedFile, tempDecryptedFile, dek, ivBase64, tagBase64)
 
                 val map = Arguments.createMap().apply {
                     putString("localUri", Uri.fromFile(tempDecryptedFile).toString())
@@ -550,6 +614,7 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
     /**
      * Uploads media (photo or video) to the specified Telegram channel with versioned metadata caption.
      * When isEncrypted is true, encrypts the file locally with AES-256-GCM before sending ciphertext to Telegram.
+     * Uses streaming bounded buffers and disk space checks to prevent memory exhaustion and crashes.
      */
     @ReactMethod
     fun uploadMedia(
@@ -574,19 +639,30 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                 val modifiedAtMs = metaObj.optLong("modifiedAtMs", System.currentTimeMillis())
                 val contentHash = if (metaObj.has("contentHash") && !metaObj.isNull("contentHash")) metaObj.getString("contentHash") else null
 
+                // Disk space check before allocating temporary files
+                val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_upload")
+                if (!cacheDir.exists()) cacheDir.mkdirs()
+                val estimatedSize = metaObj.optLong("sizeBytes", 10 * 1024 * 1024L)
+                val requiredSpace = estimatedSize * 2 + 50 * 1024 * 1024L
+                if (cacheDir.usableSpace < requiredSpace) {
+                    throw IllegalStateException("Insufficient device storage for upload: requires at least ${requiredSpace / (1024 * 1024)}MB free space.")
+                }
+
                 // Resolve source file to local filesystem for reading
                 val uploadFile: File
                 if (uriString.startsWith("content://")) {
                     val contentUri = Uri.parse(uriString)
-                    val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_upload")
-                    if (!cacheDir.exists()) cacheDir.mkdirs()
                     val cleanName = originalName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
                     val temp = File(cacheDir, "upload_raw_${System.currentTimeMillis()}_$cleanName")
                     val inputStream = reactApplicationContext.contentResolver.openInputStream(contentUri)
                         ?: throw IllegalStateException("Could not open content stream for $uriString")
+                    val buffer = ByteArray(TelegramCryptoService.BUFFER_SIZE)
                     inputStream.use { input ->
                         FileOutputStream(temp).use { output ->
-                            input.copyTo(output)
+                            var read: Int
+                            while (input.read(buffer).also { read = it } != -1) {
+                                output.write(buffer, 0, read)
+                            }
                         }
                     }
                     tempRawSourceFile = temp
@@ -612,9 +688,7 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     val dek = ByteArray(32)
                     java.security.SecureRandom().nextBytes(dek)
 
-                    // 2. Encrypt media content with DEK
-                    val cacheDir = File(reactApplicationContext.cacheDir, "tgcloud_upload")
-                    if (!cacheDir.exists()) cacheDir.mkdirs()
+                    // 2. Encrypt media content with DEK using streaming 64KB bounded buffers
                     val encFile = File(cacheDir, "upload_enc_${System.currentTimeMillis()}.bin")
                     val mediaEnc = TelegramCryptoService.encryptMediaFile(uploadFile, encFile, dek)
                     tempEncryptedFile = encFile
@@ -685,8 +759,26 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                     finalFileToUpload = uploadFile
                 }
 
+                // Safe video metadata extraction
+                var videoDurationSec = 0
+                var videoWidth = 0
+                var videoHeight = 0
+                if (mediaType == "video") {
+                    try {
+                        val retriever = android.media.MediaMetadataRetriever()
+                        retriever.setDataSource(uploadFile.absolutePath)
+                        val durationStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        val wStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                        val hStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                        videoDurationSec = (durationStr?.toLongOrNull() ?: 0L).toInt() / 1000
+                        videoWidth = wStr?.toIntOrNull() ?: 0
+                        videoHeight = hStr?.toIntOrNull() ?: 0
+                        retriever.release()
+                    } catch (_: Exception) {}
+                }
+
                 val result = if (mediaType == "video" && !isEncrypted) {
-                    mediaManager.uploadVideo(cId, finalFileToUpload, envelope)
+                    mediaManager.uploadVideo(cId, finalFileToUpload, envelope, videoDurationSec, videoWidth, videoHeight)
                 } else {
                     mediaManager.uploadPhoto(cId, finalFileToUpload, envelope)
                 }
@@ -717,6 +809,30 @@ class TelegramBridgeModule(reactContext: ReactApplicationContext) :
                         TelegramCryptoService.secureWipe(it)
                     } catch (_: Exception) {}
                 }
+            }
+        }
+    }
+
+    /**
+     * Deletes specified messages from Telegram cloud channel.
+     */
+    @ReactMethod
+    fun deleteMessages(chatId: String, messageIds: com.facebook.react.bridge.ReadableArray, promise: Promise) {
+        scope.launch {
+            try {
+                val cId = chatId.toLong()
+                val idList = mutableListOf<Long>()
+                for (i in 0 until messageIds.size()) {
+                    val idStr = messageIds.getString(i)
+                    val id = idStr?.toLongOrNull()
+                    if (id != null) {
+                        idList.add(id)
+                    }
+                }
+                val success = mediaManager.deleteMessages(cId, idList)
+                promise.resolve(success)
+            } catch (e: Exception) {
+                promise.reject("DELETE_ERROR", "Failed to delete messages from Telegram: ${e.message}", e)
             }
         }
     }

@@ -145,7 +145,7 @@ describe('React Native Simplified UI Screens', () => {
   });
 
   it('renders MainApp shell with minimal 3-tab navigation', async () => {
-    jest.spyOn(TelegramBridgeService, 'getAuthState').mockResolvedValue({
+    const authSpy = jest.spyOn(TelegramBridgeService, 'getAuthState').mockResolvedValue({
       state: 'READY',
       userId: 12345,
       firstName: 'Alex',
@@ -169,6 +169,8 @@ describe('React Native Simplified UI Screens', () => {
     expect(root.findAllByProps({ accessibilityLabel: 'Dashboard tab' })).toHaveLength(0);
     expect(root.findAllByProps({ accessibilityLabel: 'Scan Review tab' })).toHaveLength(0);
     expect(root.findAllByProps({ accessibilityLabel: 'Telegram tab' })).toHaveLength(0);
+
+    authSpy.mockRestore();
   });
 
   it('renders LoginScreen with phone number and OTP flow', async () => {

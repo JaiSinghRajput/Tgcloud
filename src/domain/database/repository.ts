@@ -43,6 +43,12 @@ export interface DatabaseRepository {
   getTelegramObjectForMedia(
     mediaItemId: string,
   ): Promise<DbTelegramObject | null>;
+  deleteTelegramObject(channelId: string, messageId: string): Promise<void>;
+  reconcileTelegramObjects(
+    channelId: string,
+    validMessageIds: Set<string>,
+  ): Promise<number>;
+  deleteMediaItem(id: string): Promise<void>;
 
   // Exclusions
   addFolderExclusion(
@@ -280,6 +286,52 @@ export class InMemoryDatabaseRepository implements DatabaseRepository {
       if (obj.mediaItemId === mediaItemId) return obj;
     }
     return null;
+  }
+
+  async deleteTelegramObject(channelId: string, messageId: string): Promise<void> {
+    for (const [key, obj] of this.telegramObjects.entries()) {
+      if (obj.channelId === channelId && obj.messageId === messageId) {
+        this.telegramObjects.delete(key);
+        const media = this.mediaItems.get(obj.mediaItemId);
+        if (media && media.state === MediaState.BACKED_UP) {
+          media.state = MediaState.DISCOVERED;
+          media.updatedAtMsLocal = Date.now();
+        }
+      }
+    }
+  }
+
+  async reconcileTelegramObjects(
+    channelId: string,
+    validMessageIds: Set<string>,
+  ): Promise<number> {
+    let removedCount = 0;
+    for (const [key, obj] of this.telegramObjects.entries()) {
+      if (obj.channelId === channelId && !validMessageIds.has(obj.messageId)) {
+        this.telegramObjects.delete(key);
+        removedCount++;
+        const media = this.mediaItems.get(obj.mediaItemId);
+        if (media && media.state === MediaState.BACKED_UP) {
+          media.state = MediaState.DISCOVERED;
+          media.updatedAtMsLocal = Date.now();
+        }
+      }
+    }
+    return removedCount;
+  }
+
+  async deleteMediaItem(id: string): Promise<void> {
+    this.mediaItems.delete(id);
+    for (const [key, job] of this.uploadJobs.entries()) {
+      if (job.mediaItemId === id) {
+        this.uploadJobs.delete(key);
+      }
+    }
+    for (const [key, obj] of this.telegramObjects.entries()) {
+      if (obj.mediaItemId === id) {
+        this.telegramObjects.delete(key);
+      }
+    }
   }
 
   async addFolderExclusion(

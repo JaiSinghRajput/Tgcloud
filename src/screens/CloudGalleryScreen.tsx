@@ -24,6 +24,7 @@ import {
   verifyPassphraseAgainstItemAsync,
   verifyRecoveryKeyAsync,
   normalizeRecoveryKey,
+  persistMasterKeySecurely,
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
 import { InAppVideoPlayer } from '../components/InAppVideoPlayer';
@@ -101,6 +102,11 @@ export interface CloudGalleryScreenProps {
   onRecreateDestination?: (type: 'photo' | 'video') => Promise<void>;
   onSetupDestinations?: () => Promise<void>;
   syncFreshnessState?: 'synced' | 'syncing' | 'offline' | 'error';
+  syncError?: string | null;
+  onDeleteLocalMedia?: (sourceKey: string) => Promise<boolean>;
+  onDeleteCloudMedia?: (
+    items: CloudMediaItem[],
+  ) => Promise<{ successCount: number; failedCount: number }>;
 }
 
 export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
@@ -127,6 +133,9 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   onRecreateDestination,
   onSetupDestinations,
   syncFreshnessState = 'synced',
+  syncError = null,
+  onDeleteLocalMedia,
+  onDeleteCloudMedia,
 }) => {
   // Navigation View: 'device' (Local Gallery) or 'cloud' (Telegram Cloud Backups)
   const [activeView, setActiveView] = useState<'device' | 'cloud'>(initialView);
@@ -479,10 +488,11 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 
   // Selection calculations
   const totalSelectedBytes = useMemo(() => {
-    return scannedItems
+    const list = activeView === 'cloud' ? items : scannedItems;
+    return list
       .filter(i => selectedItemIds.has(i.id))
       .reduce((acc, curr) => acc + curr.sizeBytes, 0);
-  }, [scannedItems, selectedItemIds]);
+  }, [activeView, items, scannedItems, selectedItemIds]);
 
   const handleItemPress = (item: DiscoveredMediaItem) => {
     if (isSelectionMode) {
@@ -505,6 +515,20 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   };
 
   const handleCloudItemPress = (item: CloudMediaItem) => {
+    if (isSelectionMode) {
+      const next = new Set(selectedItemIds);
+      if (next.has(item.id)) {
+        next.delete(item.id);
+        if (next.size === 0) {
+          setIsSelectionMode(false);
+        }
+      } else {
+        next.add(item.id);
+      }
+      setSelectedItemIds(next);
+      return;
+    }
+
     const isItemLocked = (item.isEncrypted || !!item.encryptionEnvelope) && !isUnlocked;
     if (isItemLocked) {
       setPassphraseInput('');
@@ -519,6 +543,13 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     }
   };
 
+  const handleCloudItemLongPress = (item: CloudMediaItem) => {
+    if (!isSelectionMode) {
+      setIsSelectionMode(true);
+      setSelectedItemIds(new Set([item.id]));
+    }
+  };
+
   const handleItemLongPress = (item: DiscoveredMediaItem) => {
     if (!isSelectionMode) {
       setIsSelectionMode(true);
@@ -527,11 +558,12 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   };
 
   const handleToggleSelectAll = () => {
-    if (selectedItemIds.size === filteredDeviceItems.length) {
+    const currentList = activeView === 'cloud' ? filteredCloudItems : filteredDeviceItems;
+    if (selectedItemIds.size === currentList.length) {
       setSelectedItemIds(new Set());
       setIsSelectionMode(false);
     } else {
-      setSelectedItemIds(new Set(filteredDeviceItems.map(i => i.id)));
+      setSelectedItemIds(new Set(currentList.map(i => i.id)));
     }
   };
 
@@ -603,6 +635,9 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         if (verifyResult.valid && verifyResult.masterKey) {
           isValid = true;
           SessionKeyStore.setSessionKey(verifyResult.masterKey, raw);
+          await persistMasterKeySecurely(
+            verifyResult.masterKeyHex || verifyResult.masterKey.toString('hex'),
+          );
         } else {
           setBackgroundUnlockStatus({
             status: 'error',
@@ -621,6 +656,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             isValid = true;
             const masterKey = Buffer.from(verifyResult.masterKeyHex, 'hex');
             SessionKeyStore.setSessionKey(masterKey, raw, cfg);
+            await persistMasterKeySecurely(verifyResult.masterKeyHex);
           } else {
             setBackgroundUnlockStatus({
               status: 'error',
@@ -667,8 +703,99 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     }
   };
 
-  const handleLockAgain = () => {
-    SessionKeyStore.clear();
+  const handleLockAgain = async () => {
+    await SessionKeyStore.lockEncryption();
+  };
+
+  // Deletion Confirmation Modal State (Gate: Local vs Remote Cloud)
+  const [deleteConfirmation, setDeleteConfirmation] = useState<{
+    visible: boolean;
+    type: 'local' | 'cloud' | 'cloud_bulk';
+    items: (DiscoveredMediaItem | CloudMediaItem)[];
+    isDeleting: boolean;
+    error?: string | null;
+  }>({
+    visible: false,
+    type: 'local',
+    items: [],
+    isDeleting: false,
+    error: null,
+  });
+
+  const handlePromptDeleteViewerItem = (
+    item: DiscoveredMediaItem | CloudMediaItem | null,
+  ) => {
+    if (!item) return;
+    const isLocal = activeView === 'device' || 'sourceKey' in item;
+    setDeleteConfirmation({
+      visible: true,
+      type: isLocal ? 'local' : 'cloud',
+      items: [item],
+      isDeleting: false,
+      error: null,
+    });
+  };
+
+  const handlePromptDeleteCloudSelected = () => {
+    const selectedItems = items.filter(i => selectedItemIds.has(i.id));
+    if (selectedItems.length === 0) return;
+    setDeleteConfirmation({
+      visible: true,
+      type: 'cloud_bulk',
+      items: selectedItems,
+      isDeleting: false,
+      error: null,
+    });
+  };
+
+  const handleExecuteDeletion = async () => {
+    if (deleteConfirmation.items.length === 0) return;
+    setDeleteConfirmation(prev => ({ ...prev, isDeleting: true, error: null }));
+    try {
+      if (deleteConfirmation.type === 'local') {
+        const target = deleteConfirmation.items[0] as DiscoveredMediaItem;
+        if (target.sourceKey && onDeleteLocalMedia) {
+          const success = await onDeleteLocalMedia(target.sourceKey);
+          if (!success) {
+            throw new Error('Local media deletion was denied or failed.');
+          }
+        }
+        await handleCloseViewer();
+        setDeleteConfirmation(prev => ({
+          ...prev,
+          visible: false,
+          isDeleting: false,
+        }));
+        onRescan?.();
+      } else {
+        const targets = deleteConfirmation.items as CloudMediaItem[];
+        if (onDeleteCloudMedia) {
+          const res = await onDeleteCloudMedia(targets);
+          if (res.failedCount > 0 && res.successCount === 0) {
+            throw new Error(
+              `Failed to delete remote Telegram messages (${res.failedCount} failed).`,
+            );
+          }
+        }
+        if (previewItem) {
+          await handleCloseViewer();
+        }
+        setIsSelectionMode(false);
+        setSelectedItemIds(new Set());
+        setDeleteConfirmation(prev => ({
+          ...prev,
+          visible: false,
+          isDeleting: false,
+        }));
+        onResyncChannels?.();
+      }
+    } catch (err: any) {
+      setDeleteConfirmation(prev => ({
+        ...prev,
+        isDeleting: false,
+        error: err?.message || 'Deletion failed',
+      }));
+    }
   };
 
   const hasPermissionIssue =
@@ -750,6 +877,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
   // Render Cloud Media Thumbnail Item (Thumbnails Only, No Cards)
   const renderCloudGridItem = ({ item }: { item: CloudMediaItem }) => {
     const isItemLocked = (item.isEncrypted || !!item.encryptionEnvelope) && !isUnlocked;
+    const isSelected = selectedItemIds.has(item.id);
     const localMatch = scannedItems?.find(
       s => s.id === item.id || s.displayName === item.originalName,
     );
@@ -758,9 +886,14 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     return (
       <TouchableOpacity
         key={item.id}
-        style={[styles.thumbnailContainer, { width: itemSize, height: itemSize }]}
+        style={[
+          styles.thumbnailContainer,
+          { width: itemSize, height: itemSize },
+          isSelected && styles.thumbnailSelected,
+        ]}
         activeOpacity={0.8}
         onPress={() => handleCloudItemPress(item)}
+        onLongPress={() => handleCloudItemLongPress(item)}
         accessibilityLabel={item.originalName}
         testID={`cloud-item-${item.id}`}
       >
@@ -800,6 +933,18 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             <Text style={styles.encryptedBadgeText}>
               {isItemLocked ? '🔒' : '🛡️'}
             </Text>
+          </View>
+        )}
+
+        {/* Selection Checkbox */}
+        {isSelectionMode && (
+          <View
+            style={[
+              styles.selectionOverlayCheck,
+              isSelected && styles.selectionOverlayCheckActive,
+            ]}
+          >
+            {isSelected && <Text style={styles.selectionCheckmarkText}>✓</Text>}
           </View>
         )}
       </TouchableOpacity>
@@ -982,6 +1127,29 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
             </TouchableOpacity>
           )}
 
+          {activeView === 'cloud' && (
+            <TouchableOpacity
+              style={[
+                styles.selectToggleChip,
+                isSelectionMode && styles.selectToggleChipActive,
+              ]}
+              onPress={() => {
+                setIsSelectionMode(prev => !prev);
+                setSelectedItemIds(new Set());
+              }}
+              testID="cloud-select-toggle-chip"
+            >
+              <Text
+                style={[
+                  styles.selectToggleChipText,
+                  isSelectionMode && styles.selectToggleChipTextActive,
+                ]}
+              >
+                {isSelectionMode ? 'Cancel' : '✓ Select'}
+              </Text>
+            </TouchableOpacity>
+          )}
+
           {activeView === 'cloud' && isUnlocked && (
             <TouchableOpacity style={styles.lockNowChip} onPress={handleLockAgain}>
               <Text style={styles.lockNowChipText}>🔒 Lock</Text>
@@ -1076,6 +1244,29 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               </TouchableOpacity>
             )}
           </View>
+
+          {/* Sync Error Banner */}
+          {syncFreshnessState === 'error' && (
+            <View style={styles.syncErrorBanner} testID="sync-error-banner">
+              <Text style={styles.syncErrorIcon}>⚠️</Text>
+              <View style={styles.syncErrorTextContainer}>
+                <Text style={styles.syncErrorTitle}>Cloud Synchronization Incomplete</Text>
+                <Text style={styles.syncErrorSubtitle}>
+                  {syncError ||
+                    'Could not complete sync with Telegram. Showing last verified cloud backup state.'}
+                </Text>
+              </View>
+              {onResyncChannels && (
+                <TouchableOpacity
+                  style={styles.syncRetryBtn}
+                  onPress={onResyncChannels}
+                  testID="sync-retry-btn"
+                >
+                  <Text style={styles.syncRetryBtnText}>↻ Retry</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
 
           {/* Deleted Channel Alert & Recovery Action */}
           {(channels?.photoStatus?.state === 'DELETED' ||
@@ -1252,7 +1443,10 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               testID="select-all-toggle-btn"
             >
               <Text style={styles.selectToggleBtnText}>
-                {selectedItemIds.size === filteredDeviceItems.length
+                {selectedItemIds.size ===
+                (activeView === 'cloud'
+                  ? filteredCloudItems.length
+                  : filteredDeviceItems.length)
                   ? 'Deselect All'
                   : 'Select All'}
               </Text>
@@ -1269,19 +1463,35 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               <Text style={styles.cancelSelectBtnText}>Cancel</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[
-                styles.backupSelectedBtn,
-                selectedItemIds.size === 0 && styles.btnDisabled,
-              ]}
-              disabled={selectedItemIds.size === 0}
-              onPress={handleBackupSelected}
-              testID="backup-selected-btn"
-            >
-              <Text style={styles.backupSelectedBtnText}>
-                Backup ({selectedItemIds.size})
-              </Text>
-            </TouchableOpacity>
+            {activeView === 'cloud' ? (
+              <TouchableOpacity
+                style={[
+                  styles.deleteCloudSelectedBtn,
+                  selectedItemIds.size === 0 && styles.btnDisabled,
+                ]}
+                disabled={selectedItemIds.size === 0}
+                onPress={handlePromptDeleteCloudSelected}
+                testID="delete-cloud-selected-btn"
+              >
+                <Text style={styles.deleteCloudSelectedBtnText}>
+                  🗑️ Delete from Cloud ({selectedItemIds.size})
+                </Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={[
+                  styles.backupSelectedBtn,
+                  selectedItemIds.size === 0 && styles.btnDisabled,
+                ]}
+                disabled={selectedItemIds.size === 0}
+                onPress={handleBackupSelected}
+                testID="backup-selected-btn"
+              >
+                <Text style={styles.backupSelectedBtnText}>
+                  Backup ({selectedItemIds.size})
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
         </View>
       )}
@@ -1333,6 +1543,28 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                     : previewItem.originalName}
                 </Text>
               </View>
+            )}
+
+            {/* Minimal Floating Delete Button */}
+            {showViewerControls && (
+              <TouchableOpacity
+                style={[
+                  styles.viewerDeleteBtn,
+                  {
+                    top: Math.max(insets.top, 16),
+                    right: Math.max(insets.right, 16),
+                  },
+                ]}
+                onPress={() => handlePromptDeleteViewerItem(previewItem)}
+                accessibilityLabel="Delete media item"
+                testID="viewer-delete-btn"
+              >
+                <Text style={styles.viewerDeleteBtnText}>
+                  {activeView === 'device' || 'sourceKey' in previewItem
+                    ? '🗑️ Delete from Device'
+                    : '🗑️ Delete from Cloud'}
+                </Text>
+              </TouchableOpacity>
             )}
 
             {/* Left and Right Navigation Arrows */}
@@ -1561,6 +1793,74 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           </View>
         </Modal>
       )}
+
+      {/* Deletion Confirmation Modal */}
+      <Modal
+        visible={deleteConfirmation.visible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => {
+          if (!deleteConfirmation.isDeleting) {
+            setDeleteConfirmation(prev => ({ ...prev, visible: false }));
+          }
+        }}
+        testID="delete-confirmation-modal"
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.unlockModalCard}>
+            <View style={styles.unlockModalHeader}>
+              <Text style={styles.unlockModalIcon}>🗑️</Text>
+              <Text style={styles.deleteModalTitle}>
+                {deleteConfirmation.type === 'local'
+                  ? 'Delete from Device Gallery?'
+                  : deleteConfirmation.type === 'cloud_bulk'
+                  ? `Delete ${deleteConfirmation.items.length} Backups from Cloud?`
+                  : 'Delete Backup from Cloud?'}
+              </Text>
+            </View>
+
+            <Text style={styles.deleteModalDesc}>
+              {deleteConfirmation.type === 'local'
+                ? 'This permanently deletes the file from your local device storage. If already uploaded to Telegram, your cloud copy remains intact.'
+                : deleteConfirmation.type === 'cloud_bulk'
+                ? `Permanently delete these ${deleteConfirmation.items.length} backup messages from Telegram? Your local gallery files will NOT be deleted.`
+                : `Permanently delete this backup message (ID: ${(deleteConfirmation.items[0] as CloudMediaItem)?.messageId || 'N/A'}) from Telegram channel (${(deleteConfirmation.items[0] as CloudMediaItem)?.channelId || 'N/A'})? Your local gallery file will NOT be deleted.`}
+            </Text>
+
+            {deleteConfirmation.error && (
+              <View style={styles.deleteErrorBox}>
+                <Text style={styles.deleteErrorText}>⚠ {deleteConfirmation.error}</Text>
+              </View>
+            )}
+
+            <View style={styles.deleteModalButtons}>
+              <TouchableOpacity
+                style={styles.cancelDeleteBtn}
+                onPress={() => setDeleteConfirmation(prev => ({ ...prev, visible: false }))}
+                disabled={deleteConfirmation.isDeleting}
+                testID="cancel-delete-btn"
+              >
+                <Text style={styles.cancelDeleteBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.confirmDeleteBtn, deleteConfirmation.isDeleting && styles.btnDisabled]}
+                onPress={handleExecuteDeletion}
+                disabled={deleteConfirmation.isDeleting}
+                testID="confirm-delete-btn"
+              >
+                {deleteConfirmation.isDeleting ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.confirmDeleteBtnText}>
+                    {deleteConfirmation.type === 'local' ? 'Delete from Device' : 'Delete from Cloud'}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* 8. Unlock Passphrase Modal */}
       <Modal
@@ -2694,5 +2994,143 @@ const styles = StyleSheet.create({
   },
   bgStatusSpinner: {
     marginRight: 8,
+  },
+  deleteCloudSelectedBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  deleteCloudSelectedBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  selectToggleChip: {
+    backgroundColor: '#1f2937',
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#374151',
+  },
+  selectToggleChipActive: {
+    backgroundColor: '#374151',
+    borderColor: '#60a5fa',
+  },
+  selectToggleChipText: {
+    color: '#9ca3af',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  selectToggleChipTextActive: {
+    color: '#ffffff',
+  },
+  viewerDeleteBtn: {
+    position: 'absolute',
+    backgroundColor: 'rgba(220, 38, 38, 0.85)',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    zIndex: 100,
+  },
+  viewerDeleteBtnText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  deleteModalTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#ffffff',
+    marginLeft: 8,
+  },
+  deleteModalDesc: {
+    fontSize: 13,
+    color: '#d1d5db',
+    lineHeight: 18,
+    marginBottom: 16,
+  },
+  deleteErrorBox: {
+    backgroundColor: '#2d1515',
+    padding: 10,
+    borderRadius: 6,
+    marginBottom: 12,
+  },
+  deleteErrorText: {
+    color: '#f87171',
+    fontSize: 12,
+  },
+  deleteModalButtons: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'flex-end',
+  },
+  cancelDeleteBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: '#1f2937',
+  },
+  cancelDeleteBtnText: {
+    color: '#e5e7eb',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  confirmDeleteBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    backgroundColor: '#dc2626',
+    minWidth: 90,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmDeleteBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  syncErrorBanner: {
+    marginHorizontal: 16,
+    marginBottom: 10,
+    padding: 12,
+    backgroundColor: '#2d1515',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#b91c1c',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  syncErrorIcon: {
+    fontSize: 20,
+  },
+  syncErrorTextContainer: {
+    flex: 1,
+  },
+  syncErrorTitle: {
+    color: '#f87171',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  syncErrorSubtitle: {
+    color: '#d1d5db',
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  syncRetryBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+  },
+  syncRetryBtnText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700',
   },
 });

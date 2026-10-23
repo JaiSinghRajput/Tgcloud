@@ -76,12 +76,14 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         }
         val message: TdApi.Message = tdLibService.send(sendMessageReq)
 
-        // Wait for file upload to complete
         val remoteFile = extractFileFromMessage(message)
         val fileId = remoteFile?.id ?: 0
 
+        // Wait for TDLib to finish reading and uploading the file before returning
+        val finalMessageId = waitForUploadCompletion(message, fileId)
+
         return TelegramMediaResult(
-            messageId = message.id,
+            messageId = finalMessageId,
             chatId = message.chatId,
             fileId = fileId,
             remoteFileId = remoteFile?.remote?.id,
@@ -148,14 +150,67 @@ class TelegramMediaManager(private val tdLibService: TdLibService) {
         val remoteFile = extractFileFromMessage(message)
         val fileId = remoteFile?.id ?: 0
 
+        // Wait for TDLib to finish reading and uploading the file before returning
+        val finalMessageId = waitForUploadCompletion(message, fileId)
+
         return TelegramMediaResult(
-            messageId = message.id,
+            messageId = finalMessageId,
             chatId = message.chatId,
             fileId = fileId,
             remoteFileId = remoteFile?.remote?.id,
             metadata = metadata,
             date = message.date
         )
+    }
+
+    /**
+     * Waits for TDLib to finish reading and uploading the file.
+     * Prevents temporary file deletion while transfer is still active.
+     */
+    private suspend fun waitForUploadCompletion(message: TdApi.Message, fileId: Int, timeoutMs: Long = 180_000): Long {
+        if (message.sendingState == null) {
+            return message.id
+        }
+
+        val result = withTimeoutOrNull(timeoutMs) {
+            tdLibService.updates.filter { update ->
+                when (update) {
+                    is TdApi.UpdateMessageSendSucceeded -> {
+                        update.message.id == message.id || update.oldMessageId == message.id
+                    }
+                    is TdApi.UpdateMessageSendFailed -> {
+                        if (update.message.id == message.id || update.oldMessageId == message.id) {
+                            throw IllegalStateException("Telegram message upload failed: [${update.errorCode}] ${update.errorMessage}")
+                        }
+                        false
+                    }
+                    is TdApi.UpdateFile -> {
+                        update.file.id == fileId && update.file.remote.isUploadingCompleted
+                    }
+                    else -> false
+                }
+            }.first()
+        }
+
+        return if (result is TdApi.UpdateMessageSendSucceeded) {
+            result.message.id
+        } else {
+            message.id
+        }
+    }
+
+    /**
+     * Deletes specified messages from the channel for all participants.
+     */
+    suspend fun deleteMessages(chatId: Long, messageIds: List<Long>): Boolean {
+        if (messageIds.isEmpty()) return true
+        val req = TdApi.DeleteMessages().apply {
+            this.chatId = chatId
+            this.messageIds = messageIds.toLongArray()
+            this.revoke = true
+        }
+        tdLibService.send(req)
+        return true
     }
 
     /**

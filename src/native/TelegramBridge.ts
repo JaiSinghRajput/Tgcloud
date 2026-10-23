@@ -96,6 +96,15 @@ interface TelegramBridgeNativeModule {
     fileId: number;
     contentHash?: string;
   }>;
+
+  // Keystore-backed Master Key Persistence
+  storeSecureMasterKey(masterKeyHex: string): Promise<boolean>;
+  loadSecureMasterKey(): Promise<string | null>;
+  clearSecureMasterKey(): Promise<boolean>;
+  isSecureStorageAvailable(): Promise<boolean>;
+
+  // Cloud deletion
+  deleteMessages(chatId: string, messageIds: string[]): Promise<boolean>;
 }
 
 const { TelegramBridge } = NativeModules;
@@ -303,6 +312,21 @@ const fallbackMock: TelegramBridgeNativeModule = {
     isTemporary: false,
   }),
   cleanupTempMedia: async () => true,
+
+  storeSecureMasterKey: async (masterKeyHex: string) => {
+    (fallbackMock as any)._secureVaultKey = masterKeyHex;
+    return true;
+  },
+  loadSecureMasterKey: async () => {
+    return (fallbackMock as any)._secureVaultKey || null;
+  },
+  clearSecureMasterKey: async () => {
+    (fallbackMock as any)._secureVaultKey = null;
+    return true;
+  },
+  isSecureStorageAvailable: async () => true,
+
+  deleteMessages: async () => true,
 };
 
 const nativeModule: TelegramBridgeNativeModule =
@@ -357,6 +381,17 @@ export const TelegramBridgeService = {
     ivBase64: string,
     tagBase64: string,
   ) => nativeModule.decryptPayload(ciphertextBase64, keyHex, ivBase64, tagBase64),
+
+  // Keystore-backed Master Key Persistence
+  storeSecureMasterKey: (masterKeyHex: string) =>
+    nativeModule.storeSecureMasterKey(masterKeyHex),
+  loadSecureMasterKey: () => nativeModule.loadSecureMasterKey(),
+  clearSecureMasterKey: () => nativeModule.clearSecureMasterKey(),
+  isSecureStorageAvailable: () => nativeModule.isSecureStorageAvailable(),
+
+  // Cloud deletion
+  deleteMessages: (chatId: string, messageIds: string[]) =>
+    nativeModule.deleteMessages(chatId, messageIds),
 
   // Video Playback
   playVideo: (uriString: string) => nativeModule.playVideo(uriString),

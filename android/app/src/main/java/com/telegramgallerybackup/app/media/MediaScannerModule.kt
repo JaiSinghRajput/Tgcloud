@@ -291,6 +291,32 @@ class MediaScannerModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun deleteLocalMedia(uriString: String, promise: Promise) {
+        scope.launch {
+            try {
+                val uri = Uri.parse(uriString)
+                if (uriString.startsWith("content://")) {
+                    val rowsDeleted = reactContext.contentResolver.delete(uri, null, null)
+                    promise.resolve(rowsDeleted > 0)
+                } else {
+                    val filePath = if (uriString.startsWith("file://")) uri.path ?: "" else uriString
+                    val file = java.io.File(filePath)
+                    if (file.exists()) {
+                        val deleted = file.delete()
+                        promise.resolve(deleted)
+                    } else {
+                        promise.resolve(false)
+                    }
+                }
+            } catch (e: SecurityException) {
+                promise.reject("PERMISSION_DENIED", "User authorization required to delete this media file.", e)
+            } catch (e: Exception) {
+                promise.reject("DELETE_ERROR", "Failed to delete local media: ${e.message}", e)
+            }
+        }
+    }
+
     private fun scanCollection(
         collectionUri: Uri,
         mediaType: String,

@@ -29,7 +29,11 @@ import {
   PermissionService,
   MediaPermissionStatus,
 } from '../domain/permissions/permissionService';
-import { NetworkPolicy, ConflictPolicy } from '../domain/backup/stateMachine';
+import {
+  NetworkPolicy,
+  ConflictPolicy,
+  MediaState,
+} from '../domain/backup/stateMachine';
 import { TelegramBackupChannels, TelegramHistoryItem } from '../types/telegram';
 import { RestoreManager } from '../domain/restore/restoreManager';
 import {
@@ -37,6 +41,10 @@ import {
   deriveMasterKeyAsync,
   normalizeRecoveryKey,
   decryptBuffer,
+  loadPersistedMasterKey,
+  persistMasterKeySecurely,
+  clearPersistedMasterKey,
+  verifyMasterKeyAgainstConfig,
 } from '../domain/crypto/encryptionService';
 import { DbUploadJob } from '../domain/database/types';
 import { EncryptionConfig } from '../types/encryption';
@@ -56,6 +64,9 @@ export const MainApp: React.FC = () => {
 
   // Telegram Channels & Cloud Media
   const [channels, setChannels] = useState<TelegramBackupChannels | null>(null);
+  const channelsRef = useRef<TelegramBackupChannels | null>(null);
+  channelsRef.current = channels;
+
   const [cloudItems, setCloudItems] = useState<CloudMediaItem[]>([]);
   const [remoteHistoryItems, setRemoteHistoryItems] = useState<TelegramHistoryItem[]>([]);
 
@@ -70,6 +81,14 @@ export const MainApp: React.FC = () => {
   const [requiresCharging, setRequiresCharging] = useState<boolean>(false);
   const [encryptionEnabled, setEncryptionEnabled] = useState<boolean>(false);
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [autoBackupEnabled, setAutoBackupEnabled] = useState<boolean>(false);
+  const [autoBackupIncludePhotos, setAutoBackupIncludePhotos] = useState<boolean>(true);
+  const [autoBackupIncludeVideos, setAutoBackupIncludeVideos] = useState<boolean>(true);
+  const [syncFreshnessState, setSyncFreshnessState] = useState<
+    'synced' | 'syncing' | 'offline' | 'error'
+  >('synced');
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [keyRecoveryNotice, setKeyRecoveryNotice] = useState<string | null>(null);
   const [activeProgress, setActiveProgress] =
     useState<BackupTransferProgress | null>(null);
   const [queueStats, setQueueStats] = useState({
@@ -126,16 +145,41 @@ export const MainApp: React.FC = () => {
   // Concurrency guard to prevent parallel channel synchronizations
   const isSyncingDestinationsRef = useRef(false);
 
+  // Helper to paginate full channel history from Telegram
+  const fetchAllChannelHistory = async (
+    chatId: string,
+    maxTotal: number = 2000,
+  ): Promise<TelegramHistoryItem[]> => {
+    const all: TelegramHistoryItem[] = [];
+    let fromMessageId = '0';
+    const batchSize = 100;
+
+    while (all.length < maxTotal) {
+      const batch = await TelegramBridgeService.getChannelHistory(
+        chatId,
+        batchSize,
+        fromMessageId,
+      );
+      if (!batch || batch.length === 0) break;
+      all.push(...batch);
+      if (batch.length < batchSize) break;
+      const last = batch[batch.length - 1];
+      if (last.messageId === fromMessageId) break;
+      fromMessageId = last.messageId;
+    }
+    return all;
+  };
+
   // Synchronize Telegram Backup Channels and Remote Cloud History
-  // Refresh remains read-only; initial setup runs only when destinations are unconfigured
+  // Strictly enforces that Telegram channel contents are the authoritative source of truth.
   const syncChannelsAndCloudHistory = useCallback(async () => {
     if (isSyncingDestinationsRef.current) return;
     isSyncingDestinationsRef.current = true;
+    setSyncFreshnessState('syncing');
+    setSyncError(null);
     try {
       let ch = await TelegramBridgeService.refreshDestinations();
       if (!ch) {
-        // Read-only discovery returned no existing destinations.
-        // Run initial setup to discover existing destinations or create them without duplicates!
         try {
           ch = await TelegramBridgeService.setupChannels();
         } catch (setupErr: any) {
@@ -158,21 +202,24 @@ export const MainApp: React.FC = () => {
               errorMessage: setupErr?.message || 'Destinations need setup',
             },
           });
+          setSyncFreshnessState('error');
+          setSyncError(setupErr?.message || 'Destinations need setup');
           return;
         }
       }
       setChannels(ch);
 
-      const photoHistory = await TelegramBridgeService.getChannelHistory(
-        ch.photoChannelId,
-        100,
-      );
-      const videoHistory = await TelegramBridgeService.getChannelHistory(
-        ch.videoChannelId,
-        100,
-      );
+      // Paginate complete remote history across both channels
+      const photoHistory = await fetchAllChannelHistory(ch.photoChannelId);
+      const videoHistory = await fetchAllChannelHistory(ch.videoChannelId);
       const allHistory = [...photoHistory, ...videoHistory];
       setRemoteHistoryItems(allHistory);
+
+      // Reconcile local database cache: remove stale objects absent from remote channels
+      const photoMsgIds = new Set(photoHistory.map(h => h.messageId));
+      const videoMsgIds = new Set(videoHistory.map(h => h.messageId));
+      await repo.reconcileTelegramObjects(ch.photoChannelId, photoMsgIds);
+      await repo.reconcileTelegramObjects(ch.videoChannelId, videoMsgIds);
 
       const masterKey = SessionKeyStore.getSessionKey() || undefined;
       await restoreManager.rebuildIndexFromRemoteHistory(allHistory, masterKey);
@@ -200,7 +247,7 @@ export const MainApp: React.FC = () => {
         };
       });
 
-      // Auto-recover client_encryption_config from remote history if local config was cleared (post-data-wipe)
+      // Auto-recover client_encryption_config from remote history if local config was cleared
       if (!SessionKeyStore.getConfig()) {
         for (const h of allHistory) {
           if (h.encryptionEnvelope) {
@@ -227,26 +274,63 @@ export const MainApp: React.FC = () => {
         }
       }
 
+      // Authoritative remote state: if channel is empty, cloud gallery is empty!
       setCloudItems(mapped);
-    } catch {
-      // Handled safely without creating channels
+      setSyncFreshnessState('synced');
+      setSyncError(null);
+    } catch (err: any) {
+      setSyncFreshnessState('error');
+      setSyncError(err?.message || 'Failed to synchronize with Telegram channels.');
     } finally {
       isSyncingDestinationsRef.current = false;
     }
   }, [restoreManager, repo]);
 
-  // Restore persisted encryption configuration on startup
+  // Restore persisted encryption configuration and Keystore master key on startup
   useEffect(() => {
     const loadPersistedSettings = async () => {
       try {
         const savedConfigStr = await repo.getSetting('client_encryption_config');
+        let cfg: EncryptionConfig | null = null;
         if (savedConfigStr) {
-          const cfg = JSON.parse(savedConfigStr);
-          SessionKeyStore.setConfig(cfg);
+          cfg = JSON.parse(savedConfigStr);
+          SessionKeyStore.setConfig(cfg!);
         }
         const savedEnc = await repo.getSetting('encryption_enabled');
         if (savedEnc === 'true') {
           setEncryptionEnabled(true);
+          // Attempt to restore master key from Keystore-backed secure storage
+          try {
+            const persistedKey = await loadPersistedMasterKey();
+            if (persistedKey && cfg) {
+              const isValid = verifyMasterKeyAgainstConfig(persistedKey, cfg);
+              if (isValid) {
+                SessionKeyStore.setSessionKey(persistedKey, undefined, cfg);
+              } else {
+                await clearPersistedMasterKey();
+                setKeyRecoveryNotice(
+                  'Persisted encryption key verification failed. Please enter your recovery passphrase.',
+                );
+              }
+            }
+          } catch (keystoreErr: any) {
+            setKeyRecoveryNotice(
+              `Device secure storage was reset or invalidated (${keystoreErr?.message || 'Keystore error'}). Please enter your 12-word recovery passphrase to re-enable secure unlock.`,
+            );
+          }
+        }
+
+        const autoBackupStr = await repo.getSetting('auto_backup_enabled');
+        if (autoBackupStr !== null && autoBackupStr !== '') {
+          setAutoBackupEnabled(autoBackupStr === 'true');
+        }
+        const autoPhotosStr = await repo.getSetting('auto_backup_include_photos');
+        if (autoPhotosStr !== null && autoPhotosStr !== '') {
+          setAutoBackupIncludePhotos(autoPhotosStr === 'true');
+        }
+        const autoVideosStr = await repo.getSetting('auto_backup_include_videos');
+        if (autoVideosStr !== null && autoVideosStr !== '') {
+          setAutoBackupIncludeVideos(autoVideosStr === 'true');
         }
       } catch {
         // Ignored
@@ -262,8 +346,8 @@ export const MainApp: React.FC = () => {
       async item => {
         let destChannelId =
           item.mediaType === 'video'
-            ? channels?.videoChannelId
-            : channels?.photoChannelId;
+            ? channelsRef.current?.videoChannelId
+            : channelsRef.current?.photoChannelId;
 
         // If channel destination is not established yet, create/setup channels
         if (!destChannelId || destChannelId === '0') {
@@ -282,11 +366,15 @@ export const MainApp: React.FC = () => {
         }
 
         // Encryption check: fail fast if enabled but locked to prevent any plaintext leak
-        if (encryptionEnabled && !SessionKeyStore.isUnlocked()) {
+        const isEncUnlocked = SessionKeyStore.isUnlocked();
+        const cfg = SessionKeyStore.getConfig();
+        const encActive = cfg?.enabled ?? false;
+
+        if (encActive && !isEncUnlocked) {
           throw new Error('Client encryption is enabled but session key is locked. Unlock encryption before uploading.');
         }
 
-        const isEncrypted = encryptionEnabled && SessionKeyStore.isUnlocked();
+        const isEncrypted = encActive && isEncUnlocked;
         let masterKeyHex = '';
         let saltHex = '';
         let verificationToken = '';
@@ -297,7 +385,6 @@ export const MainApp: React.FC = () => {
             throw new Error('Active master encryption key is unavailable.');
           }
           masterKeyHex = masterKey.toString('hex');
-          const cfg = SessionKeyStore.getConfig();
           saltHex = cfg?.kdfSalt || '';
           verificationToken = cfg?.verificationToken || '';
         }
@@ -340,8 +427,8 @@ export const MainApp: React.FC = () => {
         try {
           const destChannelId =
             item.mediaType === 'video'
-              ? channels?.videoChannelId
-              : channels?.photoChannelId;
+              ? channelsRef.current?.videoChannelId
+              : channelsRef.current?.photoChannelId;
           if (!destChannelId || destChannelId === '0') return null;
           const history = await TelegramBridgeService.getChannelHistory(
             destChannelId,
@@ -362,7 +449,7 @@ export const MainApp: React.FC = () => {
         return null;
       },
     );
-  }, [repo, channels, encryptionEnabled]);
+  }, [repo]);
 
   // Auth state listener
   useEffect(() => {
@@ -432,20 +519,232 @@ export const MainApp: React.FC = () => {
     [],
   );
 
-  // Sync permissions and initial scan on login
+  // Automatic Backup Processor
+  const runAutoBackup = useCallback(async () => {
+    if (!autoBackupEnabled || !isLoggedIn) return;
+    try {
+      const perm = await checkPermissionState();
+      if (perm !== 'granted' && perm !== 'partial') return;
+
+      const review = await MediaScannerService.scanMediaStore([]);
+      const newEligibleIds: string[] = [];
+
+      for (const item of review.items) {
+        if (item.isExcluded) continue;
+        if (item.mediaType === 'photo' && !autoBackupIncludePhotos) continue;
+        if (item.mediaType === 'video' && !autoBackupIncludeVideos) continue;
+
+        const existing = await repo.getMediaItem(item.id);
+        if (
+          existing &&
+          (existing.state === MediaState.BACKED_UP ||
+            existing.state === MediaState.QUEUED ||
+            existing.state === MediaState.UPLOADING)
+        ) {
+          continue;
+        }
+
+        const tgObj = await repo.getTelegramObjectForMedia(item.id);
+        if (tgObj) continue;
+
+        await repo.upsertMediaItem({
+          id: item.id,
+          sourceKey: item.sourceKey,
+          mediaType: item.mediaType,
+          displayName: item.displayName,
+          relativePath: item.relativePath,
+          mimeType: item.mimeType,
+          sizeBytes: item.sizeBytes,
+          modifiedAtMs: item.modifiedAtMs,
+          createdAtMs: item.modifiedAtMs,
+          state: MediaState.DISCOVERED,
+          isExcluded: false,
+          lastScannedAtMs: Date.now(),
+          createdAtMsLocal: Date.now(),
+          updatedAtMsLocal: Date.now(),
+        });
+        newEligibleIds.push(item.id);
+      }
+
+      if (newEligibleIds.length === 0) return;
+
+      if (encryptionEnabled && !SessionKeyStore.isUnlocked()) {
+        return;
+      }
+
+      await engine.queueMediaForBackup(newEligibleIds);
+      await refreshQueueStats();
+
+      engine.runQueue(networkPolicy, true, {
+        onProgress: p => setActiveProgress(p),
+        onJobCompleted: async (_job, media) => {
+          const tgObj = await repo.getTelegramObjectForMedia(media.id);
+          const destChan =
+            media.mediaType === 'video'
+              ? channelsRef.current?.videoChannelId || ''
+              : channelsRef.current?.photoChannelId || '';
+
+          setCloudItems(prev => {
+            if (prev.some(p => p.id === media.id)) return prev;
+            return [
+              ...prev,
+              {
+                id: media.id,
+                sourceKey: media.sourceKey || undefined,
+                mediaType: media.mediaType,
+                originalName: media.displayName,
+                relativePath: media.relativePath || 'DCIM/Camera',
+                sizeBytes: media.sizeBytes,
+                modifiedAtMs: media.modifiedAtMs,
+                messageId: tgObj?.messageId || '1',
+                channelId: tgObj?.channelId || destChan,
+              },
+            ];
+          });
+          await refreshQueueStats();
+        },
+      });
+    } catch (err) {
+      console.warn('Auto-backup check failed:', err);
+    }
+  }, [
+    autoBackupEnabled,
+    autoBackupIncludePhotos,
+    autoBackupIncludeVideos,
+    isLoggedIn,
+    checkPermissionState,
+    repo,
+    encryptionEnabled,
+    engine,
+    refreshQueueStats,
+    networkPolicy,
+  ]);
+
+  const handleToggleAutoBackup = useCallback(
+    async (enabled: boolean) => {
+      setAutoBackupEnabled(enabled);
+      await repo.setSetting('auto_backup_enabled', enabled ? 'true' : 'false');
+      if (enabled) {
+        runAutoBackup();
+      }
+    },
+    [repo, runAutoBackup],
+  );
+
+  const handleToggleAutoBackupPhotos = useCallback(
+    async (include: boolean) => {
+      setAutoBackupIncludePhotos(include);
+      await repo.setSetting(
+        'auto_backup_include_photos',
+        include ? 'true' : 'false',
+      );
+      if (include && autoBackupEnabled) {
+        runAutoBackup();
+      }
+    },
+    [repo, autoBackupEnabled, runAutoBackup],
+  );
+
+  const handleToggleAutoBackupVideos = useCallback(
+    async (include: boolean) => {
+      setAutoBackupIncludeVideos(include);
+      await repo.setSetting(
+        'auto_backup_include_videos',
+        include ? 'true' : 'false',
+      );
+      if (include && autoBackupEnabled) {
+        runAutoBackup();
+      }
+    },
+    [repo, autoBackupEnabled, runAutoBackup],
+  );
+
+  const handleLockEncryption = useCallback(async () => {
+    await SessionKeyStore.lockEncryption();
+    setCloudItems(prev =>
+      prev.map(item => ({
+        ...item,
+        isLocked: item.isEncrypted,
+        originalName: item.isEncrypted
+          ? 'Encrypted Item (Locked)'
+          : item.originalName,
+      })),
+    );
+  }, []);
+
+  const handleDeleteLocalMedia = useCallback(
+    async (sourceKey: string): Promise<boolean> => {
+      try {
+        const success = await MediaScannerService.deleteLocalMedia(sourceKey);
+        if (success) {
+          const item = await repo.findMediaItemBySourceKey(sourceKey);
+          if (item) {
+            await repo.deleteMediaItem(item.id);
+          }
+          await refreshScan();
+        }
+        return success;
+      } catch {
+        return false;
+      }
+    },
+    [repo, refreshScan],
+  );
+
+  const handleDeleteCloudMedia = useCallback(
+    async (
+      itemsToDelete: CloudMediaItem[],
+    ): Promise<{ successCount: number; failedCount: number }> => {
+      let successCount = 0;
+      let failedCount = 0;
+
+      const channelMap = new Map<string, string[]>();
+      for (const item of itemsToDelete) {
+        const arr = channelMap.get(item.channelId) || [];
+        arr.push(item.messageId);
+        channelMap.set(item.channelId, arr);
+      }
+
+      for (const [channelId, messageIds] of channelMap.entries()) {
+        try {
+          const ok = await TelegramBridgeService.deleteMessages(
+            channelId,
+            messageIds,
+          );
+          if (ok) {
+            successCount += messageIds.length;
+            for (const msgId of messageIds) {
+              await repo.deleteTelegramObject(channelId, msgId);
+            }
+          } else {
+            failedCount += messageIds.length;
+          }
+        } catch {
+          failedCount += messageIds.length;
+        }
+      }
+
+      await syncChannelsAndCloudHistory();
+      return { successCount, failedCount };
+    },
+    [repo, syncChannelsAndCloudHistory],
+  );
+
+  // Sync permissions, initial scan, and automatic backup on login transition
   useEffect(() => {
     if (isLoggedIn) {
       checkPermissionState().then(status => {
         if (status === 'granted' || status === 'partial') {
           refreshScan();
+          runAutoBackup();
         }
       });
       syncChannelsAndCloudHistory();
       refreshQueueStats();
     }
-  }, [isLoggedIn, checkPermissionState, refreshScan, syncChannelsAndCloudHistory, refreshQueueStats]);
+  }, [isLoggedIn]);
 
-  // Refresh permissions and scan when returning to foreground
+  // Refresh permissions, scan, and trigger auto-backup when returning to foreground
   useEffect(() => {
     let lastChecked = 0;
     const subscription = AppState.addEventListener('change', nextAppState => {
@@ -455,6 +754,7 @@ export const MainApp: React.FC = () => {
         checkPermissionState().then(status => {
           if (status === 'granted' || status === 'partial') {
             refreshScan();
+            runAutoBackup();
           }
         });
       }
@@ -463,7 +763,7 @@ export const MainApp: React.FC = () => {
     return () => {
       subscription.remove();
     };
-  }, [isLoggedIn, checkPermissionState, refreshScan]);
+  }, [isLoggedIn, checkPermissionState, refreshScan, runAutoBackup]);
 
   const handleRequestPermission = async () => {
     const status = await PermissionService.requestMediaPermission();
@@ -669,6 +969,8 @@ export const MainApp: React.FC = () => {
     try {
       const masterKey = await deriveMasterKeyAsync(raw, saltHex);
       SessionKeyStore.setSessionKey(masterKey, raw);
+      await persistMasterKeySecurely(masterKey.toString('hex'));
+      setKeyRecoveryNotice(null);
 
       await restoreManager.unlockEncryptedMedia(remoteHistoryItems, masterKey);
 
@@ -705,6 +1007,7 @@ export const MainApp: React.FC = () => {
           };
         }),
       );
+      runAutoBackup();
       return true;
     } catch {
       return false;
@@ -732,7 +1035,7 @@ export const MainApp: React.FC = () => {
     } catch {
       // Handled
     }
-    SessionKeyStore.clear();
+    await SessionKeyStore.lockEncryption();
     setIsLoggedIn(false);
     setCurrentUser(null);
     setChannels(null);
@@ -773,6 +1076,23 @@ export const MainApp: React.FC = () => {
 
       {/* Main Screen Content */}
       <View style={styles.screenContainer}>
+        {keyRecoveryNotice && (
+          <View style={styles.keyRecoveryBanner} testID="key-recovery-notice">
+            <Text style={styles.keyRecoveryBannerText}>
+              ⚠️ {keyRecoveryNotice}
+            </Text>
+            <TouchableOpacity
+              onPress={() => {
+                setKeyRecoveryNotice(null);
+                setActiveTab('settings');
+              }}
+              style={styles.keyRecoveryActionBtn}
+            >
+              <Text style={styles.keyRecoveryActionText}>Unlock</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {activeTab === 'gallery' && (
           <CloudGalleryScreen
             items={cloudItems}
@@ -796,6 +1116,11 @@ export const MainApp: React.FC = () => {
             onResyncChannels={syncChannelsAndCloudHistory}
             onUnlockPassphrase={handleUnlockPassphrase}
             onRecreateDestination={handleRecreateDestination}
+            onSetupDestinations={handleSetupDestinations}
+            syncFreshnessState={syncFreshnessState}
+            syncError={syncError}
+            onDeleteLocalMedia={handleDeleteLocalMedia}
+            onDeleteCloudMedia={handleDeleteCloudMedia}
           />
         )}
 
@@ -823,6 +1148,10 @@ export const MainApp: React.FC = () => {
             onUnlockPassphrase={handleUnlockPassphrase}
             onRecreateDestination={handleRecreateDestination}
             onSetupDestinations={handleSetupDestinations}
+            syncFreshnessState={syncFreshnessState}
+            syncError={syncError}
+            onDeleteLocalMedia={handleDeleteLocalMedia}
+            onDeleteCloudMedia={handleDeleteCloudMedia}
           />
         )}
 
@@ -843,6 +1172,9 @@ export const MainApp: React.FC = () => {
             networkPolicy={networkPolicy}
             requiresCharging={requiresCharging}
             encryptionEnabled={encryptionEnabled}
+            autoBackupEnabled={autoBackupEnabled}
+            autoBackupIncludePhotos={autoBackupIncludePhotos}
+            autoBackupIncludeVideos={autoBackupIncludeVideos}
             isPaused={isPaused}
             mediaPermissionStatus={permissionStatus}
             user={currentUser}
@@ -863,6 +1195,10 @@ export const MainApp: React.FC = () => {
               }
               repo.setSetting('encryption_enabled', enabled ? 'true' : 'false');
             }}
+            onToggleAutoBackup={handleToggleAutoBackup}
+            onToggleAutoBackupIncludePhotos={handleToggleAutoBackupPhotos}
+            onToggleAutoBackupIncludeVideos={handleToggleAutoBackupVideos}
+            onLockEncryption={handleLockEncryption}
             onTogglePause={handleTogglePause}
             onRequestPermission={handleRequestPermission}
             onOpenAppSettings={handleOpenAppSettings}
@@ -1065,6 +1401,37 @@ const styles = StyleSheet.create({
   },
   navLabelActive: {
     color: '#34d399',
+    fontWeight: '700',
+  },
+  keyRecoveryBanner: {
+    backgroundColor: '#3b1c1c',
+    borderColor: '#b91c1c',
+    borderWidth: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    marginHorizontal: 16,
+    marginTop: 8,
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  keyRecoveryBannerText: {
+    color: '#fca5a5',
+    fontSize: 12,
+    flex: 1,
+    lineHeight: 16,
+  },
+  keyRecoveryActionBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+  },
+  keyRecoveryActionText: {
+    color: '#ffffff',
+    fontSize: 11,
     fontWeight: '700',
   },
 });

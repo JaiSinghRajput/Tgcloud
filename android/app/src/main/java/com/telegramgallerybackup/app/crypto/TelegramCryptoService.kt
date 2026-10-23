@@ -1,6 +1,12 @@
 package com.telegramgallerybackup.app.crypto
 
+import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyStore
 import java.util.Base64
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
@@ -44,6 +50,14 @@ object TelegramCryptoService {
     const val IV_LENGTH_BYTES = 12
     const val GCM_TAG_LENGTH_BITS = 128
     const val VERIFY_PAYLOAD_CONSTANT = "TGB_RECOVERY_KEY_VERIFIED_V1"
+    const val BUFFER_SIZE = 64 * 1024 // 64 KB bounded buffer
+
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val KEYSTORE_ALIAS = "tgcloud_master_key_v1"
+    private const val SECURE_VAULT_PREFS = "tgcloud_secure_vault"
+    private const val PREF_KEY_CIPHERTEXT = "enc_master_key"
+    private const val PREF_KEY_IV = "master_key_iv"
+    private const val PREF_KEY_TAG = "master_key_tag"
 
     private val secureRandom = SecureRandom()
 
@@ -122,23 +136,53 @@ object TelegramCryptoService {
     }
 
     /**
-     * Encrypts a media file using AES-256-GCM under the given DEK.
-     * Writes the ciphertext directly to outputFile and returns the IV and authentication tag.
+     * Encrypts a media file using AES-256-GCM under the given DEK with bounded 64KB memory buffers.
+     * Streams ciphertext directly to outputFile to prevent memory exhaustion / OOM crashes on large videos.
+     * Returns the IV and authentication tag.
      */
     fun encryptMediaFile(
         inputFile: File,
         outputFile: File,
         dek: ByteArray
     ): EncryptedPayload {
-        val plaintext = inputFile.readBytes()
-        val enc = encryptAesGcm(plaintext, dek)
-        outputFile.writeBytes(enc.ciphertext)
-        return enc
+        val iv = ByteArray(IV_LENGTH_BYTES)
+        secureRandom.nextBytes(iv)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val keySpec = SecretKeySpec(dek, "AES")
+        val gcmSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+        cipher.init(Cipher.ENCRYPT_MODE, keySpec, gcmSpec)
+
+        java.io.FileInputStream(inputFile).use { fis ->
+            java.io.FileOutputStream(outputFile).use { fos ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                var bytesRead: Int
+                while (fis.read(buffer).also { bytesRead = it } != -1) {
+                    val chunk = cipher.update(buffer, 0, bytesRead)
+                    if (chunk != null && chunk.isNotEmpty()) {
+                        fos.write(chunk)
+                    }
+                }
+                val finalBytes = cipher.doFinal()
+                val tagLengthBytes = GCM_TAG_LENGTH_BITS / 8
+                val ciphertextLength = finalBytes.size - tagLengthBytes
+                if (ciphertextLength > 0) {
+                    fos.write(finalBytes, 0, ciphertextLength)
+                }
+                val tag = finalBytes.copyOfRange(ciphertextLength, finalBytes.size)
+
+                return EncryptedPayload(
+                    ciphertext = ByteArray(0),
+                    ivBase64 = Base64.getEncoder().encodeToString(iv),
+                    tagBase64 = Base64.getEncoder().encodeToString(tag)
+                )
+            }
+        }
     }
 
     /**
-     * Decrypts a media file using AES-256-GCM under the given DEK.
-     * Writes the decrypted plaintext directly to outputFile.
+     * Decrypts a media file using AES-256-GCM under the given DEK with bounded 64KB memory buffers.
+     * Streams plaintext directly to outputFile to prevent memory exhaustion / OOM crashes on large videos.
      */
     fun decryptMediaFile(
         inputFile: File,
@@ -147,9 +191,30 @@ object TelegramCryptoService {
         ivBase64: String,
         tagBase64: String
     ) {
-        val ciphertext = inputFile.readBytes()
-        val decrypted = decryptAesGcm(ciphertext, dek, ivBase64, tagBase64)
-        outputFile.writeBytes(decrypted)
+        val iv = Base64.getDecoder().decode(ivBase64)
+        val tag = Base64.getDecoder().decode(tagBase64)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        val keySpec = SecretKeySpec(dek, "AES")
+        val gcmSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec)
+
+        java.io.FileInputStream(inputFile).use { fis ->
+            java.io.FileOutputStream(outputFile).use { fos ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                var bytesRead: Int
+                while (fis.read(buffer).also { bytesRead = it } != -1) {
+                    val chunk = cipher.update(buffer, 0, bytesRead)
+                    if (chunk != null && chunk.isNotEmpty()) {
+                        fos.write(chunk)
+                    }
+                }
+                val finalBytes = cipher.doFinal(tag)
+                if (finalBytes != null && finalBytes.isNotEmpty()) {
+                    fos.write(finalBytes)
+                }
+            }
+        }
     }
 
     /**
@@ -234,6 +299,113 @@ object TelegramCryptoService {
             file.delete()
         } catch (e: Exception) {
             file.delete()
+        }
+    }
+
+    fun isKeystoreAvailable(): Boolean {
+        return try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+            keyStore.load(null)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun getOrCreateKeystoreKey(): SecretKey {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+        keyStore.load(null)
+        if (keyStore.containsAlias(KEYSTORE_ALIAS)) {
+            val entry = keyStore.getEntry(KEYSTORE_ALIAS, null) as? KeyStore.SecretKeyEntry
+            if (entry != null) return entry.secretKey
+        }
+
+        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        val spec = KeyGenParameterSpec.Builder(
+            KEYSTORE_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setRandomizedEncryptionRequired(true)
+            .build()
+        keyGenerator.init(spec)
+        return keyGenerator.generateKey()
+    }
+
+    /**
+     * Securely persists derived 256-bit Master Key encrypted at rest via Android Keystore-backed AES-256-GCM.
+     * Does NOT persist user's recovery passphrase. Key material is stored in private SharedPreferences.
+     */
+    fun storeMasterKeyProtected(context: Context, masterKeyHex: String): Boolean {
+        return try {
+            val secretKey = getOrCreateKeystoreKey()
+            val iv = ByteArray(IV_LENGTH_BYTES)
+            secureRandom.nextBytes(iv)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
+            val output = cipher.doFinal(masterKeyHex.toByteArray(Charsets.UTF_8))
+            val tagLengthBytes = GCM_TAG_LENGTH_BITS / 8
+            val ciphertextLength = output.size - tagLengthBytes
+            val ciphertext = output.copyOfRange(0, ciphertextLength)
+            val tag = output.copyOfRange(ciphertextLength, output.size)
+
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            prefs.edit()
+                .putString(PREF_KEY_CIPHERTEXT, Base64.getEncoder().encodeToString(ciphertext))
+                .putString(PREF_KEY_IV, Base64.getEncoder().encodeToString(iv))
+                .putString(PREF_KEY_TAG, Base64.getEncoder().encodeToString(tag))
+                .commit()
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Decrypts and retrieves the persisted Master Key using Android Keystore.
+     * Returns null if key is not present, keystore was invalidated, or storage corrupted.
+     */
+    fun loadMasterKeyProtected(context: Context): String? {
+        return try {
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            val ctB64 = prefs.getString(PREF_KEY_CIPHERTEXT, null) ?: return null
+            val ivB64 = prefs.getString(PREF_KEY_IV, null) ?: return null
+            val tagB64 = prefs.getString(PREF_KEY_TAG, null) ?: return null
+
+            val ciphertext = Base64.getDecoder().decode(ctB64)
+            val iv = Base64.getDecoder().decode(ivB64)
+            val tag = Base64.getDecoder().decode(tagB64)
+
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+            keyStore.load(null)
+            val entry = keyStore.getEntry(KEYSTORE_ALIAS, null) as? KeyStore.SecretKeyEntry ?: return null
+            val secretKey = entry.secretKey
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv))
+            val combined = ByteArray(ciphertext.size + tag.size)
+            System.arraycopy(ciphertext, 0, combined, 0, ciphertext.size)
+            System.arraycopy(tag, 0, combined, ciphertext.size, tag.size)
+            val decrypted = cipher.doFinal(combined)
+            val keyHex = String(decrypted, Charsets.UTF_8).trim()
+            if (keyHex.length == 64) keyHex else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Removes persisted Master Key material upon user lock or logout.
+     */
+    fun clearMasterKeyProtected(context: Context): Boolean {
+        return try {
+            val prefs = context.getSharedPreferences(SECURE_VAULT_PREFS, Context.MODE_PRIVATE)
+            prefs.edit().clear().commit()
+            true
+        } catch (_: Exception) {
+            false
         }
     }
 

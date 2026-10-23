@@ -17,6 +17,8 @@ import {
   SessionKeyStore,
   verifyRecoveryKeyAsync,
   setupExistingKeyAsync,
+  persistMasterKeySecurely,
+  clearPersistedMasterKey,
 } from '../domain/crypto/encryptionService';
 import { MediaScannerService } from '../domain/media/scanner';
 import { UserProfileInfo } from './ProfileScreen';
@@ -29,6 +31,9 @@ interface SettingsScreenProps {
   networkPolicy: NetworkPolicy;
   requiresCharging: boolean;
   encryptionEnabled: boolean;
+  autoBackupEnabled?: boolean;
+  autoBackupIncludePhotos?: boolean;
+  autoBackupIncludeVideos?: boolean;
   isPaused?: boolean;
   mediaPermissionStatus?: MediaPermissionStatus;
   user?: UserProfileInfo | null;
@@ -36,6 +41,10 @@ interface SettingsScreenProps {
   onToggleNetworkPolicy: (wifiOnly: boolean) => void;
   onToggleCharging: (chargingOnly: boolean) => void;
   onToggleEncryption: (enabled: boolean, setup?: RecoveryKeySetup) => void;
+  onToggleAutoBackup?: (enabled: boolean) => void;
+  onToggleAutoBackupIncludePhotos?: (include: boolean) => void;
+  onToggleAutoBackupIncludeVideos?: (include: boolean) => void;
+  onLockEncryption?: () => void;
   onTogglePause?: () => void;
   onRequestPermission?: () => void;
   onOpenAppSettings?: () => void;
@@ -52,6 +61,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   networkPolicy,
   requiresCharging,
   encryptionEnabled,
+  autoBackupEnabled = false,
+  autoBackupIncludePhotos = true,
+  autoBackupIncludeVideos = true,
   isPaused: _isPaused = false,
   mediaPermissionStatus = 'granted',
   user,
@@ -59,6 +71,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onToggleNetworkPolicy,
   onToggleCharging,
   onToggleEncryption,
+  onToggleAutoBackup,
+  onToggleAutoBackupIncludePhotos,
+  onToggleAutoBackupIncludeVideos,
+  onLockEncryption,
   onTogglePause: _onTogglePause,
   onRequestPermission,
   onOpenAppSettings,
@@ -145,7 +161,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       // Present Option A ("I already have a key") or Option B ("I don't have a key")
       setShowChoiceModal(true);
     } else {
-      SessionKeyStore.clear();
+      await SessionKeyStore.lockEncryption();
       onToggleEncryption(false);
     }
   };
@@ -202,6 +218,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
       const masterKey = Buffer.from(result.setup.masterKeyHex, 'hex');
       SessionKeyStore.setSessionKey(masterKey, result.setup.recoveryKey, result.setup.config);
+      await persistMasterKeySecurely(result.setup.masterKeyHex);
       onToggleEncryption(true, result.setup);
       setKeySetupState('ENABLED_UNLOCKED');
       setShowImportModal(false);
@@ -268,6 +285,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     if (activeSetup) {
       const masterKey = Buffer.from(activeSetup.masterKeyHex, 'hex');
       SessionKeyStore.setSessionKey(masterKey, activeSetup.recoveryKey, activeSetup.config);
+      persistMasterKeySecurely(activeSetup.masterKeyHex);
       onToggleEncryption(true, activeSetup);
     } else {
       onToggleEncryption(true);
@@ -300,6 +318,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           valid = true;
           const masterKey = Buffer.from(res.masterKeyHex, 'hex');
           SessionKeyStore.setSessionKey(masterKey, raw, cfg);
+          await persistMasterKeySecurely(res.masterKeyHex);
           onToggleEncryption(true);
         }
       }
@@ -418,6 +437,73 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       <View style={styles.section}>
         <Text style={styles.sectionHeader}>Backup</Text>
         <View style={styles.card}>
+          {/* Automatic Gallery Backup toggle */}
+          <View style={styles.settingRow}>
+            <View style={styles.settingTextCol}>
+              <Text style={styles.settingTitle}>Automatic Gallery Backup</Text>
+              <Text style={styles.settingSubtitle}>
+                Automatically detect and queue newly captured photos and videos from your device.
+              </Text>
+            </View>
+            <Switch
+              value={autoBackupEnabled}
+              onValueChange={onToggleAutoBackup}
+              trackColor={{ false: '#243029', true: '#047857' }}
+              thumbColor={autoBackupEnabled ? '#34d399' : '#9ca3af'}
+              testID="auto-backup-switch"
+            />
+          </View>
+
+          {autoBackupEnabled && (
+            <>
+              <View style={styles.divider} />
+              {/* Include Photos toggle */}
+              <View style={styles.settingRow}>
+                <View style={styles.settingTextCol}>
+                  <Text style={styles.settingTitle}>Include Photos</Text>
+                  <Text style={styles.settingSubtitle}>
+                    Automatically back up new pictures.
+                  </Text>
+                </View>
+                <Switch
+                  value={autoBackupIncludePhotos}
+                  onValueChange={onToggleAutoBackupIncludePhotos}
+                  trackColor={{ false: '#243029', true: '#047857' }}
+                  thumbColor={autoBackupIncludePhotos ? '#34d399' : '#9ca3af'}
+                  testID="auto-backup-photos-switch"
+                />
+              </View>
+
+              <View style={styles.divider} />
+              {/* Include Videos toggle */}
+              <View style={styles.settingRow}>
+                <View style={styles.settingTextCol}>
+                  <Text style={styles.settingTitle}>Include Videos</Text>
+                  <Text style={styles.settingSubtitle}>
+                    Automatically back up new videos.
+                  </Text>
+                </View>
+                <Switch
+                  value={autoBackupIncludeVideos}
+                  onValueChange={onToggleAutoBackupIncludeVideos}
+                  trackColor={{ false: '#243029', true: '#047857' }}
+                  thumbColor={autoBackupIncludeVideos ? '#34d399' : '#9ca3af'}
+                  testID="auto-backup-videos-switch"
+                />
+              </View>
+
+              <View style={styles.divider} />
+              <View style={styles.infoNoteBox}>
+                <Text style={styles.infoNoteTitle}>ℹ️ Android Background Backup</Text>
+                <Text style={styles.infoNoteText}>
+                  Android schedules background tasks via WorkManager. Backup jobs may be deferred in battery-saver mode or during low-battery states. Resuming or opening TG Cloud triggers an immediate queue scan.
+                </Text>
+              </View>
+            </>
+          )}
+
+          <View style={styles.divider} />
+
           {/* Wi-Fi only toggle */}
           <View style={styles.settingRow}>
             <View style={styles.settingTextCol}>
@@ -685,10 +771,14 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               ) : (
                 <TouchableOpacity
                   style={styles.lockKeyBtn}
-                  onPress={() => SessionKeyStore.clear()}
+                  onPress={async () => {
+                    await SessionKeyStore.lockEncryption();
+                    onLockEncryption?.();
+                  }}
+                  testID="lock-encryption-btn"
                 >
                   <Text style={styles.lockKeyBtnText}>
-                    🔒 Lock Cloud Media (Clear Key from Memory)
+                    🔒 Lock Encryption (Clear Key & Require Passphrase)
                   </Text>
                 </TouchableOpacity>
               )}

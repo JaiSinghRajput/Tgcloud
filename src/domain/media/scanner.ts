@@ -39,6 +39,7 @@ interface MediaScannerNativeModule {
   copyToClipboard?(text: string): Promise<boolean>;
   pasteFromClipboard?(): Promise<string>;
   savePassphraseImage?(passphrase: string): Promise<string>;
+  deleteLocalMedia?(uriString: string): Promise<boolean>;
 }
 
 const { MediaScanner } = NativeModules;
@@ -50,6 +51,7 @@ const fallbackScannerMock: MediaScannerNativeModule = {
   copyToClipboard: async () => true,
   pasteFromClipboard: async () => '',
   savePassphraseImage: async () => 'file://mock/TGCloud_Recovery.png',
+  deleteLocalMedia: async () => true,
   scanMediaStore: async (excludedFolders: string[]) => {
     const excludedSet = new Set(excludedFolders);
     const mockItems: ScannedMediaItem[] = [
@@ -232,6 +234,10 @@ export const MediaScannerService = {
     nativeModule.savePassphraseImage
       ? nativeModule.savePassphraseImage(passphrase)
       : Promise.resolve('file://mock/TGCloud_Recovery.png'),
+  deleteLocalMedia: (uriString: string) =>
+    nativeModule.deleteLocalMedia
+      ? nativeModule.deleteLocalMedia(uriString)
+      : Promise.resolve(true),
   scanMediaStore: async (
     excludedFolders: string[] = [],
   ): Promise<ScanReviewResult> => {

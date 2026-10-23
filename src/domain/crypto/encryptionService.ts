@@ -420,6 +420,26 @@ export function verifyRecoveryKey(
   }
 }
 
+export function verifyMasterKeyAgainstConfig(
+  masterKey: Buffer,
+  config: EncryptionConfig,
+): boolean {
+  try {
+    if (!config.verificationToken) return false;
+    const tokenObj = JSON.parse(config.verificationToken);
+    const ciphertext = Buffer.from(tokenObj.ct, 'base64');
+    const decrypted = decryptBuffer(
+      ciphertext,
+      masterKey,
+      tokenObj.iv,
+      tokenObj.tag,
+    );
+    return decrypted.toString('utf8') === VERIFY_PAYLOAD_CONSTANT;
+  } catch {
+    return false;
+  }
+}
+
 export async function verifyRecoveryKeyAsync(
   recoveryKey: string,
   config: EncryptionConfig,
@@ -663,17 +683,75 @@ class SessionKeyStoreManager {
     return this.inMemoryMasterKey !== null;
   }
 
+  /**
+   * Explicit Lock: Clears sensitive in-memory key material and destroys the
+   * hardware-backed Keystore unlock token so encryption cannot be unlocked without the passphrase.
+   */
+  async lockEncryption(): Promise<void> {
+    this.clear();
+    await clearPersistedMasterKey();
+  }
+
   clear() {
     if (this.inMemoryMasterKey) {
       this.inMemoryMasterKey.fill(0);
       this.inMemoryMasterKey = null;
     }
     this.inMemoryRecoveryKey = null;
-    this.encryptionConfig = null;
   }
 }
 
 export const SessionKeyStore = new SessionKeyStoreManager();
+
+/**
+ * Persists the derived master key in Android Keystore-backed secure storage.
+ * The raw recovery passphrase is NEVER stored.
+ */
+export async function persistMasterKeySecurely(masterKeyHex: string): Promise<boolean> {
+  try {
+    return await TelegramBridgeService.storeSecureMasterKey(masterKeyHex);
+  } catch (err) {
+    console.warn('Failed to securely persist master key in Keystore:', err);
+    return false;
+  }
+}
+
+/**
+ * Attempts to load the persisted master key from Android Keystore-backed secure storage.
+ * Returns Buffer if available, or null if locked, absent, or reset.
+ */
+export async function loadPersistedMasterKey(): Promise<Buffer | null> {
+  try {
+    const hex = await TelegramBridgeService.loadSecureMasterKey();
+    if (hex && hex.length === 64) {
+      return Buffer.from(hex, 'hex');
+    }
+    return null;
+  } catch (err) {
+    console.warn('Failed to load persisted master key from Keystore:', err);
+    throw err;
+  }
+}
+
+/**
+ * Explicitly clears the Keystore-persisted master key, locking encryption across restarts.
+ */
+export async function clearPersistedMasterKey(): Promise<boolean> {
+  try {
+    return await TelegramBridgeService.clearSecureMasterKey();
+  } catch (err) {
+    console.warn('Failed to clear persisted master key:', err);
+    return false;
+  }
+}
+
+export async function isSecureKeyPersistenceAvailable(): Promise<boolean> {
+  try {
+    return await TelegramBridgeService.isSecureStorageAvailable();
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Attempts authenticated verification of a recovery passphrase against an encrypted object's DEK.
