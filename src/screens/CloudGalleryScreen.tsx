@@ -29,6 +29,7 @@ import {
 } from '../domain/crypto/encryptionService';
 import { EncryptedItemEnvelope } from '../types/encryption';
 import { InAppVideoPlayer } from '../components/InAppVideoPlayer';
+import { AppIcon, IconButton } from '../components/AppIcon';
 
 const defaultInsets = { top: 16, bottom: 16, left: 0, right: 0 };
 function useSafeInsetsFallback() {
@@ -140,6 +141,14 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
 }) => {
   // Navigation View: 'device' (Local Gallery) or 'cloud' (Telegram Cloud Backups)
   const [activeView, setActiveView] = useState<'device' | 'cloud'>(initialView);
+
+  useEffect(() => {
+    if (initialView && initialView !== activeView) {
+      setActiveView(initialView);
+      setIsSelectionMode(false);
+      setSelectedItemIds(new Set());
+    }
+  }, [initialView]);
 
   // Layout Toggle: exactly 1-column or 2-column thumbnail view
   const [columnCount, setColumnCount] = useState<1 | 2>(2);
@@ -702,19 +711,44 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
     });
   };
 
+  const handlePromptDeleteDeviceSelected = () => {
+    const selectedItems = scannedItems.filter(i => selectedItemIds.has(i.id));
+    if (selectedItems.length === 0) return;
+    setDeleteConfirmation({
+      visible: true,
+      type: 'local',
+      items: selectedItems,
+      isDeleting: false,
+      error: null,
+    });
+  };
+
   const handleExecuteDeletion = async () => {
     if (deleteConfirmation.items.length === 0) return;
     setDeleteConfirmation(prev => ({ ...prev, isDeleting: true, error: null }));
     try {
       if (deleteConfirmation.type === 'local') {
-        const target = deleteConfirmation.items[0] as DiscoveredMediaItem;
-        if (target.sourceKey && onDeleteLocalMedia) {
-          const success = await onDeleteLocalMedia(target.sourceKey);
-          if (!success) {
-            throw new Error('Local media deletion was denied or failed.');
+        const targets = deleteConfirmation.items as DiscoveredMediaItem[];
+        let anyFailed = false;
+        let successCount = 0;
+        for (const target of targets) {
+          if (target.sourceKey && onDeleteLocalMedia) {
+            const success = await onDeleteLocalMedia(target.sourceKey);
+            if (!success) {
+              anyFailed = true;
+            } else {
+              successCount++;
+            }
           }
         }
-        await handleCloseViewer();
+        if (anyFailed && successCount === 0) {
+          throw new Error('Local media deletion was denied or failed.');
+        }
+        if (previewItem) {
+          await handleCloseViewer();
+        }
+        setIsSelectionMode(false);
+        setSelectedItemIds(new Set());
         setDeleteConfirmation(prev => ({
           ...prev,
           visible: false,
@@ -914,11 +948,11 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           <View style={styles.topRightControls}>
             {/* Selection Mode Toggle Button */}
             {activeView === 'device' && (
-              <TouchableOpacity
-                style={[
-                  styles.selectModeBtn,
-                  isSelectionMode && styles.selectModeBtnActive,
-                ]}
+              <IconButton
+                name={isSelectionMode ? 'close' : 'check'}
+                size={34}
+                iconSize={16}
+                variant={isSelectionMode ? 'destructive' : 'secondary'}
                 onPress={() => {
                   if (isSelectionMode) {
                     setIsSelectionMode(false);
@@ -928,55 +962,30 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                   }
                 }}
                 accessibilityLabel="Toggle selection mode"
-              >
-                <Text
-                  style={[
-                    styles.selectModeBtnText,
-                    isSelectionMode && styles.selectModeBtnTextActive,
-                  ]}
-                >
-                  {isSelectionMode ? 'Done' : 'Select'}
-                </Text>
-              </TouchableOpacity>
+                testID="device-select-mode-btn"
+              />
             )}
 
             <View style={styles.layoutToggleRow}>
-              {/* 1-Column / 2-Column Layout Toggle Button */}
-              <TouchableOpacity
-                style={[
-                  styles.layoutBtn,
-                  columnCount === 1 && styles.layoutBtnActive,
-                ]}
+              {/* 1-Column / 2-Column Compact Layout Toggle Buttons */}
+              <IconButton
+                name="list"
+                size={34}
+                iconSize={16}
+                variant={columnCount === 1 ? 'filled' : 'secondary'}
                 onPress={() => setColumnCount(1)}
                 accessibilityLabel="One-column layout"
-              >
-                <Text
-                  style={[
-                    styles.layoutBtnText,
-                    columnCount === 1 && styles.layoutBtnTextActive,
-                  ]}
-                >
-                  1 Col
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[
-                  styles.layoutBtn,
-                  columnCount === 2 && styles.layoutBtnActive,
-                ]}
+                testID="layout-1col-btn"
+              />
+              <IconButton
+                name="grid"
+                size={34}
+                iconSize={16}
+                variant={columnCount === 2 ? 'filled' : 'secondary'}
                 onPress={() => setColumnCount(2)}
                 accessibilityLabel="Two-column layout"
-              >
-                <Text
-                  style={[
-                    styles.layoutBtnText,
-                    columnCount === 2 && styles.layoutBtnTextActive,
-                  ]}
-                >
-                  2 Col
-                </Text>
-              </TouchableOpacity>
+                testID="layout-2col-btn"
+              />
             </View>
           </View>
         </View>
@@ -1076,38 +1085,42 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           </TouchableOpacity>
 
           {activeView === 'device' && onRescan && (
-            <TouchableOpacity style={styles.rescanChip} onPress={onRescan}>
-              <Text style={styles.rescanChipText}>↻ Refresh</Text>
-            </TouchableOpacity>
+            <IconButton
+              name="refresh"
+              size={32}
+              iconSize={15}
+              variant="secondary"
+              onPress={onRescan}
+              accessibilityLabel="Refresh local media"
+              testID="refresh-local-media-btn"
+            />
           )}
 
           {activeView === 'cloud' && (
-            <TouchableOpacity
-              style={[
-                styles.selectToggleChip,
-                isSelectionMode && styles.selectToggleChipActive,
-              ]}
+            <IconButton
+              name={isSelectionMode ? 'close' : 'check'}
+              size={32}
+              iconSize={15}
+              variant={isSelectionMode ? 'destructive' : 'secondary'}
               onPress={() => {
                 setIsSelectionMode(prev => !prev);
                 setSelectedItemIds(new Set());
               }}
+              accessibilityLabel={isSelectionMode ? 'Cancel selection' : 'Select items'}
               testID="cloud-select-toggle-chip"
-            >
-              <Text
-                style={[
-                  styles.selectToggleChipText,
-                  isSelectionMode && styles.selectToggleChipTextActive,
-                ]}
-              >
-                {isSelectionMode ? 'Cancel' : '✓ Select'}
-              </Text>
-            </TouchableOpacity>
+            />
           )}
 
           {activeView === 'cloud' && isUnlocked && (
-            <TouchableOpacity style={styles.lockNowChip} onPress={handleLockAgain}>
-              <Text style={styles.lockNowChipText}>🔒 Lock</Text>
-            </TouchableOpacity>
+            <IconButton
+              name="lock"
+              size={32}
+              iconSize={15}
+              variant="secondary"
+              onPress={handleLockAgain}
+              accessibilityLabel="Lock encrypted cloud media"
+              testID="cloud-lock-again-btn"
+            />
           )}
         </View>
       </View>
@@ -1378,9 +1391,19 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
         />
       )}
 
-      {/* 6. Multi-Selection Sticky Bottom Bar */}
+      {/* 6. Multi-Selection Sticky Bottom Action Bar */}
       {isSelectionMode && (
-        <View style={styles.selectionBar}>
+        <View
+          style={[
+            styles.selectionBar,
+            {
+              paddingBottom: Math.max(insets.bottom, 12),
+              paddingLeft: Math.max(insets.left, 16),
+              paddingRight: Math.max(insets.right, 16),
+            },
+          ]}
+          testID="selection-bottom-bar"
+        >
           <View style={styles.selectionBarInfo}>
             <Text style={styles.selectionCountText}>
               {selectedItemIds.size} Selected
@@ -1391,47 +1414,88 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           </View>
 
           <View style={styles.selectionBarActions}>
+            {/* Select All / Deselect All Button */}
             <TouchableOpacity
-              style={styles.selectToggleBtn}
+              style={styles.selectionActionBtn}
               onPress={handleToggleSelectAll}
-              testID="select-all-toggle-btn"
-            >
-              <Text style={styles.selectToggleBtnText}>
-                {selectedItemIds.size ===
+              accessibilityRole="button"
+              accessibilityLabel={
+                selectedItemIds.size ===
                 (activeView === 'cloud'
                   ? filteredCloudItems.length
                   : filteredDeviceItems.length)
                   ? 'Deselect All'
-                  : 'Select All'}
+                  : 'Select All'
+              }
+              testID="select-all-toggle-btn"
+            >
+              <AppIcon
+                name={
+                  selectedItemIds.size ===
+                  (activeView === 'cloud'
+                    ? filteredCloudItems.length
+                    : filteredDeviceItems.length)
+                    ? 'checkbox'
+                    : 'selectAll'
+                }
+                size={16}
+                color="#f8fafc"
+              />
+              <Text style={styles.selectionActionBtnText}>
+                {selectedItemIds.size ===
+                (activeView === 'cloud'
+                  ? filteredCloudItems.length
+                  : filteredDeviceItems.length)
+                  ? 'Deselect'
+                  : 'All'}
               </Text>
             </TouchableOpacity>
 
+            {/* Cancel Selection Button */}
             <TouchableOpacity
-              style={styles.cancelSelectBtn}
+              style={styles.selectionActionBtn}
               onPress={() => {
                 setIsSelectionMode(false);
                 setSelectedItemIds(new Set());
               }}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel selection mode"
               testID="cancel-select-btn"
             >
-              <Text style={styles.cancelSelectBtnText}>Cancel</Text>
+              <AppIcon name="close" size={14} color="#94a3b8" />
+              <Text style={styles.selectionActionBtnText}>Cancel</Text>
             </TouchableOpacity>
 
-            {activeView === 'cloud' ? (
-              <TouchableOpacity
-                style={[
-                  styles.deleteCloudSelectedBtn,
-                  selectedItemIds.size === 0 && styles.btnDisabled,
-                ]}
-                disabled={selectedItemIds.size === 0}
-                onPress={handlePromptDeleteCloudSelected}
-                testID="delete-cloud-selected-btn"
-              >
-                <Text style={styles.deleteCloudSelectedBtnText}>
-                  🗑️ Delete from Cloud ({selectedItemIds.size})
-                </Text>
-              </TouchableOpacity>
-            ) : (
+            {/* Delete Selected (Trash Icon Button) */}
+            <TouchableOpacity
+              style={[
+                styles.selectionDeleteBtn,
+                selectedItemIds.size === 0 && styles.btnDisabled,
+              ]}
+              disabled={selectedItemIds.size === 0}
+              onPress={() => {
+                if (activeView === 'cloud') {
+                  handlePromptDeleteCloudSelected();
+                } else {
+                  handlePromptDeleteDeviceSelected();
+                }
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={
+                activeView === 'cloud'
+                  ? 'Delete selected from Cloud'
+                  : 'Delete selected from Device'
+              }
+              testID="delete-cloud-selected-btn"
+            >
+              <AppIcon name="trash" size={16} color="#ffffff" />
+              <Text style={styles.selectionDeleteBtnText}>
+                Delete ({selectedItemIds.size})
+              </Text>
+            </TouchableOpacity>
+
+            {/* Backup Selected Button (Device View) */}
+            {activeView === 'device' && (
               <TouchableOpacity
                 style={[
                   styles.backupSelectedBtn,
@@ -1439,8 +1503,11 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                 ]}
                 disabled={selectedItemIds.size === 0}
                 onPress={handleBackupSelected}
+                accessibilityRole="button"
+                accessibilityLabel="Backup selected to Telegram"
                 testID="backup-selected-btn"
               >
+                <AppIcon name="upload" size={16} color="#ffffff" />
                 <Text style={styles.backupSelectedBtnText}>
                   Backup ({selectedItemIds.size})
                 </Text>
@@ -1461,7 +1528,14 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
           <View style={styles.viewerContainer}>
             {/* Minimal Floating Close Button */}
             {showViewerControls && (
-              <TouchableOpacity
+              <IconButton
+                name="close"
+                size={40}
+                iconSize={18}
+                variant="surface"
+                onPress={handleCloseViewer}
+                accessibilityLabel="Close media viewer"
+                testID="viewer-close-btn"
                 style={[
                   styles.viewerFloatingCloseBtn,
                   {
@@ -1469,16 +1543,10 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                     left: Math.max(insets.left, 16),
                   },
                 ]}
-                onPress={handleCloseViewer}
-                hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
-                accessibilityLabel="Close media viewer"
-                testID="viewer-close-btn"
-              >
-                <Text style={styles.viewerFloatingCloseText}>✕</Text>
-              </TouchableOpacity>
+              />
             )}
 
-            {/* Floating Index Counter Pill */}
+            {/* Floating Index Counter Pill (Unobstructed, full width header) */}
             {showViewerControls && currentViewerItems.length > 0 && (
               <View
                 style={[
@@ -1497,28 +1565,6 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                     : previewItem.originalName}
                 </Text>
               </View>
-            )}
-
-            {/* Minimal Floating Delete Button */}
-            {showViewerControls && (
-              <TouchableOpacity
-                style={[
-                  styles.viewerDeleteBtn,
-                  {
-                    top: Math.max(insets.top, 16),
-                    right: Math.max(insets.right, 16),
-                  },
-                ]}
-                onPress={() => handlePromptDeleteViewerItem(previewItem)}
-                accessibilityLabel="Delete media item"
-                testID="viewer-delete-btn"
-              >
-                <Text style={styles.viewerDeleteBtnText}>
-                  {activeView === 'device' || 'sourceKey' in previewItem
-                    ? '🗑️ Delete from Device'
-                    : '🗑️ Delete from Cloud'}
-                </Text>
-              </TouchableOpacity>
             )}
 
             {/* Left and Right Navigation Arrows */}
@@ -1613,6 +1659,7 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
                             }
                             onClose={handleCloseViewer}
                             onError={err => setVideoError(err)}
+                            onDelete={() => handlePromptDeleteViewerItem(item)}
                             testID="in-app-video-player"
                           />
                         ) : (
@@ -1744,6 +1791,64 @@ export const CloudGalleryScreen: React.FC<CloudGalleryScreenProps> = ({
               initialNumToRender={3}
               testID="viewer-horizontal-list"
             />
+
+            {/* 8. Dedicated Safe-Area-Aware Bottom Action Bar for Media Viewer */}
+            {showViewerControls && (
+              <View
+                style={[
+                  styles.viewerBottomBar,
+                  {
+                    paddingBottom: Math.max(insets.bottom, 16),
+                    paddingLeft: Math.max(insets.left, 16),
+                    paddingRight: Math.max(insets.right, 16),
+                  },
+                ]}
+                testID="viewer-bottom-bar"
+              >
+                <View style={styles.viewerBottomInfo}>
+                  <Text style={styles.viewerBottomMetaText} numberOfLines={1}>
+                    {'sourceKey' in previewItem || activeView === 'device'
+                      ? 'Local Device Media'
+                      : 'Telegram Cloud Backup'}
+                  </Text>
+                  <Text style={styles.viewerBottomSizeText}>
+                    {formatBytes(previewItem.sizeBytes)}
+                  </Text>
+                </View>
+
+                <View style={styles.viewerBottomActions}>
+                  {/* Download / Restore for Cloud Media */}
+                  {('channelId' in previewItem || activeView === 'cloud') && (
+                    <IconButton
+                      name="download"
+                      size={40}
+                      iconSize={18}
+                      variant="secondary"
+                      onPress={() =>
+                        setRestoreModalItem(previewItem as CloudMediaItem)
+                      }
+                      accessibilityLabel="Download or restore media"
+                      testID="viewer-restore-btn"
+                    />
+                  )}
+
+                  {/* Single Item Delete Action with Trash Icon */}
+                  <IconButton
+                    name="trash"
+                    size={40}
+                    iconSize={18}
+                    variant="destructive"
+                    onPress={() => handlePromptDeleteViewerItem(previewItem)}
+                    accessibilityLabel={
+                      'sourceKey' in previewItem || activeView === 'device'
+                        ? 'Delete from Device'
+                        : 'Delete from Cloud'
+                    }
+                    testID="viewer-delete-btn"
+                  />
+                </View>
+              </View>
+            )}
           </View>
         </Modal>
       )}
@@ -2442,7 +2547,38 @@ const styles = StyleSheet.create({
   },
   selectionBarActions: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 8,
+  },
+  selectionActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    gap: 6,
+  },
+  selectionActionBtnText: {
+    color: '#e2e8f0',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  selectionDeleteBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#dc2626',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    gap: 6,
+  },
+  selectionDeleteBtnText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
   },
   selectToggleBtn: {
     backgroundColor: '#16221c',
@@ -2469,16 +2605,17 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   backupSelectedBtn: {
-    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
     backgroundColor: '#10b981',
     paddingVertical: 8,
-    borderRadius: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    gap: 6,
   },
   backupSelectedBtnText: {
     color: '#ffffff',
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '700',
   },
   btnDisabled: {
@@ -2498,14 +2635,14 @@ const styles = StyleSheet.create({
     position: 'absolute',
     alignSelf: 'center',
     zIndex: 50,
-    backgroundColor: 'rgba(20, 20, 20, 0.75)',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 16,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    paddingHorizontal: 18,
+    paddingVertical: 7,
+    borderRadius: 18,
     alignItems: 'center',
     borderWidth: 1,
     borderColor: 'rgba(255, 255, 255, 0.15)',
-    maxWidth: '55%',
+    maxWidth: '78%',
   },
   viewerCounterText: {
     color: '#ffffff',
@@ -2982,18 +3119,38 @@ const styles = StyleSheet.create({
   selectToggleChipTextActive: {
     color: '#ffffff',
   },
-  viewerDeleteBtn: {
+  viewerBottomBar: {
     position: 'absolute',
-    backgroundColor: 'rgba(220, 38, 38, 0.85)',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 16,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(15, 23, 42, 0.88)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.12)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingTop: 12,
     zIndex: 100,
   },
-  viewerDeleteBtnText: {
-    color: '#ffffff',
+  viewerBottomInfo: {
+    flex: 1,
+    marginRight: 16,
+  },
+  viewerBottomMetaText: {
+    color: '#f8fafc',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  viewerBottomSizeText: {
+    color: '#94a3b8',
     fontSize: 11,
-    fontWeight: '700',
+    marginTop: 2,
+  },
+  viewerBottomActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
   },
   deleteModalTitle: {
     fontSize: 16,

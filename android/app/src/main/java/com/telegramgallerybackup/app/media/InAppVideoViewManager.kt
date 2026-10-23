@@ -225,6 +225,24 @@ class InAppVideoContainerView(private val reactContext: ThemedReactContext) :
                 true
             }
 
+            mp.setOnInfoListener { player, what, _ ->
+                when (what) {
+                    MediaPlayer.MEDIA_INFO_BUFFERING_START -> {
+                        sendEvent("loading", player.duration, player.currentPosition, null)
+                        true
+                    }
+                    MediaPlayer.MEDIA_INFO_BUFFERING_END -> {
+                        if (player.isPlaying) {
+                            sendEvent("playing", player.duration, player.currentPosition, null)
+                        } else {
+                            sendEvent("paused", player.duration, player.currentPosition, null)
+                        }
+                        true
+                    }
+                    else -> false
+                }
+            }
+
             mp.prepareAsync()
         } catch (e: Exception) {
             Log.e(tag, "initMediaPlayer failed: ${e.message}", e)

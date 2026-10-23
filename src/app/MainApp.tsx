@@ -13,7 +13,7 @@ import {
   CloudGalleryScreen,
   CloudMediaItem,
 } from '../screens/CloudGalleryScreen';
-import { BackupActivityScreen } from '../screens/BackupActivityScreen';
+import { AppIcon } from '../components/AppIcon';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { ProfileScreen, UserProfileInfo } from '../screens/ProfileScreen';
 import { LoginScreen } from '../screens/LoginScreen';
@@ -50,7 +50,7 @@ import {
 import { DbUploadJob } from '../domain/database/types';
 import { EncryptionConfig } from '../types/encryption';
 
-export type AppTab = 'gallery' | 'cloud' | 'activity' | 'settings' | 'profile';
+export type AppTab = 'gallery' | 'cloud' | 'settings' | 'profile';
 
 export const MainApp: React.FC = () => {
   const [activeTab, setActiveTab] = useState<AppTab>('gallery');
@@ -1140,17 +1140,6 @@ export const MainApp: React.FC = () => {
           />
         )}
 
-        {activeTab === 'activity' && (
-          <BackupActivityScreen
-            activeProgress={activeProgress}
-            isPaused={isPaused}
-            queueStats={queueStats}
-            jobs={jobsList}
-            onTogglePause={handleTogglePause}
-            onCancelAll={handleCancelAllJobs}
-            onRetryFailed={handleRetryFailedJobs}
-          />
-        )}
 
         {activeTab === 'settings' && (
           <SettingsScreen
@@ -1206,7 +1195,7 @@ export const MainApp: React.FC = () => {
         )}
       </View>
 
-      {/* Streamlined Bottom Navigation Bar with all core destinations */}
+      {/* Streamlined Bottom Navigation Bar with 4 core destinations */}
       <View style={styles.navBar}>
         <TouchableOpacity
           style={[
@@ -1216,14 +1205,11 @@ export const MainApp: React.FC = () => {
           onPress={() => setActiveTab('gallery')}
           accessibilityLabel="Gallery tab"
         >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'gallery' && styles.navIconActive,
-            ]}
-          >
-            🖼️
-          </Text>
+          <AppIcon
+            name="gallery"
+            size={18}
+            color={activeTab === 'gallery' ? '#34d399' : '#6b7280'}
+          />
           <Text
             style={[
               styles.navLabel,
@@ -1242,14 +1228,11 @@ export const MainApp: React.FC = () => {
           onPress={() => setActiveTab('cloud')}
           accessibilityLabel="Cloud tab"
         >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'cloud' && styles.navIconActive,
-            ]}
-          >
-            ☁️
-          </Text>
+          <AppIcon
+            name="cloud"
+            size={18}
+            color={activeTab === 'cloud' ? '#34d399' : '#6b7280'}
+          />
           <Text
             style={[
               styles.navLabel,
@@ -1263,48 +1246,16 @@ export const MainApp: React.FC = () => {
         <TouchableOpacity
           style={[
             styles.navItem,
-            activeTab === 'activity' && styles.navItemActive,
-          ]}
-          onPress={() => {
-            refreshQueueStats();
-            setActiveTab('activity');
-          }}
-          accessibilityLabel="Activity tab"
-        >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'activity' && styles.navIconActive,
-            ]}
-          >
-            ⚡
-          </Text>
-          <Text
-            style={[
-              styles.navLabel,
-              activeTab === 'activity' && styles.navLabelActive,
-            ]}
-          >
-            Activity
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[
-            styles.navItem,
             activeTab === 'settings' && styles.navItemActive,
           ]}
           onPress={() => setActiveTab('settings')}
           accessibilityLabel="Settings tab"
         >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'settings' && styles.navIconActive,
-            ]}
-          >
-            ⚙️
-          </Text>
+          <AppIcon
+            name="settings"
+            size={18}
+            color={activeTab === 'settings' ? '#34d399' : '#6b7280'}
+          />
           <Text
             style={[
               styles.navLabel,
@@ -1323,14 +1274,11 @@ export const MainApp: React.FC = () => {
           onPress={() => setActiveTab('profile')}
           accessibilityLabel="Profile tab"
         >
-          <Text
-            style={[
-              styles.navIcon,
-              activeTab === 'profile' && styles.navIconActive,
-            ]}
-          >
-            👤
-          </Text>
+          <AppIcon
+            name="profile"
+            size={18}
+            color={activeTab === 'profile' ? '#34d399' : '#6b7280'}
+          />
           <Text
             style={[
               styles.navLabel,
